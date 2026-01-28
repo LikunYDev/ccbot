@@ -6,6 +6,7 @@ Format reference: https://github.com/desis123/claude-code-viewer
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass
@@ -30,10 +31,25 @@ class ParsedEntry:
     role: str  # "user" | "assistant"
     text: str  # Already formatted text
     content_type: str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
+    tool_use_id: str | None = None
 
 
 class TranscriptParser:
-    """Parser for Claude Code JSONL session files."""
+    """Parser for Claude Code JSONL session files.
+
+    Expected JSONL entry structure:
+    - type: "user" | "assistant" | "summary" | "file-history-snapshot" | ...
+    - message.content: list of blocks (text, tool_use, tool_result, thinking)
+    - sessionId, cwd, timestamp, uuid: metadata fields
+
+    Tool pairing model: tool_use blocks appear in assistant messages,
+    matching tool_result blocks appear in the next user message (keyed by tool_use_id).
+    """
+
+    # Magic string constants
+    _NO_CONTENT_PLACEHOLDER = "(no content)"
+    _INTERRUPTED_TEXT = "[Request interrupted by user for tool use]"
+    _MAX_SUMMARY_LENGTH = 200
 
     @staticmethod
     def parse_line(line: str) -> dict | None:
@@ -74,49 +90,6 @@ class TranscriptParser:
         return data.get("type") == "user"
 
     @staticmethod
-    def parse_structured_content(content_list: list[Any]) -> str:
-        """Parse structured content array into a string representation.
-
-        Handles text, tool_use, tool_result, and thinking blocks.
-
-        Args:
-            content_list: List of content blocks
-
-        Returns:
-            Combined string representation
-        """
-        if not isinstance(content_list, list):
-            if isinstance(content_list, str):
-                return content_list
-            return ""
-
-        parts = []
-        for item in content_list:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                item_type = item.get("type", "")
-
-                if item_type == "text":
-                    text = item.get("text", "")
-                    if text:
-                        parts.append(text)
-
-                elif item_type == "thinking":
-                    # Skip thinking blocks by default
-                    pass
-
-                elif item_type == "tool_use":
-                    tool_name = item.get("name", "unknown")
-                    parts.append(f"[Tool: {tool_name}]")
-
-                elif item_type == "tool_result":
-                    # Skip tool results by default
-                    pass
-
-        return "\n".join(parts)
-
-    @staticmethod
     def extract_text_only(content_list: list[Any]) -> str:
         """Extract only text content from structured content.
 
@@ -151,7 +124,22 @@ class TranscriptParser:
     _RE_SYSTEM_TAGS = re.compile(r"<(bash-input|bash-stdout|bash-stderr|local-command-caveat|system-reminder)")
 
     @staticmethod
-    def format_tool_use_summary(name: str, input_data: dict | Any) -> str:
+    def _format_edit_diff(old_string: str, new_string: str) -> str:
+        """Generate a compact unified diff between old_string and new_string."""
+        old_lines = old_string.splitlines(keepends=True)
+        new_lines = new_string.splitlines(keepends=True)
+        diff = difflib.unified_diff(old_lines, new_lines, lineterm="")
+        # Skip the --- / +++ header lines
+        result_lines: list[str] = []
+        for line in diff:
+            if line.startswith("---") or line.startswith("+++"):
+                continue
+            # Strip trailing newline for clean display
+            result_lines.append(line.rstrip("\n"))
+        return "\n".join(result_lines)
+
+    @classmethod
+    def format_tool_use_summary(cls, name: str, input_data: dict | Any) -> str:
         """Format a tool_use block into a brief summary line.
 
         Args:
@@ -172,6 +160,15 @@ class TranscriptParser:
             summary = input_data.get("file_path", "")
         elif name in ("Edit", "NotebookEdit"):
             summary = input_data.get("file_path") or input_data.get("notebook_path", "")
+            # For Edit, generate diff and return early with expandable quote
+            if name == "Edit":
+                old_s = input_data.get("old_string", "")
+                new_s = input_data.get("new_string", "")
+                if old_s and new_s:
+                    diff_text = TranscriptParser._format_edit_diff(old_s, new_s)
+                    if diff_text:
+                        header = f"🔧 **{name}** `{summary}`" if summary else f"🔧 **{name}**"
+                        return header + "\n" + TranscriptParser._format_expandable_quote(diff_text)
         elif name == "Bash":
             summary = input_data.get("command", "")
         elif name == "Grep":
@@ -182,6 +179,20 @@ class TranscriptParser:
             summary = input_data.get("url", "")
         elif name == "WebSearch":
             summary = input_data.get("query", "")
+        elif name == "TodoWrite":
+            todos = input_data.get("todos", [])
+            if isinstance(todos, list):
+                summary = f"{len(todos)} item(s)"
+        elif name == "TodoRead":
+            summary = ""
+        elif name == "AskUserQuestion":
+            questions = input_data.get("questions", [])
+            if isinstance(questions, list) and questions:
+                q = questions[0]
+                if isinstance(q, dict):
+                    summary = q.get("question", "")
+        elif name == "Skill":
+            summary = input_data.get("skill", "")
         else:
             # Generic: show first string value
             for v in input_data.values():
@@ -190,6 +201,8 @@ class TranscriptParser:
                     break
 
         if summary:
+            if len(summary) > cls._MAX_SUMMARY_LENGTH:
+                summary = summary[:cls._MAX_SUMMARY_LENGTH] + "…"
             return f"🔧 **{name}** `{summary}`"
         return f"🔧 **{name}**"
 
@@ -225,7 +238,9 @@ class TranscriptParser:
         if msg_type not in ("user", "assistant"):
             return None
 
-        message = data.get("message", {})
+        message = data.get("message")
+        if not isinstance(message, dict):
+            return None
         role = message.get("role")
         content = message.get("content", "")
 
@@ -289,7 +304,7 @@ class TranscriptParser:
 
         text = cls.extract_text_only(content)
         # Filter out "(no content)" placeholder
-        if text and text.strip() == "(no content)":
+        if text and text.strip() == cls._NO_CONTENT_PLACEHOLDER:
             return None
         return text
 
@@ -309,30 +324,26 @@ class TranscriptParser:
         if not isinstance(content, list):
             return None
 
-        # Check what types of content blocks are present
-        has_thinking = False
-        has_text = False
-        thinking_text = ""
-        text_text = ""
+        # Collect all text and thinking blocks
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
 
         for item in content:
             if not isinstance(item, dict):
                 continue
             if item.get("type") == "thinking":
-                t = item.get("thinking", "")
-                if t:
-                    has_thinking = True
-                    thinking_text = t
+                thinking = item.get("thinking", "")
+                if thinking:
+                    thinking_parts.append(thinking)
             elif item.get("type") == "text":
-                t = item.get("text", "")
-                if t and t.strip() != "(no content)":
-                    has_text = True
-                    text_text = t
+                text = item.get("text", "")
+                if text and text.strip() != cls._NO_CONTENT_PLACEHOLDER:
+                    text_parts.append(text)
 
-        if has_text:
-            return (text_text, "text")
-        if has_thinking:
-            return (thinking_text, "thinking")
+        if text_parts:
+            return ("\n".join(text_parts), "text")
+        if thinking_parts:
+            return ("\n".join(thinking_parts), "thinking")
         return None
 
     @staticmethod
@@ -355,20 +366,36 @@ class TranscriptParser:
         """Extract message UUID from message data."""
         return data.get("uuid")
 
-    @staticmethod
-    def _format_expandable_quote(text: str) -> str:
-        """Format text as a Telegram expandable blockquote.
-
-        Uses the MarkdownV2 expandable blockquote syntax:
-        each line prefixed with '>' and the last line ending with '||'.
-        """
-        lines = text.split("\n")
-        quoted = "\n".join(f">{line}" for line in lines)
-        quoted += "||"
-        return quoted
+    EXPANDABLE_QUOTE_START = "\x02EXPQUOTE_START\x02"
+    EXPANDABLE_QUOTE_END = "\x02EXPQUOTE_END\x02"
 
     @classmethod
-    def parse_entries(cls, entries: list[dict]) -> list[ParsedEntry]:
+    def _format_expandable_quote(cls, text: str) -> str:
+        """Format text as a Telegram expandable blockquote.
+
+        Wraps text with sentinel markers. The actual MarkdownV2 formatting
+        (> prefix, || suffix, escaping) is done in convert_markdown() after
+        telegramify processes the surrounding content.
+        """
+        return f"{cls.EXPANDABLE_QUOTE_START}{text}{cls.EXPANDABLE_QUOTE_END}"
+
+    @classmethod
+    def _format_tool_result_text(cls, text: str) -> str:
+        """Format tool result text as expandable quote.
+
+        No truncation here — per project principles, truncation is handled
+        only at the send layer (split_message / _render_expandable_quote).
+        """
+        if not text:
+            return ""
+        return cls._format_expandable_quote(text)
+
+    @classmethod
+    def parse_entries(
+        cls,
+        entries: list[dict],
+        pending_tools: dict[str, str] | None = None,
+    ) -> tuple[list[ParsedEntry], dict[str, str]]:
         """Parse a list of JSONL entries into a flat list of display-ready messages.
 
         This is the shared core logic used by both get_recent_messages (history)
@@ -376,21 +403,31 @@ class TranscriptParser:
 
         Args:
             entries: List of parsed JSONL dicts (already filtered through parse_line)
+            pending_tools: Optional carry-over pending tool_use state from a
+                previous call (tool_use_id -> formatted summary). Used by the
+                monitor to handle tool_use and tool_result arriving in separate
+                poll cycles.
 
         Returns:
-            List of ParsedEntry with formatted text
+            Tuple of (parsed entries, remaining pending_tools state)
         """
         result: list[ParsedEntry] = []
         last_cmd_name: str | None = None
-        # Pending tool_use blocks from the last assistant message, keyed by id
-        pending_tools: dict[str, str] = {}  # tool_use_id -> formatted summary
+        # Pending tool_use blocks keyed by id
+        _carry_over = pending_tools is not None
+        if pending_tools is None:
+            pending_tools = {}
+        else:
+            pending_tools = dict(pending_tools)  # don't mutate caller's dict
 
         for data in entries:
             msg_type = cls.get_message_type(data)
             if msg_type not in ("user", "assistant"):
                 continue
 
-            message = data.get("message", {})
+            message = data.get("message")
+            if not isinstance(message, dict):
+                continue
             content = message.get("content", "")
             if not isinstance(content, list):
                 content = [{"type": "text", "text": str(content)}] if content else []
@@ -425,13 +462,6 @@ class TranscriptParser:
             last_cmd_name = None
 
             if msg_type == "assistant":
-                # Flush any pending tools that didn't get results
-                for tool_summary in pending_tools.values():
-                    result.append(ParsedEntry(
-                        role="assistant", text=tool_summary, content_type="tool_use",
-                    ))
-                pending_tools = {}
-
                 # Process content blocks
                 has_text = False
                 for block in content:
@@ -441,7 +471,7 @@ class TranscriptParser:
 
                     if btype == "text":
                         t = block.get("text", "").strip()
-                        if t and t != "(no content)":
+                        if t and t != cls._NO_CONTENT_PLACEHOLDER:
                             result.append(ParsedEntry(
                                 role="assistant", text=t, content_type="text",
                             ))
@@ -457,6 +487,7 @@ class TranscriptParser:
                         else:
                             result.append(ParsedEntry(
                                 role="assistant", text=summary, content_type="tool_use",
+                                tool_use_id=tool_id or None,
                             ))
 
                     elif btype == "thinking":
@@ -464,11 +495,11 @@ class TranscriptParser:
                         if thinking_text:
                             quoted = cls._format_expandable_quote(thinking_text)
                             result.append(ParsedEntry(
-                                role="assistant", text=f"💭\n{quoted}", content_type="thinking",
+                                role="assistant", text=quoted, content_type="thinking",
                             ))
                         elif not has_text:
                             result.append(ParsedEntry(
-                                role="assistant", text="💭 (thinking)", content_type="thinking",
+                                role="assistant", text="(thinking)", content_type="thinking",
                             ))
 
             elif msg_type == "user":
@@ -486,32 +517,56 @@ class TranscriptParser:
                         tool_use_id = block.get("tool_use_id", "")
                         result_content = block.get("content", "")
                         result_text = cls.extract_tool_result_text(result_content)
+                        is_error = block.get("is_error", False)
+                        is_interrupted = result_text == cls._INTERRUPTED_TEXT
                         tool_summary = pending_tools.pop(tool_use_id, None)
-                        if tool_summary:
-                            entry_text = tool_summary
-                            if result_text:
-                                entry_text += "\n" + cls._format_expandable_quote(result_text)
+                        _tuid = tool_use_id or None
+
+                        if is_interrupted:
+                            # Show interruption inline with tool summary
+                            entry_text = tool_summary or ""
+                            if entry_text:
+                                entry_text += "\n⏹ Interrupted"
+                            else:
+                                entry_text = "⏹ Interrupted"
                             result.append(ParsedEntry(
                                 role="assistant", text=entry_text, content_type="tool_result",
+                                tool_use_id=_tuid,
+                            ))
+                        elif is_error:
+                            # Replace 🔧 prefix with ❌ and show error text directly
+                            if tool_summary:
+                                entry_text = tool_summary.replace("🔧", "❌", 1)
+                            else:
+                                entry_text = "❌ Error"
+                            if result_text:
+                                entry_text += "\n" + result_text
+                            result.append(ParsedEntry(
+                                role="assistant", text=entry_text, content_type="tool_result",
+                                tool_use_id=_tuid,
+                            ))
+                        elif tool_summary:
+                            entry_text = tool_summary
+                            # Skip appending result text if summary already has
+                            # an expandable quote (e.g. Edit diff)
+                            if result_text and cls.EXPANDABLE_QUOTE_START not in tool_summary:
+                                entry_text += "\n" + cls._format_tool_result_text(result_text)
+                            result.append(ParsedEntry(
+                                role="assistant", text=entry_text, content_type="tool_result",
+                                tool_use_id=_tuid,
                             ))
                         elif result_text:
                             result.append(ParsedEntry(
                                 role="assistant",
-                                text=cls._format_expandable_quote(result_text),
+                                text=cls._format_tool_result_text(result_text),
                                 content_type="tool_result",
+                                tool_use_id=_tuid,
                             ))
 
                     elif btype == "text":
                         t = block.get("text", "").strip()
                         if t and not cls._RE_SYSTEM_TAGS.search(t):
                             user_text_parts.append(t)
-
-                # Flush remaining pending tools
-                for tool_summary in pending_tools.values():
-                    result.append(ParsedEntry(
-                        role="assistant", text=tool_summary, content_type="tool_use",
-                    ))
-                pending_tools = {}
 
                 # Add user text if present (skip if message was only tool_results)
                 if user_text_parts:
@@ -523,14 +578,19 @@ class TranscriptParser:
                             role="user", text=combined, content_type="text",
                         ))
 
-        # Flush any remaining pending tools at end
-        for tool_summary in pending_tools.values():
-            result.append(ParsedEntry(
-                role="assistant", text=tool_summary, content_type="tool_use",
-            ))
+        # Flush remaining pending tools at end.
+        # In carry-over mode (monitor), keep them pending for the next call
+        # without emitting entries. In one-shot mode (history), emit them.
+        remaining_pending = dict(pending_tools)
+        if not _carry_over:
+            for tool_id, tool_summary in pending_tools.items():
+                result.append(ParsedEntry(
+                    role="assistant", text=tool_summary, content_type="tool_use",
+                    tool_use_id=tool_id,
+                ))
 
         # Strip whitespace
         for entry in result:
             entry.text = entry.text.strip()
 
-        return result
+        return result, remaining_pending

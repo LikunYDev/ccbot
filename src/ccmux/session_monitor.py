@@ -18,6 +18,7 @@ from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
+from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class NewMessage:
     is_complete: bool  # True when stop_reason is set (final message)
     msg_id: str | None = None  # API message ID (same across streaming chunks)
     content_type: str = "text"  # "text" or "thinking"
+    tool_use_id: str | None = None
 
 
 class SessionMonitor:
@@ -58,8 +60,8 @@ class SessionMonitor:
         poll_interval: float | None = None,
         state_file: Path | None = None,
     ):
-        self.projects_path = projects_path or config.claude_projects_path
-        self.poll_interval = poll_interval or config.monitor_poll_interval
+        self.projects_path = projects_path if projects_path is not None else config.claude_projects_path
+        self.poll_interval = poll_interval if poll_interval is not None else config.monitor_poll_interval
 
         self.state = MonitorState(
             state_file=state_file or config.monitor_state_file
@@ -69,6 +71,8 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        # Per-session pending tool_use state carried across poll cycles
+        self._pending_tools: dict[str, dict[str, str]] = {}  # session_id -> pending
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -149,7 +153,7 @@ class SessionMonitor:
                     # Determine project_path for this file
                     file_project_path = original_path
                     if not file_project_path:
-                        file_project_path = self._read_cwd_from_jsonl(jsonl_file)
+                        file_project_path = read_cwd_from_jsonl(jsonl_file)
                     if not file_project_path:
                         dir_name = project_dir.name
                         if dir_name.startswith("-"):
@@ -178,31 +182,29 @@ class SessionMonitor:
 
         return sessions
 
-    @staticmethod
-    def _read_cwd_from_jsonl(file_path: Path) -> str:
-        """Read the cwd field from the first JSONL entry that has one."""
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                        cwd = data.get("cwd")
-                        if cwd:
-                            return cwd
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            pass
-        return ""
-
     def _read_new_lines(self, session: TrackedSession, file_path: Path) -> list[dict]:
-        """Read new lines from a session file."""
+        """Read new lines from a session file.
+
+        Detects file truncation (e.g. after /clear) and resets line count.
+        """
         new_entries = []
         try:
             with open(file_path, "r", encoding="utf-8") as f:
+                # Detect file truncation: if we expect more lines than exist,
+                # reset and re-read from the beginning
+                current_total = sum(1 for _ in f)
+                f.seek(0)
+
+                if current_total < session.last_line_count:
+                    logger.info(
+                        "File truncated for session %s "
+                        "(had %d lines, now %d). Resetting.",
+                        session.session_id,
+                        session.last_line_count,
+                        current_total,
+                    )
+                    session.last_line_count = 0
+
                 for _ in range(session.last_line_count):
                     f.readline()
                 line_count = session.last_line_count
@@ -213,7 +215,7 @@ class SessionMonitor:
                         new_entries.append(data)
                 session.last_line_count = line_count
         except OSError as e:
-            logger.error(f"Error reading session file {file_path}: {e}")
+            logger.error("Error reading session file %s: %s", file_path, e)
         return new_entries
 
     async def check_for_updates(self) -> list[NewMessage]:
@@ -254,8 +256,15 @@ class SessionMonitor:
                         f"session {session_info.session_id}"
                     )
 
-                # Parse new entries using the shared logic
-                parsed_entries = TranscriptParser.parse_entries(new_entries)
+                # Parse new entries using the shared logic, carrying over pending tools
+                carry = self._pending_tools.get(session_info.session_id, {})
+                parsed_entries, remaining = TranscriptParser.parse_entries(
+                    new_entries, pending_tools=carry,
+                )
+                if remaining:
+                    self._pending_tools[session_info.session_id] = remaining
+                else:
+                    self._pending_tools.pop(session_info.session_id, None)
 
                 for entry in parsed_entries:
                     if not entry.text or entry.role == "user":
@@ -267,6 +276,7 @@ class SessionMonitor:
                         uuid=None,
                         is_complete=True,
                         content_type=entry.content_type,
+                        tool_use_id=entry.tool_use_id,
                     ))
 
                 tracked.last_mtime = actual_mtime
@@ -287,21 +297,23 @@ class SessionMonitor:
             return 0
 
     async def _monitor_loop(self) -> None:
-        logger.info(f"Session monitor started, polling every {self.poll_interval}s")
+        logger.info("Session monitor started, polling every %ss", self.poll_interval)
+
+        # Deferred import to avoid circular dependency (cached once)
+        from .session import session_manager
 
         while self._running:
             try:
                 # Load hook-based session map updates
-                from .session import session_manager
                 session_manager.load_session_map()
 
                 new_messages = await self.check_for_updates()
 
                 for msg in new_messages:
                     status = "complete" if msg.is_complete else "streaming"
+                    preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
                     logger.info(
-                        f"[{status}] session={msg.session_id}: "
-                        f"{msg.text[:80]}..."
+                        "[%s] session=%s: %s", status, msg.session_id, preview
                     )
                     if self._message_callback:
                         try:

@@ -24,8 +24,6 @@ class TrackedSession:
     last_mtime: float  # File modification time
     last_line_count: int  # Number of lines read
     project_path: str = ""  # Working directory
-    pending_streaming_uuid: str | None = None  # UUID of last streaming (incomplete) msg
-    pending_streaming_mtime: float = 0.0  # mtime when pending streaming was set
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -40,8 +38,6 @@ class TrackedSession:
             last_mtime=data.get("last_mtime", 0.0),
             last_line_count=data.get("last_line_count", 0),
             project_path=data.get("project_path", ""),
-            pending_streaming_uuid=data.get("pending_streaming_uuid"),
-            pending_streaming_mtime=data.get("pending_streaming_mtime", 0.0),
         )
 
 
@@ -75,8 +71,8 @@ class MonitorState:
             self.tracked_sessions = {}
 
     def save(self) -> None:
-        """Save state to file."""
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        """Save state to file atomically."""
+        from .utils import atomic_write_json
 
         data = {
             "tracked_sessions": {
@@ -85,11 +81,11 @@ class MonitorState:
         }
 
         try:
-            self.state_file.write_text(json.dumps(data, indent=2))
+            atomic_write_json(self.state_file, data)
             self._dirty = False
-            logger.debug(f"Saved {len(self.tracked_sessions)} tracked sessions to state")
+            logger.debug("Saved %d tracked sessions to state", len(self.tracked_sessions))
         except OSError as e:
-            logger.error(f"Failed to save state file: {e}")
+            logger.error("Failed to save state file: %s", e)
 
     def get_session(self, session_id: str) -> TrackedSession | None:
         """Get tracked session by ID."""
@@ -111,16 +107,3 @@ class MonitorState:
         if self._dirty:
             self.save()
 
-    def cleanup_stale_sessions(self) -> None:
-        """Remove sessions for files that no longer exist."""
-        stale = []
-        for session_id, session in self.tracked_sessions.items():
-            if not Path(session.file_path).exists():
-                stale.append(session_id)
-
-        for session_id in stale:
-            logger.info(f"Removing stale session: {session_id}")
-            del self.tracked_sessions[session_id]
-
-        if stale:
-            self._dirty = True

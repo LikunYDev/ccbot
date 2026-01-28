@@ -18,6 +18,7 @@ from typing import Any
 from .config import config
 from .tmux_manager import TmuxWindow, tmux_manager
 from .transcript_parser import TranscriptParser
+from .utils import atomic_write_json, read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -66,25 +67,6 @@ class ClaudeSession:
     def project_name(self) -> str:
         return Path(self.project_path).name
 
-
-def _read_cwd_from_jsonl(file_path: str | Path) -> str:
-    """Read the cwd field from the first entry that has one."""
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    cwd = data.get("cwd")
-                    if cwd:
-                        return cwd
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return ""
 
 
 def _read_user_messages_from_jsonl(file_path: str | Path) -> list[str]:
@@ -149,7 +131,6 @@ class SessionManager:
         self._load_state()
 
     def _save_state(self) -> None:
-        config.state_file.parent.mkdir(parents=True, exist_ok=True)
         state = {
             "active_sessions": {
                 str(k): v for k, v in self.active_sessions.items()
@@ -158,7 +139,7 @@ class SessionManager:
                 k: v.to_dict() for k, v in self.window_states.items()
             },
         }
-        config.state_file.write_text(json.dumps(state, indent=2))
+        atomic_write_json(config.state_file, state)
 
     def _load_state(self) -> None:
         if config.state_file.exists():
@@ -292,7 +273,7 @@ class SessionManager:
                         continue
                     project_path = original_path
                     if not project_path:
-                        project_path = _read_cwd_from_jsonl(jsonl_file)
+                        project_path = read_cwd_from_jsonl(jsonl_file)
                     if not project_path:
                         dir_name = project_dir.name
                         if dir_name.startswith("-"):
@@ -449,8 +430,8 @@ class SessionManager:
             logger.error(f"Error reading session file {file_path}: {e}")
             return [], 0
 
-        parsed_entries = TranscriptParser.parse_entries(entries)
-        all_messages = [{"role": e.role, "text": e.text} for e in parsed_entries]
+        parsed_entries, _ = TranscriptParser.parse_entries(entries)
+        all_messages = [{"role": e.role, "text": e.text, "content_type": e.content_type} for e in parsed_entries]
 
         total = len(all_messages)
         if total == 0:

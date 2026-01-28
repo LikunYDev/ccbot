@@ -2,12 +2,23 @@
 
 Called by Claude Code's SessionStart/SessionEnd hooks to maintain
 a window↔session mapping in ~/.ccmux/session_map.json.
+
+This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
+since hooks run inside tmux panes where bot env vars are not set.
 """
 
+import fcntl
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+# Validate session_id looks like a UUID
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+_SESSION_MAP_FILE = Path.home() / ".ccmux" / "session_map.json"
 
 
 def hook_main() -> None:
@@ -24,11 +35,19 @@ def hook_main() -> None:
     if not session_id or not event:
         return
 
-    # Get tmux window name for the pane running this hook.
-    # TMUX_PANE is set by tmux for every process inside a pane,
-    # so we use it to target the correct window (not the active one).
-    import os
+    # Validate session_id format
+    if not _UUID_RE.match(session_id):
+        return
 
+    # Validate cwd is an absolute path (if provided)
+    if cwd and not os.path.isabs(cwd):
+        return
+
+    if event != "SessionStart":
+        return
+
+    # Get tmux window name for the pane running this hook.
+    # TMUX_PANE is set by tmux for every process inside a pane.
     pane_id = os.environ.get("TMUX_PANE", "")
     if not pane_id:
         return
@@ -42,21 +61,31 @@ def hook_main() -> None:
     if not window_name:
         return
 
-    map_file = Path.home() / ".ccmux" / "session_map.json"
-    session_map: dict = {}
-    if map_file.exists():
-        try:
-            session_map = json.loads(map_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    if event != "SessionStart":
-        return
-
-    session_map[window_name] = {
-        "session_id": session_id,
-        "cwd": cwd,
-    }
-
+    # Read-modify-write with file locking to prevent concurrent hook races
+    map_file = _SESSION_MAP_FILE
     map_file.parent.mkdir(parents=True, exist_ok=True)
-    map_file.write_text(json.dumps(session_map, indent=2))
+
+    lock_path = map_file.with_suffix(".lock")
+    try:
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                session_map: dict[str, dict[str, str]] = {}
+                if map_file.exists():
+                    try:
+                        session_map = json.loads(map_file.read_text())
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                session_map[window_name] = {
+                    "session_id": session_id,
+                    "cwd": cwd,
+                }
+
+                from .utils import atomic_write_json
+
+                atomic_write_json(map_file, session_map)
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+    except OSError:
+        pass

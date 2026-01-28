@@ -19,9 +19,15 @@ class Config:
         allowed_users_str = os.getenv("ALLOWED_USERS", "")
         if not allowed_users_str:
             raise ValueError("ALLOWED_USERS environment variable is required")
-        self.allowed_users: set[int] = {
-            int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()
-        }
+        try:
+            self.allowed_users: set[int] = {
+                int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()
+            }
+        except ValueError as e:
+            raise ValueError(
+                f"ALLOWED_USERS contains non-numeric value: {e}. "
+                "Expected comma-separated Telegram user IDs."
+            ) from e
 
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccmux")
@@ -29,7 +35,7 @@ class Config:
         self.tmux_window_prefix = "cc:"
 
         # Claude command to run in new windows
-        self.claude_command = os.getenv("CLAUDE_COMMAND", "claude --dangerously-skip-permissions")
+        self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
 
         # Root directory for directory browser (default: current working directory)
         browse_root = os.getenv("BROWSE_ROOT_DIR", "")
@@ -42,7 +48,6 @@ class Config:
         self.claude_projects_path = Path.home() / ".claude" / "projects"
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
         self.monitor_state_file = Path.home() / ".ccmux" / "monitor_state.json"
-        self.monitor_stable_wait = float(os.getenv("MONITOR_STABLE_WAIT", "2.0"))
 
         # Hook-based session map file
         self.session_map_file = Path.home() / ".ccmux" / "session_map.json"

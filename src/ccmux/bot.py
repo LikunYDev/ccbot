@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 from .config import config
-from .markdown_html import convert_markdown
+from .markdown_v2 import convert_markdown
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
+
+# Map (tool_use_id, user_id) -> telegram message_id for editing tool_use messages with results
+_tool_msg_ids: dict[tuple[str, int], int] = {}
 
 # Callback data prefixes
 CB_HISTORY_PREV = "hp:"  # history page older
@@ -53,18 +56,15 @@ CB_SESSION_REFRESH = "sa:ref:"
 CB_SESSION_KILL = "sa:kill:"
 
 # Bot's own commands — handled locally, NOT forwarded to Claude Code
-BOT_COMMANDS = {"start", "list", "history", "cancel", "screenshot"}
+BOT_COMMANDS = {"start", "list", "history", "screenshot"}
 
-# Claude Code slash commands shown in bot menu (command -> description)
+# Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
-    "clear": "Clear conversation history",
-    "compact": "Compact conversation context",
-    "cost": "Show token/cost usage",
-    "help": "Show Claude Code help",
-    "review": "Code review",
-    "doctor": "Diagnose environment",
-    "memory": "Edit CLAUDE.md",
-    "init": "Init project CLAUDE.md",
+    "clear": "↗ Clear conversation history",
+    "compact": "↗ Compact conversation context",
+    "cost": "↗ Show token/cost usage",
+    "help": "↗ Show Claude Code help",
+    "memory": "↗ Edit CLAUDE.md",
 }
 
 # List inline callback prefixes
@@ -86,6 +86,37 @@ def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
 
 
+def _clear_browse_state(user_data: dict | None) -> None:
+    """Clear directory browsing state keys from user_data."""
+    if user_data is not None:
+        user_data.pop(STATE_KEY, None)
+        user_data.pop(BROWSE_PATH_KEY, None)
+        user_data.pop(BROWSE_PAGE_KEY, None)
+
+
+def _build_session_detail(
+    window_name: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build session detail text and action buttons for a window."""
+    session = session_manager.resolve_session_for_window(window_name)
+    if session:
+        detail_text = (
+            f"📤 *Selected: {window_name}*\n\n"
+            f"📝 {session.summary}\n"
+            f"💬 {session.message_count} messages\n\n"
+            f"Send text to forward to Claude."
+        )
+    else:
+        detail_text = f"📤 *Selected: {window_name}*\n\nSend text to forward to Claude."
+    # Encode callback data with byte-safe truncation
+    action_buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📋 History", callback_data=f"{CB_SESSION_HISTORY}{window_name}"[:64]),
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_SESSION_REFRESH}{window_name}"[:64]),
+        InlineKeyboardButton("❌ Kill", callback_data=f"{CB_SESSION_KILL}{window_name}"[:64]),
+    ]])
+    return detail_text, action_buttons
+
+
 async def _safe_reply(message, text: str, **kwargs):  # type: ignore[no-untyped-def]
     """Reply with MarkdownV2, falling back to plain text on failure."""
     try:
@@ -96,7 +127,7 @@ async def _safe_reply(message, text: str, **kwargs):  # type: ignore[no-untyped-
         return await message.reply_text(text, **kwargs)
 
 
-async def _safe_edit(target, text: str, **kwargs) -> None:
+async def _safe_edit(target, text: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
     """Edit message with MarkdownV2, falling back to plain text on failure."""
     try:
         await target.edit_message_text(
@@ -105,8 +136,8 @@ async def _safe_edit(target, text: str, **kwargs) -> None:
     except Exception:
         try:
             await target.edit_message_text(text, **kwargs)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Failed to edit message: %s", e)
 
 
 async def _safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
@@ -171,10 +202,23 @@ async def send_history(
         text = f"📋 [{window_name}] No messages yet."
         keyboard = None
     else:
+        from .transcript_parser import TranscriptParser
+        _start = TranscriptParser.EXPANDABLE_QUOTE_START
+        _end = TranscriptParser.EXPANDABLE_QUOTE_END
+
         lines = [f"📋 [{window_name}] Messages ({total} total)\n"]
         for msg in messages:
-            icon = "👤" if msg["role"] == "user" else "🤖"
-            lines.append(f"{icon} {msg['text']}")
+            if msg["role"] == "user":
+                icon = "👤"
+            elif msg.get("content_type") == "thinking":
+                icon = "💭"
+            else:
+                icon = "🤖"
+            msg_text = msg["text"]
+            # Strip expandable quote sentinels for history view —
+            # content is shown inline, not as collapsed blocks.
+            msg_text = msg_text.replace(_start, "").replace(_end, "")
+            lines.append(f"{icon} {msg_text}")
         full_text = "\n\n".join(lines)
         pages = split_message(full_text, max_length=4096)
         # Default to last page (newest messages), navigate backwards
@@ -253,10 +297,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await _safe_reply(update.message, "You are not authorized to use this bot.")
         return
 
-    if context.user_data:
-        context.user_data.pop(STATE_KEY, None)
-        context.user_data.pop(BROWSE_PATH_KEY, None)
-        context.user_data.pop(BROWSE_PAGE_KEY, None)
+    _clear_browse_state(context.user_data)
 
     if update.message:
         # Remove any existing reply keyboard
@@ -332,8 +373,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data.startswith(CB_HISTORY_PREV) or data.startswith(CB_HISTORY_NEXT):
         prefix_len = len(CB_HISTORY_PREV)  # same length for both
         rest = data[prefix_len:]
-        offset_str, window_name = rest.split(":", 1)
-        offset = int(offset_str)
+        try:
+            offset_str, window_name = rest.split(":", 1)
+            offset = int(offset_str)
+        except ValueError:
+            await query.answer("Invalid data")
+            return
 
         w = tmux_manager.find_window_by_name(window_name)
         if w:
@@ -347,7 +392,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         subdir_name = data[len(CB_DIR_SELECT):]
         default_path = str(config.browse_root_dir)
         current_path = context.user_data.get(BROWSE_PATH_KEY, default_path) if context.user_data else default_path
-        new_path = Path(current_path) / subdir_name
+        new_path = (Path(current_path) / subdir_name).resolve()
+
+        # Validate: must be within browse_root_dir (prevent path traversal)
+        browse_root = config.browse_root_dir.resolve()
+        if not (str(new_path).startswith(str(browse_root) + "/") or new_path == browse_root):
+            await query.answer("Access denied", show_alert=True)
+            return
 
         if not new_path.exists() or not new_path.is_dir():
             await query.answer("Directory not found", show_alert=True)
@@ -381,7 +432,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
 
     elif data.startswith(CB_DIR_PAGE):
-        pg = int(data[len(CB_DIR_PAGE):])
+        try:
+            pg = int(data[len(CB_DIR_PAGE):])
+        except ValueError:
+            await query.answer("Invalid data")
+            return
         default_path = str(config.browse_root_dir)
         current_path = context.user_data.get(BROWSE_PATH_KEY, default_path) if context.user_data else default_path
         if context.user_data is not None:
@@ -395,10 +450,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         default_path = str(config.browse_root_dir)
         selected_path = context.user_data.get(BROWSE_PATH_KEY, default_path) if context.user_data else default_path
 
-        if context.user_data is not None:
-            context.user_data.pop(STATE_KEY, None)
-            context.user_data.pop(BROWSE_PATH_KEY, None)
-            context.user_data.pop(BROWSE_PAGE_KEY, None)
+        _clear_browse_state(context.user_data)
 
         success, message, created_wname = tmux_manager.create_window(selected_path)
         if success:
@@ -413,10 +465,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Created" if success else "Failed")
 
     elif data == CB_DIR_CANCEL:
-        if context.user_data is not None:
-            context.user_data.pop(STATE_KEY, None)
-            context.user_data.pop(BROWSE_PATH_KEY, None)
-            context.user_data.pop(BROWSE_PAGE_KEY, None)
+        _clear_browse_state(context.user_data)
         await _safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
@@ -433,22 +482,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Session action: Refresh
     elif data.startswith(CB_SESSION_REFRESH):
         window_name = data[len(CB_SESSION_REFRESH):]
-        session = session_manager.resolve_session_for_window(window_name)
-        if session:
-            detail_text = (
-                f"📤 *Selected: {window_name}*\n\n"
-                f"📝 {session.summary}\n"
-                f"💬 {session.message_count} messages\n\n"
-                f"Send text to forward to Claude."
-            )
-            action_buttons = InlineKeyboardMarkup([[
-                InlineKeyboardButton("📋 History", callback_data=f"{CB_SESSION_HISTORY}{window_name}"[:64]),
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_SESSION_REFRESH}{window_name}"[:64]),
-                InlineKeyboardButton("❌ Kill", callback_data=f"{CB_SESSION_KILL}{window_name}"[:64]),
-            ]])
-            await _safe_edit(query, detail_text, reply_markup=action_buttons)
-        else:
-            await _safe_edit(query, "Session no longer exists.")
+        detail_text, action_buttons = _build_session_detail(window_name)
+        await _safe_edit(query, detail_text, reply_markup=action_buttons)
         await query.answer("Refreshed")
 
     # Session action: Kill
@@ -479,21 +514,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             keyboard = _build_list_keyboard(user.id)
             await _safe_edit(query, text, reply_markup=keyboard)
             # Send session detail message
-            session = session_manager.resolve_session_for_window(w.window_name)
-            if session:
-                detail_text = (
-                    f"📤 *Selected: {w.window_name}*\n\n"
-                    f"📝 {session.summary}\n"
-                    f"💬 {session.message_count} messages\n\n"
-                    f"Send text to forward to Claude."
-                )
-            else:
-                detail_text = f"📤 *Selected: {w.window_name}*\n\nSend text to forward to Claude."
-            action_buttons = InlineKeyboardMarkup([[
-                InlineKeyboardButton("📋 History", callback_data=f"{CB_SESSION_HISTORY}{w.window_name}"[:64]),
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_SESSION_REFRESH}{w.window_name}"[:64]),
-                InlineKeyboardButton("❌ Kill", callback_data=f"{CB_SESSION_KILL}{w.window_name}"[:64]),
-            ]])
+            detail_text, action_buttons = _build_session_detail(w.window_name)
             await _safe_send(
                 context.bot, user.id, detail_text,
                 reply_markup=action_buttons,
@@ -545,9 +566,24 @@ def _build_response_parts(
 
     # Truncate thinking content to keep it compact
     if content_type == "thinking" and is_complete:
+        from .transcript_parser import TranscriptParser
+        start_tag = TranscriptParser.EXPANDABLE_QUOTE_START
+        end_tag = TranscriptParser.EXPANDABLE_QUOTE_END
         max_thinking = 500
-        if len(text) > max_thinking:
-            text = text[:max_thinking] + "\n\n... (thinking truncated)"
+        if start_tag in text and end_tag in text:
+            inner = text[text.index(start_tag) + len(start_tag):text.index(end_tag)]
+            if len(inner) > max_thinking:
+                inner = inner[:max_thinking] + "\n\n… (thinking truncated)"
+            text = start_tag + inner + end_tag
+        elif len(text) > max_thinking:
+            text = text[:max_thinking] + "\n\n… (thinking truncated)"
+
+    # If text contains expandable quote sentinels, don't split —
+    # the quote must stay atomic. Truncation is handled by
+    # _render_expandable_quote in markdown_v2.py.
+    from .transcript_parser import TranscriptParser
+    if TranscriptParser.EXPANDABLE_QUOTE_START in text:
+        return [convert_markdown(f"{prefix}\n\n{text}")]
 
     # Split markdown first, then convert each chunk to HTML.
     # Use conservative max to leave room for HTML tags added by conversion.
@@ -599,18 +635,52 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         return
 
     for user_id, wname in active_users:
+        # For tool_result, try to edit the original tool_use message
+        _tkey = (msg.tool_use_id or "", user_id)
+        if msg.content_type == "tool_result" and msg.tool_use_id and _tkey in _tool_msg_ids:
+            tg_msg_id = _tool_msg_ids.pop(_tkey)
+            text_md = convert_markdown(f"{_format_response_prefix(wname, True)}\n\n{msg.text}")
+            try:
+                await bot.edit_message_text(
+                    chat_id=user_id, message_id=tg_msg_id,
+                    text=text_md, parse_mode="MarkdownV2",
+                )
+            except Exception:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=user_id, message_id=tg_msg_id,
+                        text=f"{_format_response_prefix(wname, True)}\n\n{msg.text}",
+                    )
+                except Exception:
+                    logger.debug(f"Failed to edit tool msg {tg_msg_id}, sending new")
+                    # Fallback: send as new message
+                    parts = _build_response_parts(wname, msg.text, True, msg.content_type)
+                    for part in parts:
+                        try:
+                            await bot.send_message(chat_id=user_id, text=part, parse_mode="MarkdownV2")
+                        except Exception:
+                            try:
+                                await bot.send_message(chat_id=user_id, text=part)
+                            except Exception as e:
+                                logger.error(f"Failed to send message to {user_id}: {e}")
+            continue
+
         parts = _build_response_parts(
             wname, msg.text, msg.is_complete, msg.content_type,
         )
         if msg.is_complete:
             for part in parts:
                 try:
-                    await bot.send_message(chat_id=user_id, text=part, parse_mode="MarkdownV2")
+                    sent = await bot.send_message(chat_id=user_id, text=part, parse_mode="MarkdownV2")
                 except Exception:
                     try:
-                        await bot.send_message(chat_id=user_id, text=part)
+                        sent = await bot.send_message(chat_id=user_id, text=part)
                     except Exception as e:
                         logger.error(f"Failed to send message to {user_id}: {e}")
+                        sent = None
+                # Record tool_use message ID for later editing
+                if sent and msg.tool_use_id and msg.content_type == "tool_use":
+                    _tool_msg_ids[(msg.tool_use_id, user_id)] = sent.message_id
 
 
 # --- App lifecycle ---
@@ -624,7 +694,6 @@ async def post_init(application: Application) -> None:
         BotCommand("start", "Show session menu"),
         BotCommand("list", "List all sessions"),
         BotCommand("history", "Message history for active session"),
-        BotCommand("cancel", "Cancel current operation"),
         BotCommand("screenshot", "Capture terminal screenshot"),
     ]
     # Add Claude Code slash commands
@@ -759,21 +828,11 @@ async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     png_bytes = text_to_image(text)
-    await update.message.reply_photo(photo=io.BytesIO(png_bytes))
+    await update.message.reply_document(
+        document=io.BytesIO(png_bytes),
+        filename="screenshot.png",
+    )
 
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-
-    if context.user_data:
-        context.user_data.pop(STATE_KEY, None)
-        context.user_data.pop(BROWSE_PATH_KEY, None)
-        context.user_data.pop(BROWSE_PAGE_KEY, None)
-
-    if update.message:
-        await _safe_reply(update.message, "Cancelled.")
 
 
 def create_bot() -> Application:
@@ -788,7 +847,6 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Forward any other /command to Claude Code

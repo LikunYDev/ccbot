@@ -3,7 +3,7 @@
 import httpx
 
 from .config import config
-from .markdown_html import convert_markdown
+from .markdown_v2 import convert_markdown
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
@@ -65,7 +65,7 @@ def send_telegram_message(chat_id: int, text: str) -> bool:
                     },
                 )
                 if not response.is_success:
-                    # Retry without HTML parsing if it fails
+                    # Retry without MarkdownV2 parsing if it fails
                     response = client.post(
                         url,
                         json={

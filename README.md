@@ -18,33 +18,79 @@ Telegram Bot for monitoring and interacting with Claude Code sessions running in
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                       Telegram Bot                            │
-│  - /list: Browse sessions (inline buttons)                   │
-│  - Select active window for sending                          │
-│  - Send text messages to Claude Code                         │
-│  - Forward /commands to Claude Code                          │
-│  - View message history with pagination                      │
-│  - Create / kill sessions                                    │
-└───────────────────────────────────────────────────────────────┘
-         │                                    │
-         │ Monitor (polling JSONL)            │ Send (tmux keys)
-         ▼                                    ▼
-┌─────────────────────┐           ┌─────────────────────┐
-│  Claude Sessions    │◄─────────►│    Tmux Windows     │
-│  ~/.claude/projects │  matched  │    (by cwd)         │
-│  - sessions-index   │   by      │                     │
-│  - *.jsonl files    │ session_id│  claude running in │
-└─────────────────────┘           │  each window        │
-                                  └─────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Telegram Bot (bot.py)                       │
+│  - /list: Browse sessions (inline buttons)                         │
+│  - /history: Paginated message history (default: latest page)      │
+│  - /screenshot: Capture tmux pane as PNG                           │
+│  - Send text → Claude Code via tmux keystrokes                     │
+│  - Forward /commands to Claude Code                                │
+│  - Create / kill sessions via directory browser                    │
+│  - Tool use → tool result: edit message in-place                   │
+│  - MarkdownV2 output with auto fallback to plain text              │
+├──────────────────────┬──────────────────────────────────────────────┤
+│  markdown_v2.py      │  telegram_sender.py                         │
+│  MD → MarkdownV2     │  split_message (4096 limit)                 │
+│  + expandable quotes │  + inline keyboard pagination               │
+└──────────┬───────────┴──────────────────┬───────────────────────────┘
+           │                              │
+           │ Notify (NewMessage callback) │ Send (tmux keys)
+           │                              │
+┌──────────┴──────────────┐    ┌──────────┴──────────────────────┐
+│  SessionMonitor         │    │  TmuxManager (tmux_manager.py)  │
+│  (session_monitor.py)   │    │  - list/find/create/kill windows│
+│  - Poll JSONL every 2s  │    │  - send_keys to pane            │
+│  - Detect mtime changes │    │  - capture_pane for screenshot  │
+│  - Parse new lines      │    └──────────────┬─────────────────┘
+│  - Track pending tools  │                   │
+│    across poll cycles   │                   │
+└──────────┬──────────────┘                   │
+           │                                  │
+           ▼                                  ▼
+┌────────────────────────┐         ┌─────────────────────────┐
+│  TranscriptParser      │         │  Tmux Windows (cc:*)    │
+│  (transcript_parser.py)│         │  - Claude Code process  │
+│  - Parse JSONL entries │         │  - One window per       │
+│  - Pair tool_use ↔     │         │    project/session      │
+│    tool_result         │         └────────────┬────────────┘
+│  - Format expandable   │                      │
+│    quotes for thinking │              SessionStart hook
+│  - Extract history     │                      │
+└────────────────────────┘                      ▼
+                                   ┌────────────────────────┐
+┌────────────────────────┐         │  Hook (hook.py)        │
+│  SessionManager        │◄────────│  - Receive hook stdin  │
+│  (session.py)          │  reads  │  - Write session_map   │
+│  - Window ↔ Session    │  map    │    .json               │
+│    resolution          │         └────────────────────────┘
+│  - Active window per   │
+│    user                │         ┌────────────────────────┐
+│  - Message history     │────────►│  Claude Sessions       │
+│    retrieval           │  reads  │  ~/.claude/projects/   │
+└────────────────────────┘  JSONL  │  - sessions-index      │
+                                   │  - *.jsonl files       │
+┌────────────────────────┐         └────────────────────────┘
+│  MonitorState          │
+│  (monitor_state.py)    │
+│  - Track file mtime    │
+│  - Track line count    │
+│  - Prevent duplicates  │
+│    after restart       │
+└────────────────────────┘
+
+State files (~/.ccmux/):
+  state.json         ─ user→window mapping + window states
+  session_map.json   ─ hook-generated window→session mapping
+  monitor_state.json ─ poll progress per JSONL file
 ```
 
 **Key design decisions:**
-- **State anchored to tmux window names** — `state.json` stores `{user_id: window_name}` and `{window_name: window_state}`. Window names are stable.
-- **Persistent session association** — Each window stores its associated `session_id`, `last_msg_id`, and `pending_text` for session detection.
-- **New session detection** — When a new session is created or after `/clear`, the session is detected by matching the user's first message against recent JSONL files.
-- **Message ID tracking** — `last_msg_id` enables correct message polling after session switches.
-- Only sessions with matching tmux windows are displayed (enables bidirectional communication)
+- **Window-centric** — All state anchored to tmux window names (`cc:project`), not directories. Same directory can have multiple windows.
+- **Hook-based session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; monitor reads it each poll cycle to auto-detect session changes.
+- **Tool use ↔ tool result pairing** — `tool_use_id` tracked across poll cycles; tool result edits the original tool_use Telegram message in-place.
+- **MarkdownV2 with fallback** — All messages go through `_safe_reply`/`_safe_edit`/`_safe_send` which convert via `telegramify-markdown` and fall back to plain text on parse failure.
+- **No truncation at parse layer** — Full content preserved; splitting at send layer respects Telegram's 4096 char limit with expandable quote atomicity.
+- Only sessions with matching `cc:` tmux windows are displayed (enables bidirectional communication)
 - Notifications sent only to users whose active window matches the message's session
 
 ## Installation
@@ -105,22 +151,26 @@ uv run ccmux
 
 ### Commands
 
+**Bot commands:**
+
 | Command | Description |
 |---|---|
 | `/start` | Welcome message |
 | `/list` | Browse active sessions (inline buttons) |
 | `/history` | Show history for active session |
-| `/cancel` | Cancel current operation |
-| `/clear` | Forward to Claude Code: clear conversation |
-| `/compact` | Forward to Claude Code: compact context |
-| `/cost` | Forward to Claude Code: show token usage |
-| `/help` | Forward to Claude Code: show help |
-| `/review` | Forward to Claude Code: code review |
-| `/doctor` | Forward to Claude Code: diagnose environment |
-| `/memory` | Forward to Claude Code: edit CLAUDE.md |
-| `/init` | Forward to Claude Code: init project CLAUDE.md |
+| `/screenshot` | Capture terminal screenshot |
 
-Any unrecognized `/command` is also forwarded to Claude Code as-is.
+**Claude Code commands (forwarded via tmux):**
+
+| Command | Description |
+|---|---|
+| `/clear` | Clear conversation history |
+| `/compact` | Compact conversation context |
+| `/cost` | Show token/cost usage |
+| `/help` | Show Claude Code help |
+| `/memory` | Edit CLAUDE.md |
+
+Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/review`, `/doctor`, `/init`).
 
 ### Session List (`/list`)
 
@@ -224,6 +274,9 @@ src/ccmux/
 ├── session_monitor.py   # JSONL file monitoring (polling + change detection)
 ├── monitor_state.py     # Monitor state persistence
 ├── transcript_parser.py # Claude Code JSONL transcript parsing
+├── markdown_v2.py       # Markdown → Telegram MarkdownV2 conversion
+├── utils.py             # Shared utilities (atomic JSON writes, JSONL helpers)
 ├── telegram_sender.py   # Message splitting and sending utilities
+├── screenshot.py        # Terminal text → PNG image for /screenshot
 └── tmux_manager.py      # Tmux window management (list, create, send keys, kill)
 ```

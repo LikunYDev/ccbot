@@ -4,90 +4,26 @@ from __future__ import annotations
 
 import io
 import logging
-import os
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-# Font candidates ordered by priority:
-#   1. CJK monospace fonts (best: mono + CJK support)
-#   2. CJK proportional fonts (fallback: CJK support but not mono)
-#   3. Latin monospace fonts (fallback: mono but no CJK)
-_FONT_CANDIDATES: list[str] = [
-    # --- CJK Monospace ---
-    # Sarasa Mono (open-source CJK mono, popular choice)
-    "/usr/share/fonts/sarasa-gothic/SarasaMonoSC-Regular.ttf",
-    "/usr/share/fonts/truetype/sarasa/SarasaMonoSC-Regular.ttf",
-    # Noto Sans Mono CJK
-    "/usr/share/fonts/opentype/noto/NotoSansMonoCJKsc-Regular.otf",
-    "/usr/share/fonts/noto-cjk/NotoSansMonoCJKsc-Regular.otf",  # Fedora/Arch
-    "/usr/share/fonts/google-noto-sans-mono-cjk-ttc/NotoSansMonoCJK-Regular.ttc",
-    # WenQuanYi Mono
-    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",  # Fedora
-    # macOS CJK mono
-    "/System/Library/Fonts/PingFang.ttc",
-    "/Library/Fonts/Sarasa Mono SC Regular.ttf",
-
-    # --- CJK Proportional (still better than no CJK) ---
-    # Noto Sans CJK
-    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-    "/usr/share/fonts/noto-cjk/NotoSansCJKsc-Regular.otf",
-    "/usr/share/fonts/google-noto-sans-cjk-ttc/NotoSansCJK-Regular.ttc",
-    # Source Han Sans
-    "/usr/share/fonts/adobe-source-han-sans/SourceHanSansSC-Regular.otf",
-    "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
-    # macOS CJK
-    "/System/Library/Fonts/STHeiti Light.ttc",
-    "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    "/Library/Fonts/Arial Unicode.ttf",
-
-    # --- Latin Monospace (no CJK support) ---
-    # Linux - DejaVu
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",  # Fedora/RHEL
-    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",  # Arch
-    # Linux - Liberation Mono
-    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-    "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
-    # Linux - Ubuntu Mono
-    "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
-    # Linux - Noto Mono (Latin only)
-    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
-    # macOS Latin mono
-    "/System/Library/Fonts/Menlo.ttc",
-    "/System/Library/Fonts/SFMono-Regular.otf",
-    "/System/Library/Fonts/Monaco.ttf",
-    "/Library/Fonts/Courier New.ttf",
-    "/System/Library/Fonts/Supplemental/Courier New.ttf",
-]
-
-# Detected font path (resolved once at import time)
-_MONO_FONT_PATH: str | None = None
-
-for _path in _FONT_CANDIDATES:
-    if os.path.isfile(_path):
-        _MONO_FONT_PATH = _path
-        break
-
-if _MONO_FONT_PATH:
-    logger.info("Using font: %s", _MONO_FONT_PATH)
-else:
-    logger.warning("No suitable font found, falling back to Pillow default")
+# Bundled font: Noto Sans Mono CJK SC (OFL-1.1)
+_FONT_PATH = Path(__file__).parent / "fonts" / "NotoSansMonoCJKsc-Regular.otf"
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Load the detected monospace font at the given size."""
-    if _MONO_FONT_PATH:
-        try:
-            return ImageFont.truetype(_MONO_FONT_PATH, size)
-        except (OSError, IOError):
-            pass
-    return ImageFont.load_default()
+    """Load the bundled monospace font at the given size."""
+    try:
+        return ImageFont.truetype(str(_FONT_PATH), size)
+    except OSError:
+        logger.warning("Failed to load bundled font %s, using Pillow default", _FONT_PATH)
+        return ImageFont.load_default()
 
 
-def text_to_image(text: str, font_size: int = 14) -> bytes:
+def text_to_image(text: str, font_size: int = 28) -> bytes:
     """Render monospace text onto a dark-background image and return PNG bytes."""
     font = _load_font(font_size)
 
