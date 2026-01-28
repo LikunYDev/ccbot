@@ -23,6 +23,15 @@ class ParsedMessage:
     raw: dict | None = None  # Original data
 
 
+@dataclass
+class ParsedEntry:
+    """A single parsed message entry ready for display."""
+
+    role: str  # "user" | "assistant"
+    text: str  # Already formatted text
+    content_type: str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
+
+
 class TranscriptParser:
     """Parser for Claude Code JSONL session files."""
 
@@ -139,6 +148,67 @@ class TranscriptParser:
 
     _RE_COMMAND_NAME = re.compile(r"<command-name>(.*?)</command-name>")
     _RE_LOCAL_STDOUT = re.compile(r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL)
+    _RE_SYSTEM_TAGS = re.compile(r"<(bash-input|bash-stdout|bash-stderr|local-command-caveat|system-reminder)")
+
+    @staticmethod
+    def format_tool_use_summary(name: str, input_data: dict | Any) -> str:
+        """Format a tool_use block into a brief summary line.
+
+        Args:
+            name: Tool name (e.g. "Read", "Write", "Bash")
+            input_data: The tool input dict
+
+        Returns:
+            Formatted string like "🔧 Read: /path/to/file.py"
+        """
+        if not isinstance(input_data, dict):
+            return f"🔧 {name}"
+
+        # Pick a meaningful short summary based on tool name
+        summary = ""
+        if name in ("Read", "Glob"):
+            summary = input_data.get("file_path") or input_data.get("pattern", "")
+        elif name == "Write":
+            summary = input_data.get("file_path", "")
+        elif name in ("Edit", "NotebookEdit"):
+            summary = input_data.get("file_path") or input_data.get("notebook_path", "")
+        elif name == "Bash":
+            summary = input_data.get("command", "")
+        elif name == "Grep":
+            summary = input_data.get("pattern", "")
+        elif name == "Task":
+            summary = input_data.get("description", "")
+        elif name == "WebFetch":
+            summary = input_data.get("url", "")
+        elif name == "WebSearch":
+            summary = input_data.get("query", "")
+        else:
+            # Generic: show first string value
+            for v in input_data.values():
+                if isinstance(v, str) and v:
+                    summary = v
+                    break
+
+        if summary:
+            return f"🔧 **{name}** `{summary}`"
+        return f"🔧 **{name}**"
+
+    @staticmethod
+    def extract_tool_result_text(content: list | Any) -> str:
+        """Extract text from a tool_result content block."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    t = item.get("text", "")
+                    if t:
+                        parts.append(t)
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts)
+        return ""
 
     @classmethod
     def parse_message(cls, data: dict) -> ParsedMessage | None:
@@ -284,3 +354,183 @@ class TranscriptParser:
     def get_uuid(data: dict) -> str | None:
         """Extract message UUID from message data."""
         return data.get("uuid")
+
+    @staticmethod
+    def _format_expandable_quote(text: str) -> str:
+        """Format text as a Telegram expandable blockquote.
+
+        Uses the MarkdownV2 expandable blockquote syntax:
+        each line prefixed with '>' and the last line ending with '||'.
+        """
+        lines = text.split("\n")
+        quoted = "\n".join(f">{line}" for line in lines)
+        quoted += "||"
+        return quoted
+
+    @classmethod
+    def parse_entries(cls, entries: list[dict]) -> list[ParsedEntry]:
+        """Parse a list of JSONL entries into a flat list of display-ready messages.
+
+        This is the shared core logic used by both get_recent_messages (history)
+        and check_for_updates (monitor).
+
+        Args:
+            entries: List of parsed JSONL dicts (already filtered through parse_line)
+
+        Returns:
+            List of ParsedEntry with formatted text
+        """
+        result: list[ParsedEntry] = []
+        last_cmd_name: str | None = None
+        # Pending tool_use blocks from the last assistant message, keyed by id
+        pending_tools: dict[str, str] = {}  # tool_use_id -> formatted summary
+
+        for data in entries:
+            msg_type = cls.get_message_type(data)
+            if msg_type not in ("user", "assistant"):
+                continue
+
+            message = data.get("message", {})
+            content = message.get("content", "")
+            if not isinstance(content, list):
+                content = [{"type": "text", "text": str(content)}] if content else []
+
+            parsed = cls.parse_message(data)
+
+            # Handle local command messages first
+            if parsed:
+                if parsed.message_type == "local_command_invoke":
+                    last_cmd_name = parsed.tool_name
+                    continue
+                if parsed.message_type == "local_command":
+                    cmd = parsed.tool_name or last_cmd_name or ""
+                    text = parsed.text
+                    if cmd:
+                        if "\n" in text:
+                            formatted = f"❯ `{cmd}`\n```\n{text}\n```"
+                        else:
+                            formatted = f"❯ `{cmd}`\n`{text}`"
+                    else:
+                        if "\n" in text:
+                            formatted = f"```\n{text}\n```"
+                        else:
+                            formatted = f"`{text}`"
+                    result.append(ParsedEntry(
+                        role="assistant",
+                        text=formatted,
+                        content_type="local_command",
+                    ))
+                    last_cmd_name = None
+                    continue
+            last_cmd_name = None
+
+            if msg_type == "assistant":
+                # Flush any pending tools that didn't get results
+                for tool_summary in pending_tools.values():
+                    result.append(ParsedEntry(
+                        role="assistant", text=tool_summary, content_type="tool_use",
+                    ))
+                pending_tools = {}
+
+                # Process content blocks
+                has_text = False
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type", "")
+
+                    if btype == "text":
+                        t = block.get("text", "").strip()
+                        if t and t != "(no content)":
+                            result.append(ParsedEntry(
+                                role="assistant", text=t, content_type="text",
+                            ))
+                            has_text = True
+
+                    elif btype == "tool_use":
+                        tool_id = block.get("id", "")
+                        name = block.get("name", "unknown")
+                        inp = block.get("input", {})
+                        summary = cls.format_tool_use_summary(name, inp)
+                        if tool_id:
+                            pending_tools[tool_id] = summary
+                        else:
+                            result.append(ParsedEntry(
+                                role="assistant", text=summary, content_type="tool_use",
+                            ))
+
+                    elif btype == "thinking":
+                        thinking_text = block.get("thinking", "")
+                        if thinking_text:
+                            quoted = cls._format_expandable_quote(thinking_text)
+                            result.append(ParsedEntry(
+                                role="assistant", text=f"💭\n{quoted}", content_type="thinking",
+                            ))
+                        elif not has_text:
+                            result.append(ParsedEntry(
+                                role="assistant", text="💭 (thinking)", content_type="thinking",
+                            ))
+
+            elif msg_type == "user":
+                # Check for tool_result blocks and merge with pending tools
+                user_text_parts: list[str] = []
+
+                for block in content:
+                    if not isinstance(block, dict):
+                        if isinstance(block, str) and block.strip():
+                            user_text_parts.append(block.strip())
+                        continue
+                    btype = block.get("type", "")
+
+                    if btype == "tool_result":
+                        tool_use_id = block.get("tool_use_id", "")
+                        result_content = block.get("content", "")
+                        result_text = cls.extract_tool_result_text(result_content)
+                        tool_summary = pending_tools.pop(tool_use_id, None)
+                        if tool_summary:
+                            entry_text = tool_summary
+                            if result_text:
+                                entry_text += "\n" + cls._format_expandable_quote(result_text)
+                            result.append(ParsedEntry(
+                                role="assistant", text=entry_text, content_type="tool_result",
+                            ))
+                        elif result_text:
+                            result.append(ParsedEntry(
+                                role="assistant",
+                                text=cls._format_expandable_quote(result_text),
+                                content_type="tool_result",
+                            ))
+
+                    elif btype == "text":
+                        t = block.get("text", "").strip()
+                        if t and not cls._RE_SYSTEM_TAGS.search(t):
+                            user_text_parts.append(t)
+
+                # Flush remaining pending tools
+                for tool_summary in pending_tools.values():
+                    result.append(ParsedEntry(
+                        role="assistant", text=tool_summary, content_type="tool_use",
+                    ))
+                pending_tools = {}
+
+                # Add user text if present (skip if message was only tool_results)
+                if user_text_parts:
+                    combined = "\n".join(user_text_parts)
+                    # Skip if it looks like local command XML
+                    if not cls._RE_LOCAL_STDOUT.search(combined) and \
+                       not cls._RE_COMMAND_NAME.search(combined):
+                        result.append(ParsedEntry(
+                            role="user", text=combined, content_type="text",
+                        ))
+
+        # Flush any remaining pending tools at end
+        for tool_summary in pending_tools.values():
+            result.append(ParsedEntry(
+                role="assistant", text=tool_summary, content_type="tool_use",
+            ))
+
+        # Strip whitespace
+        for entry in result:
+            entry.text = entry.text.strip()
+
+        return result

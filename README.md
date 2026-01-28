@@ -13,6 +13,7 @@ Telegram Bot for monitoring and interacting with Claude Code sessions running in
 - **Kill sessions** — Terminate sessions remotely
 - **Message history** — Browse conversation history with pagination
 - **Persistent state** — Active window selection survives restarts
+- **Hook-based session tracking** — Auto-associates tmux windows with Claude sessions via hooks
 
 ## Architecture
 
@@ -77,6 +78,24 @@ cp .env.example .env
 | `BROWSE_ROOT_DIR` | cwd | Root directory for file browser |
 | `MONITOR_POLL_INTERVAL` | `2.0` | Polling interval in seconds |
 | `MONITOR_STABLE_WAIT` | `2.0` | File stability wait time in seconds |
+
+## Hook Setup (Recommended)
+
+To enable automatic session tracking when Claude Code starts or ends a session, add the following to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{ "type": "command", "command": "ccmux hook", "timeout": 5 }]
+      }
+    ]
+  }
+}
+```
+
+This writes window↔session mappings to `~/.ccmux/session_map.json`, so the bot automatically tracks which Claude session is running in each tmux window — even after `/new` or session restarts.
 
 ## Usage
 
@@ -189,6 +208,7 @@ Window names must start with the prefix `cc:` to be recognized.
 | Path | Description |
 |---|---|
 | `~/.ccmux/state.json` | Active window selections and window states (`{user_id: window_name}`, `{window_name: {session_id, last_msg_id, pending_text}}`) |
+| `~/.ccmux/session_map.json` | Hook-generated window↔session mappings |
 | `~/.ccmux/monitor_state.json` | Monitor state (prevents duplicate notifications) |
 | `~/.claude/projects/` | Claude Code session data (read-only) |
 
@@ -196,7 +216,8 @@ Window names must start with the prefix `cc:` to be recognized.
 
 ```
 src/ccmux/
-├── main.py              # Entry point (tmux session init + bot start)
+├── main.py              # Entry point (subcommand dispatch + bot start)
+├── hook.py              # Hook subcommand for session tracking
 ├── config.py            # Configuration from environment variables
 ├── bot.py               # Telegram bot handlers and inline UI
 ├── session.py           # Session management + message history

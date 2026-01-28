@@ -3,6 +3,7 @@
 import httpx
 
 from .config import config
+from .markdown_html import convert_markdown
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
@@ -48,22 +49,23 @@ def send_telegram_message(chat_id: int, text: str) -> bool:
     """
     url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
 
-    chunks = split_message(text)
+    chunks = split_message(text, max_length=3000)
     success = True
 
     with httpx.Client(timeout=30.0) as client:
         for chunk in chunks:
+            html_chunk = convert_markdown(chunk)
             try:
                 response = client.post(
                     url,
                     json={
                         "chat_id": chat_id,
-                        "text": chunk,
-                        "parse_mode": "Markdown",
+                        "text": html_chunk,
+                        "parse_mode": "MarkdownV2",
                     },
                 )
                 if not response.is_success:
-                    # Retry without Markdown parsing if it fails
+                    # Retry without HTML parsing if it fails
                     response = client.post(
                         url,
                         json={

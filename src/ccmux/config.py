@@ -12,7 +12,7 @@ class Config:
     def __init__(self) -> None:
         load_dotenv()
 
-        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         if not self.telegram_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
@@ -43,6 +43,9 @@ class Config:
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
         self.monitor_state_file = Path.home() / ".ccmux" / "monitor_state.json"
         self.monitor_stable_wait = float(os.getenv("MONITOR_STABLE_WAIT", "2.0"))
+
+        # Hook-based session map file
+        self.session_map_file = Path.home() / ".ccmux" / "session_map.json"
 
     def is_user_allowed(self, user_id: int) -> bool:
         """Check if a user is in the allowed list."""

@@ -1,14 +1,20 @@
 """Entry point for CCMux."""
 
 import logging
+import sys
 
 from .bot import create_bot
 from .config import config
+from .hook import hook_main
 from .tmux_manager import tmux_manager
 
 
 def main() -> None:
     """Main entry point."""
+    if len(sys.argv) > 1 and sys.argv[1] == "hook":
+        hook_main()
+        return
+
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.WARNING,

@@ -122,30 +122,28 @@ class TmuxManager:
                 return window
         return None
 
-    def find_window_by_cwd(self, target_cwd: str) -> TmuxWindow | None:
-        """Find a window by its working directory.
 
-        Args:
-            target_cwd: The working directory to match
+    def capture_pane(self, window_id: str) -> str | None:
+        """Capture the visible text content of a window's active pane.
 
         Returns:
-            TmuxWindow if found, None otherwise
+            The captured text, or None on failure.
         """
+        session = self.get_session()
+        if not session:
+            return None
         try:
-            normalized_target = str(Path(target_cwd).resolve())
-        except (OSError, ValueError):
-            normalized_target = target_cwd
-
-        for window in self.list_windows():
-            try:
-                normalized_cwd = str(Path(window.cwd).resolve())
-            except (OSError, ValueError):
-                normalized_cwd = window.cwd
-
-            if normalized_cwd == normalized_target:
-                return window
-
-        return None
+            window = session.windows.get(window_id=window_id)
+            if not window:
+                return None
+            pane = window.active_pane
+            if not pane:
+                return None
+            lines = pane.capture_pane()
+            return "\n".join(lines) if isinstance(lines, list) else str(lines)
+        except Exception as e:
+            logger.error(f"Failed to capture pane {window_id}: {e}")
+            return None
 
     def send_keys(self, window_id: str, text: str, enter: bool = True) -> bool:
         """Send keys to a specific window.
@@ -196,30 +194,12 @@ class TmuxManager:
             logger.error(f"Failed to kill window {window_id}: {e}")
             return False
 
-    def send_keys_by_cwd(self, target_cwd: str, text: str, enter: bool = True) -> bool:
-        """Send keys to a window matched by working directory.
-
-        Args:
-            target_cwd: The working directory to match
-            text: Text to send
-            enter: Whether to press enter after the text
-
-        Returns:
-            True if successful, False otherwise
-        """
-        window = self.find_window_by_cwd(target_cwd)
-        if not window:
-            logger.warning(f"No window found for cwd: {target_cwd}")
-            return False
-
-        return self.send_keys(window.window_id, text, enter)
-
     def create_window(
         self,
         work_dir: str,
         window_name: str | None = None,
         start_claude: bool = True,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
         """Create a new tmux window and optionally start Claude Code.
 
         Args:
@@ -228,27 +208,28 @@ class TmuxManager:
             start_claude: Whether to start claude command
 
         Returns:
-            Tuple of (success, message)
+            Tuple of (success, message, window_name)
         """
         session = self.get_or_create_session()
 
         # Validate directory
         path = Path(work_dir).expanduser().resolve()
         if not path.exists():
-            return False, f"Directory does not exist: {work_dir}"
+            return False, f"Directory does not exist: {work_dir}", ""
         if not path.is_dir():
-            return False, f"Not a directory: {work_dir}"
+            return False, f"Not a directory: {work_dir}", ""
 
-        # Check if window for this directory already exists
-        existing = self.find_window_by_cwd(str(path))
-        if existing:
-            return False, f"Window already exists for this directory: {existing.window_name}"
-
-        # Create window name with prefix
+        # Create window name with prefix, adding suffix if name already exists
         if not window_name:
             window_name = f"{config.tmux_window_prefix}{path.name}"
         elif not window_name.startswith(config.tmux_window_prefix):
             window_name = f"{config.tmux_window_prefix}{window_name}"
+
+        base_name = window_name
+        counter = 2
+        while self.find_window_by_name(window_name):
+            window_name = f"{base_name}-{counter}"
+            counter += 1
 
         try:
             # Create new window
@@ -263,11 +244,11 @@ class TmuxManager:
                 if pane:
                     pane.send_keys(config.claude_command, enter=True)
 
-            return True, f"Created window '{window_name}' at {path}"
+            return True, f"Created window '{window_name}' at {path}", window_name
 
         except Exception as e:
             logger.error(f"Failed to create window: {e}")
-            return False, f"Failed to create window: {e}"
+            return False, f"Failed to create window: {e}", ""
 
 
 # Global instance with default session name
