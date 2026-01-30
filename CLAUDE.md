@@ -153,6 +153,10 @@ Session monitor 通过 `session_map.json`（hook 写入）追踪 window → sess
 
 通过 `_font_tier()` 函数按字符 codepoint 判断使用哪级字体。支持完整的 ANSI 颜色解析（16 色 + 256 色 + RGB）。
 
+### 服务重启
+
+修改代码后需要重启 ccmux 服务时，执行 `./scripts/restart.sh`。脚本会自动检测 tmux session `ccmux` 的 `__main__` 窗口中是否有运行中的 `uv run ccmux` 进程，发送 Ctrl-C 停止后重新启动，并输出启动日志供确认。
+
 ### Hook 配置
 
 用户需在 `~/.claude/settings.json` 中配置：

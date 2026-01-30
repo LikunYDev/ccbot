@@ -1037,6 +1037,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if success:
             session_manager.set_active_window(user.id, created_wname)
 
+            # Wait for Claude Code's SessionStart hook to register in session_map
+            await session_manager.wait_for_session_map_entry(created_wname)
+
             # Update the directory browser message to show refreshed session list
             active_items = await session_manager.list_active_sessions()
             list_text = f"📊 {len(active_items)} active sessions:"

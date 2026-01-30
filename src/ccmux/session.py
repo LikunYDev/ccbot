@@ -147,6 +147,31 @@ class SessionManager:
                 self.window_states = {}
                 self.user_window_offsets = {}
 
+    async def wait_for_session_map_entry(
+        self, window_name: str, timeout: float = 5.0, interval: float = 0.5
+    ) -> bool:
+        """Poll session_map.json until an entry for window_name appears.
+
+        Returns True if the entry was found within timeout, False otherwise.
+        """
+        key = f"{config.tmux_session_name}:{window_name}"
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                if config.session_map_file.exists():
+                    async with aiofiles.open(config.session_map_file, "r") as f:
+                        content = await f.read()
+                    session_map = json.loads(content)
+                    info = session_map.get(key, {})
+                    if info.get("session_id"):
+                        # Found — load into window_states immediately
+                        await self.load_session_map()
+                        return True
+            except (json.JSONDecodeError, OSError):
+                pass
+            await asyncio.sleep(interval)
+        return False
+
     async def load_session_map(self) -> None:
         """Read session_map.json and update window_states with new session associations.
 
@@ -289,10 +314,13 @@ class SessionManager:
     async def list_active_sessions(self) -> list[tuple[TmuxWindow, ClaudeSession | None]]:
         """List active tmux windows paired with their resolved sessions.
 
-        Returns a list of (TmuxWindow, ClaudeSession | None) for windows
-        that have been registered via hook (present in window_states with session_id).
-        Multiple windows for the same directory are all included.
+        Refreshes session_map first to ensure we have the latest hook data,
+        then returns windows that have been registered (present in window_states
+        with session_id).
         """
+        # Refresh from session_map.json to pick up recently started sessions
+        await self.load_session_map()
+
         windows = await tmux_manager.list_windows()
         # Filter to only windows that have been registered (have session_id in window_states)
         registered_windows = [
