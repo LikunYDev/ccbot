@@ -2,6 +2,8 @@
 
 Control Claude Code sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in tmux.
 
+<video src="https://github.com/user-attachments/assets/319cf103-0da3-452e-89f1-e72b29efb5c4" controls></video>
+
 ## Why CCBot?
 
 Claude Code runs in your terminal. When you step away from your computer — commuting, on the couch, or just away from your desk — the session keeps working, but you lose visibility and control.
