@@ -229,7 +229,7 @@ class TmuxManager:
             # (arriving in the same input batch as the text) as a newline
             # rather than submit.  A 500ms gap lets the TUI process the
             # text before receiving Enter.
-            def _send_text() -> bool:
+            def _send_literal(chars: str) -> bool:
                 session = self.get_session()
                 if not session:
                     logger.error("No tmux session found")
@@ -243,7 +243,7 @@ class TmuxManager:
                     if not pane:
                         logger.error(f"No active pane in window {window_id}")
                         return False
-                    pane.send_keys(text, enter=False, literal=True)
+                    pane.send_keys(chars, enter=False, literal=True)
                     return True
                 except Exception as e:
                     logger.error(f"Failed to send keys to window {window_id}: {e}")
@@ -266,8 +266,19 @@ class TmuxManager:
                     logger.error(f"Failed to send Enter to window {window_id}: {e}")
                     return False
 
-            if not await asyncio.to_thread(_send_text):
-                return False
+            # Claude Code's ! command mode: send "!" first so the TUI
+            # switches to bash mode, wait 1s, then send the rest.
+            if text.startswith("!"):
+                if not await asyncio.to_thread(_send_literal, "!"):
+                    return False
+                rest = text[1:]
+                if rest:
+                    await asyncio.sleep(1.0)
+                    if not await asyncio.to_thread(_send_literal, rest):
+                        return False
+            else:
+                if not await asyncio.to_thread(_send_literal, text):
+                    return False
             await asyncio.sleep(0.5)
             return await asyncio.to_thread(_send_enter)
 
