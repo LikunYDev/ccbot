@@ -31,7 +31,7 @@ from .callback_data import (
     CB_ASK_TAB,
     CB_ASK_UP,
 )
-from .message_sender import NO_LINK_PREVIEW, send_with_fallback
+from .message_sender import NO_LINK_PREVIEW
 
 logger = logging.getLogger(__name__)
 
@@ -205,17 +205,21 @@ async def handle_interactive_ui(
             # Message unchanged or other error - silently ignore, don't send new
             return True
 
-    # Send new message
+    # Send new message (plain text — terminal content is not markdown)
     logger.info(
         "Sending interactive UI to user %d for window_id %s", user_id, window_id
     )
-    sent = await send_with_fallback(
-        bot,
-        chat_id,
-        text,
-        reply_markup=keyboard,
-        **thread_kwargs,  # type: ignore[arg-type]
-    )
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            link_preview_options=NO_LINK_PREVIEW,
+            **thread_kwargs,  # type: ignore[arg-type]
+        )
+    except Exception as e:
+        logger.error("Failed to send interactive UI: %s", e)
+        return False
     if sent:
         _interactive_msgs[ikey] = sent.message_id
         _interactive_mode[ikey] = window_id
