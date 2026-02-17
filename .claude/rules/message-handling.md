@@ -25,9 +25,10 @@ Per-user message queues + worker pattern for all send tasks:
 
 ## Rate Limiting
 
-- Minimum 1.1-second interval between messages per user
-- Status polling interval: 1 second (send layer has rate limiting protection)
-- Automated outbound messages (queue worker, status updates) go through `rate_limit_send()`
+- `AIORateLimiter(max_retries=5)` on the Application (30/s global)
+- On 429, AIORateLimiter pauses all concurrent requests (`_retry_after_event`) and retries after the ban
+- On restart, the global bucket is pre-filled (`_level=max_rate`) to avoid burst against Telegram's persisted server-side counter
+- Status polling interval: 1 second (skips enqueue when queue is non-empty)
 
 ## Performance Optimizations
 

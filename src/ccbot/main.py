@@ -41,8 +41,8 @@ def main() -> None:
         sys.exit(1)
 
     logging.getLogger("ccbot").setLevel(logging.DEBUG)
-    # Suppress noisy AIORateLimiter traceback on RetryAfter (we handle it ourselves)
-    logging.getLogger("telegram.ext.AIORateLimiter").setLevel(logging.CRITICAL)
+    # AIORateLimiter (max_retries=5) handles retries itself; keep INFO for visibility
+    logging.getLogger("telegram.ext.AIORateLimiter").setLevel(logging.INFO)
     logger = logging.getLogger(__name__)
 
     from .tmux_manager import tmux_manager

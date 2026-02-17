@@ -1322,6 +1322,17 @@ async def post_init(application: Application) -> None:
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
 
+    # Pre-fill global rate limiter bucket on restart.
+    # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
+    # server-side counter persists across bot restarts.  Setting _level=max_rate
+    # forces the bucket to start "full" so capacity drains in naturally (~1s).
+    # AIORateLimiter has no per-private-chat limiter, so max_retries is the
+    # primary protection (retry + pause all concurrent requests on 429).
+    rate_limiter = application.bot.rate_limiter
+    if rate_limiter and rate_limiter._base_limiter:
+        rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
+        logger.info("Pre-filled global rate limiter bucket")
+
     monitor = SessionMonitor()
 
     async def message_callback(msg: NewMessage) -> None:
@@ -1362,7 +1373,7 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter())
+        .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
