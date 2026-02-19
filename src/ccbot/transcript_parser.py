@@ -132,6 +132,8 @@ class TranscriptParser:
 
         return "\n".join(texts)
 
+    _RE_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
     _RE_COMMAND_NAME = re.compile(r"<command-name>(.*?)</command-name>")
     _RE_LOCAL_STDOUT = re.compile(
         r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL
@@ -259,6 +261,7 @@ class TranscriptParser:
             text = cls.extract_text_only(content)
         else:
             text = str(content) if content else ""
+        text = cls._RE_ANSI_ESCAPE.sub("", text)
 
         # Detect local command responses in user messages.
         # These are rendered as bot replies: "❯ /cmd\n  ⎿  output"
