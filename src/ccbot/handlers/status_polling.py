@@ -25,7 +25,7 @@ from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
-from ..tmux_manager import TmuxWindow, tmux_manager
+from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -48,17 +48,13 @@ async def update_status_message(
     user_id: int,
     window_id: str,
     thread_id: int | None = None,
-    window: TmuxWindow | None = None,
 ) -> None:
     """Poll terminal and enqueue status update for user's active window.
 
     Also detects permission prompt UIs (not triggered via JSONL) and enters
     interactive mode when found.
-
-    Args:
-        window: Pre-resolved TmuxWindow to skip redundant list_windows call.
     """
-    w = window or await tmux_manager.find_window_by_id(window_id)
+    w = await tmux_manager.find_window_by_id(window_id)
     if not w:
         # Window gone, enqueue clear
         await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
@@ -111,10 +107,6 @@ async def status_poll_loop(bot: Bot) -> None:
     last_topic_check = 0.0
     while True:
         try:
-            # Single list_windows call per cycle, build lookup map
-            all_windows = await tmux_manager.list_windows()
-            window_map: dict[str, TmuxWindow] = {w.window_id: w for w in all_windows}
-
             # Periodic topic existence probe
             now = time.monotonic()
             if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
@@ -130,7 +122,7 @@ async def status_poll_loop(bot: Bot) -> None:
                     except BadRequest as e:
                         if "Topic_id_invalid" in str(e):
                             # Topic deleted — kill window, unbind, and clean up state
-                            w = window_map.get(wid)
+                            w = await tmux_manager.find_window_by_id(wid)
                             if w:
                                 await tmux_manager.kill_window(w.window_id)
                             session_manager.unbind_thread(user_id, thread_id)
@@ -155,12 +147,10 @@ async def status_poll_loop(bot: Bot) -> None:
                             e,
                         )
 
-            # Collect status update coroutines to run in parallel
-            status_coros = []
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
                     # Clean up stale bindings (window no longer exists)
-                    w = window_map.get(wid)
+                    w = await tmux_manager.find_window_by_id(wid)
                     if not w:
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
@@ -172,30 +162,20 @@ async def status_poll_loop(bot: Bot) -> None:
                         )
                         continue
 
-                    queue = get_message_queue(user_id, thread_id)
+                    queue = get_message_queue(user_id)
                     if queue and not queue.empty():
                         continue
-                    status_coros.append(
-                        update_status_message(
-                            bot,
-                            user_id,
-                            wid,
-                            thread_id=thread_id,
-                            window=w,
-                        )
+                    await update_status_message(
+                        bot,
+                        user_id,
+                        wid,
+                        thread_id=thread_id,
                     )
                 except Exception as e:
                     logger.debug(
                         f"Status update error for user {user_id} "
                         f"thread {thread_id}: {e}"
                     )
-
-            # Parallelize independent pane captures across windows
-            if status_coros:
-                results = await asyncio.gather(*status_coros, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.debug("Status update error: %s", result)
         except Exception as e:
             logger.error(f"Status poll loop error: {e}")
 

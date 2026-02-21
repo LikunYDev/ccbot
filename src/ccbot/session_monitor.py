@@ -77,8 +77,6 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
-        # Fire-and-forget callback tasks (one per session group per poll cycle)
-        self._callback_tasks: set[asyncio.Task[None]] = set()
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
@@ -271,22 +269,18 @@ class SessionMonitor:
     async def check_for_updates(self, active_session_ids: set[str]) -> list[NewMessage]:
         """Check all sessions for new assistant messages.
 
-        Uses a collect → read → parse pipeline:
-          1. Collect: identify sessions that need reading (mtime/size changed)
-          2. Read: parallel async file reads via asyncio.gather
-          3. Parse: sequential per-session parsing (safe — _pending_tools keyed by session)
+        Reads from last byte offset. Emits both intermediate
+        (stop_reason=null) and complete messages.
 
         Args:
             active_session_ids: Set of session IDs currently in session_map
         """
-        new_messages: list[NewMessage] = []
+        new_messages = []
 
         # Scan projects to get available session files
         sessions = await self.scan_projects()
 
-        # Phase 1: Collect — identify sessions needing reads
-        to_read: list[tuple[SessionInfo, TrackedSession, float]] = []
-
+        # Only process sessions that are in session_map
         for session_info in sessions:
             if session_info.session_id not in active_session_ids:
                 continue
@@ -325,77 +319,55 @@ class SessionMonitor:
                     current_mtime <= last_mtime
                     and current_size <= tracked.last_byte_offset
                 ):
+                    # File hasn't changed, skip reading
                     continue
 
-                to_read.append((session_info, tracked, current_mtime))
+                # File changed, read new content from last offset
+                new_entries = await self._read_new_lines(
+                    tracked, session_info.file_path
+                )
+                self._file_mtimes[session_info.session_id] = current_mtime
+
+                if new_entries:
+                    logger.debug(
+                        f"Read {len(new_entries)} new entries for "
+                        f"session {session_info.session_id}"
+                    )
+
+                # Parse new entries using the shared logic, carrying over pending tools
+                carry = self._pending_tools.get(session_info.session_id, {})
+                parsed_entries, remaining = TranscriptParser.parse_entries(
+                    new_entries,
+                    pending_tools=carry,
+                )
+                if remaining:
+                    self._pending_tools[session_info.session_id] = remaining
+                else:
+                    self._pending_tools.pop(session_info.session_id, None)
+
+                for entry in parsed_entries:
+                    if not entry.text and not entry.image_data:
+                        continue
+                    # Skip user messages unless show_user_messages is enabled
+                    if entry.role == "user" and not config.show_user_messages:
+                        continue
+                    new_messages.append(
+                        NewMessage(
+                            session_id=session_info.session_id,
+                            text=entry.text,
+                            is_complete=True,
+                            content_type=entry.content_type,
+                            tool_use_id=entry.tool_use_id,
+                            role=entry.role,
+                            tool_name=entry.tool_name,
+                            image_data=entry.image_data,
+                        )
+                    )
+
+                self.state.update_session(tracked)
 
             except OSError as e:
-                logger.debug(f"Error collecting session {session_info.session_id}: {e}")
-
-        if not to_read:
-            self.state.save_if_dirty()
-            return new_messages
-
-        # Phase 2: Read — parallel file reads
-        read_results: list[list[dict[str, Any]] | BaseException] = await asyncio.gather(
-            *(
-                self._read_new_lines(tracked, si.file_path)
-                for si, tracked, _mtime in to_read
-            ),
-            return_exceptions=True,
-        )
-
-        # Phase 3: Parse — sequential per session
-        for (session_info, tracked, current_mtime), result in zip(
-            to_read, read_results, strict=True
-        ):
-            if isinstance(result, BaseException):
-                logger.debug(
-                    "Error reading session %s: %s", session_info.session_id, result
-                )
-                continue
-
-            new_entries: list[dict[str, Any]] = result
-            self._file_mtimes[session_info.session_id] = current_mtime
-
-            if new_entries:
-                logger.debug(
-                    "Read %d new entries for session %s",
-                    len(new_entries),
-                    session_info.session_id,
-                )
-
-            # Parse new entries using the shared logic, carrying over pending tools
-            carry = self._pending_tools.get(session_info.session_id, {})
-            parsed_entries, remaining = TranscriptParser.parse_entries(
-                new_entries,
-                pending_tools=carry,
-            )
-            if remaining:
-                self._pending_tools[session_info.session_id] = remaining
-            else:
-                self._pending_tools.pop(session_info.session_id, None)
-
-            for entry in parsed_entries:
-                if not entry.text and not entry.image_data:
-                    continue
-                # Skip user messages unless show_user_messages is enabled
-                if entry.role == "user" and not config.show_user_messages:
-                    continue
-                new_messages.append(
-                    NewMessage(
-                        session_id=session_info.session_id,
-                        text=entry.text,
-                        is_complete=True,
-                        content_type=entry.content_type,
-                        tool_use_id=entry.tool_use_id,
-                        role=entry.role,
-                        tool_name=entry.tool_name,
-                        image_data=entry.image_data,
-                    )
-                )
-
-            self.state.update_session(tracked)
+                logger.debug(f"Error processing session {session_info.session_id}: {e}")
 
         self.state.save_if_dirty()
         return new_messages
@@ -494,17 +466,6 @@ class SessionMonitor:
 
         return current_map
 
-    async def _dispatch_session_messages(
-        self, session_id: str, messages: list[NewMessage]
-    ) -> None:
-        """Dispatch messages for one session sequentially (fire-and-forget task)."""
-        for msg in messages:
-            try:
-                if self._message_callback:
-                    await self._message_callback(msg)
-            except Exception as e:
-                logger.error("Message callback error (session %s): %s", session_id, e)
-
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.
 
@@ -532,23 +493,15 @@ class SessionMonitor:
                 # Check for new messages (all I/O is async)
                 new_messages = await self.check_for_updates(active_session_ids)
 
-                if new_messages and self._message_callback:
-                    # Group messages by session_id for concurrent dispatch
-                    groups: dict[str, list[NewMessage]] = {}
-                    for msg in new_messages:
-                        status = "complete" if msg.is_complete else "streaming"
-                        preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
-                        logger.info(
-                            "[%s] session=%s: %s", status, msg.session_id, preview
-                        )
-                        groups.setdefault(msg.session_id, []).append(msg)
-
-                    for session_id, msgs in groups.items():
-                        task = asyncio.create_task(
-                            self._dispatch_session_messages(session_id, msgs)
-                        )
-                        self._callback_tasks.add(task)
-                        task.add_done_callback(self._callback_tasks.discard)
+                for msg in new_messages:
+                    status = "complete" if msg.is_complete else "streaming"
+                    preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
+                    logger.info("[%s] session=%s: %s", status, msg.session_id, preview)
+                    if self._message_callback:
+                        try:
+                            await self._message_callback(msg)
+                        except Exception as e:
+                            logger.error(f"Message callback error: {e}")
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
@@ -569,9 +522,5 @@ class SessionMonitor:
         if self._task:
             self._task.cancel()
             self._task = None
-        # Cancel outstanding fire-and-forget callback tasks
-        for task in list(self._callback_tasks):
-            task.cancel()
-        self._callback_tasks.clear()
         self.state.save()
         logger.info("Session monitor stopped and state saved")

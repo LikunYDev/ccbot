@@ -1430,7 +1430,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # Mark interactive mode BEFORE sleeping so polling skips this window
             set_interactive_mode(user_id, wid, thread_id)
             # Flush pending messages (e.g. plan content) before sending interactive UI
-            queue = get_message_queue(user_id, thread_id)
+            queue = get_message_queue(user_id)
             if queue:
                 await queue.join()
             # Wait briefly for Claude Code to render the question UI

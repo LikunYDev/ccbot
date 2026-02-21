@@ -55,11 +55,10 @@ class MessageTask:
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
 
 
-# Per-topic message queues and worker tasks — keyed by (user_id, thread_id_or_0)
-_QueueKey = tuple[int, int]
-_message_queues: dict[_QueueKey, asyncio.Queue[MessageTask]] = {}
-_queue_workers: dict[_QueueKey, asyncio.Task[None]] = {}
-_queue_locks: dict[_QueueKey, asyncio.Lock] = {}  # Protect drain/refill operations
+# Per-user message queues and worker tasks
+_message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
+_queue_workers: dict[int, asyncio.Task[None]] = {}
+_queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
 
 # Map (tool_use_id, user_id, thread_id_or_0) -> telegram message_id
 # for editing tool_use messages with results
@@ -68,32 +67,28 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
-# Flood control: (user_id, thread_id_or_0) -> monotonic time when ban expires
-_flood_until: dict[_QueueKey, float] = {}
+# Flood control: user_id -> monotonic time when ban expires
+_flood_until: dict[int, float] = {}
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
 
 
-def get_message_queue(
-    user_id: int, thread_id: int | None = None
-) -> asyncio.Queue[MessageTask] | None:
-    """Get the message queue for a user+topic (if exists)."""
-    key: _QueueKey = (user_id, thread_id or 0)
-    return _message_queues.get(key)
+def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
+    """Get the message queue for a user (if exists)."""
+    return _message_queues.get(user_id)
 
 
-def get_or_create_queue(
-    bot: Bot, user_id: int, thread_id: int | None = None
-) -> asyncio.Queue[MessageTask]:
-    """Get or create message queue and worker for a user+topic."""
-    key: _QueueKey = (user_id, thread_id or 0)
-    if key not in _message_queues:
-        _message_queues[key] = asyncio.Queue()
-        _queue_locks[key] = asyncio.Lock()
-        # Start worker task for this topic
-        _queue_workers[key] = asyncio.create_task(_message_queue_worker(bot, key))
-    return _message_queues[key]
+def get_or_create_queue(bot: Bot, user_id: int) -> asyncio.Queue[MessageTask]:
+    """Get or create message queue and worker for a user."""
+    if user_id not in _message_queues:
+        _message_queues[user_id] = asyncio.Queue()
+        _queue_locks[user_id] = asyncio.Lock()
+        # Start worker task for this user
+        _queue_workers[user_id] = asyncio.create_task(
+            _message_queue_worker(bot, user_id)
+        )
+    return _message_queues[user_id]
 
 
 def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
@@ -191,19 +186,18 @@ async def _merge_content_tasks(
     )
 
 
-async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
-    """Process message tasks for a user+topic sequentially."""
-    user_id, _thread_id = key
-    queue = _message_queues[key]
-    lock = _queue_locks[key]
-    logger.info("Message queue worker started for %s", key)
+async def _message_queue_worker(bot: Bot, user_id: int) -> None:
+    """Process message tasks for a user sequentially."""
+    queue = _message_queues[user_id]
+    lock = _queue_locks[user_id]
+    logger.info(f"Message queue worker started for user {user_id}")
 
     while True:
         try:
             task = await queue.get()
             try:
                 # Flood control: drop status, wait for content
-                flood_end = _flood_until.get(key, 0)
+                flood_end = _flood_until.get(user_id, 0)
                 if flood_end > 0:
                     remaining = flood_end - time.monotonic()
                     if remaining > 0:
@@ -212,14 +206,14 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                             continue
                         # Content is actual Claude output — wait then send
                         logger.debug(
-                            "Flood controlled: waiting %.0fs for content (%s)",
+                            "Flood controlled: waiting %.0fs for content (user %d)",
                             remaining,
-                            key,
+                            user_id,
                         )
                         await asyncio.sleep(remaining)
                     # Ban expired
-                    _flood_until.pop(key, None)
-                    logger.info("Flood control lifted for %s", key)
+                    _flood_until.pop(user_id, None)
+                    logger.info("Flood control lifted for user %d", user_id)
 
                 if task.task_type == "content":
                     # Try to merge consecutive content tasks
@@ -227,7 +221,7 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                         queue, task, lock
                     )
                     if merge_count > 0:
-                        logger.debug("Merged %d tasks for %s", merge_count, key)
+                        logger.debug(f"Merged {merge_count} tasks for user {user_id}")
                         # Mark merged tasks as done
                         for _ in range(merge_count):
                             queue.task_done()
@@ -243,29 +237,29 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                     else int(e.retry_after.total_seconds())
                 )
                 if retry_secs > FLOOD_CONTROL_MAX_WAIT:
-                    _flood_until[key] = time.monotonic() + retry_secs
+                    _flood_until[user_id] = time.monotonic() + retry_secs
                     logger.warning(
-                        "Flood control for %s: retry_after=%ds, "
+                        "Flood control for user %d: retry_after=%ds, "
                         "pausing queue until ban expires",
-                        key,
+                        user_id,
                         retry_secs,
                     )
                 else:
                     logger.warning(
-                        "Flood control for %s: waiting %ds",
-                        key,
+                        "Flood control for user %d: waiting %ds",
+                        user_id,
                         retry_secs,
                     )
                     await asyncio.sleep(retry_secs)
             except Exception as e:
-                logger.error("Error processing message task for %s: %s", key, e)
+                logger.error(f"Error processing message task for user {user_id}: {e}")
             finally:
                 queue.task_done()
         except asyncio.CancelledError:
-            logger.info("Message queue worker cancelled for %s", key)
+            logger.info(f"Message queue worker cancelled for user {user_id}")
             break
         except Exception as e:
-            logger.error("Unexpected error in queue worker for %s: %s", key, e)
+            logger.error(f"Unexpected error in queue worker for user {user_id}: {e}")
 
 
 def _send_kwargs(thread_id: int | None) -> dict[str, int]:
@@ -575,8 +569,7 @@ async def _check_and_send_status(
 ) -> None:
     """Check terminal for status line and send status message if present."""
     # Skip if there are more messages pending in the queue
-    key: _QueueKey = (user_id, thread_id or 0)
-    queue = _message_queues.get(key)
+    queue = _message_queues.get(user_id)
     if queue and not queue.empty():
         return
     w = await tmux_manager.find_window_by_id(window_id)
@@ -611,7 +604,7 @@ async def enqueue_content_message(
         window_id,
         content_type,
     )
-    queue = get_or_create_queue(bot, user_id, thread_id)
+    queue = get_or_create_queue(bot, user_id)
 
     task = MessageTask(
         task_type="content",
@@ -634,13 +627,12 @@ async def enqueue_status_update(
     thread_id: int | None = None,
 ) -> None:
     """Enqueue status update. Skipped if text unchanged or during flood control."""
-    tid = thread_id or 0
-    key: _QueueKey = (user_id, tid)
-
     # Don't enqueue during flood control — they'd just be dropped
-    flood_end = _flood_until.get(key, 0)
+    flood_end = _flood_until.get(user_id, 0)
     if flood_end > time.monotonic():
         return
+
+    tid = thread_id or 0
 
     # Deduplicate: skip if text matches what's already displayed
     if status_text:
@@ -649,7 +641,7 @@ async def enqueue_status_update(
         if info and info[1] == window_id and info[2] == status_text:
             return
 
-    queue = get_or_create_queue(bot, user_id, thread_id)
+    queue = get_or_create_queue(bot, user_id)
 
     if status_text:
         task = MessageTask(
