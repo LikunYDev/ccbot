@@ -150,10 +150,21 @@ class SessionManager:
                     int(uid): offsets
                     for uid, offsets in state.get("user_window_offsets", {}).items()
                 }
-                self.thread_bindings = {
-                    int(uid): {int(tid): wid for tid, wid in bindings.items()}
-                    for uid, bindings in state.get("thread_bindings", {}).items()
-                }
+                self.thread_bindings = {}
+                for uid, bindings in state.get("thread_bindings", {}).items():
+                    parsed: dict[int, str] = {}
+                    for tid, wid in bindings.items():
+                        if isinstance(wid, dict):
+                            # Old format: {"window_id": "@4", "chat_id": ...}
+                            parsed[int(tid)] = wid["window_id"]
+                            # Migrate chat_id to group_chat_ids
+                            chat_id = wid.get("chat_id")
+                            if chat_id and int(chat_id) < 0:
+                                key = f"{uid}:{tid}"
+                                self.group_chat_ids[key] = int(chat_id)
+                        else:
+                            parsed[int(tid)] = wid
+                    self.thread_bindings[int(uid)] = parsed
                 self.window_display_names = state.get("window_display_names", {})
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()

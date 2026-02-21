@@ -1526,6 +1526,25 @@ async def post_init(application: Application) -> None:
     if rate_limiter and rate_limiter._base_limiter:
         rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
         logger.info("Pre-filled global rate limiter bucket")
+        # Also pre-fill per-group limiters for known chat IDs.
+        # Without this, the group limiter allows a burst of 20 requests on restart,
+        # which can exceed Telegram's persisted server-side per-group counter.
+        if hasattr(rate_limiter, "_group_limiters"):
+            from aiolimiter import AsyncLimiter
+
+            group_rate = getattr(rate_limiter, "_group_max_rate", 20)
+            group_period = getattr(rate_limiter, "_group_time_period", 60)
+            seen_chat_ids: set[int] = set()
+            for chat_id in session_manager.group_chat_ids.values():
+                if chat_id < 0 and chat_id not in seen_chat_ids:
+                    seen_chat_ids.add(chat_id)
+                    limiter = AsyncLimiter(group_rate, group_period)
+                    limiter._level = limiter.max_rate
+                    rate_limiter._group_limiters[chat_id] = limiter
+            if seen_chat_ids:
+                logger.info(
+                    "Pre-filled %d group rate limiter bucket(s)", len(seen_chat_ids)
+                )
 
     monitor = SessionMonitor()
 
