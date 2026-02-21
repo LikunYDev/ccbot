@@ -30,8 +30,6 @@ from telegram.error import RetryAfter
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..transcript_parser import TranscriptParser
-from ..terminal_parser import parse_status_line
-from ..tmux_manager import tmux_manager
 from .message_sender import NO_LINK_PREVIEW, send_photo, send_with_fallback
 
 logger = logging.getLogger(__name__)
@@ -73,6 +71,16 @@ _flood_until: dict[_QueueKey, float] = {}
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
+
+# Per-group-chat processing lock — serializes API calls across topic workers
+# sending to the same Telegram group to prevent rate limit bursts
+_group_process_locks: dict[int, asyncio.Lock] = {}
+
+# Typing indicator throttle: (user_id, thread_id_or_0) -> monotonic time of last send
+_last_typing: dict[tuple[int, int], float] = {}
+
+# Minimum interval between typing indicators to same topic (seconds)
+TYPING_MIN_INTERVAL = 4.0
 
 
 def get_message_queue(
@@ -196,6 +204,14 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
     user_id, _thread_id = key
     queue = _message_queues[key]
     lock = _queue_locks[key]
+
+    # Shared per-group-chat lock — serializes sends across topic workers
+    # to stay within Telegram's per-group rate limit
+    chat_id = session_manager.resolve_chat_id(user_id, _thread_id or None)
+    if chat_id not in _group_process_locks:
+        _group_process_locks[chat_id] = asyncio.Lock()
+    group_lock = _group_process_locks[chat_id]
+
     logger.info("Message queue worker started for %s", key)
 
     while True:
@@ -221,21 +237,24 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                     _flood_until.pop(key, None)
                     logger.info("Flood control lifted for %s", key)
 
-                if task.task_type == "content":
-                    # Try to merge consecutive content tasks
-                    merged_task, merge_count = await _merge_content_tasks(
-                        queue, task, lock
-                    )
-                    if merge_count > 0:
-                        logger.debug("Merged %d tasks for %s", merge_count, key)
-                        # Mark merged tasks as done
-                        for _ in range(merge_count):
-                            queue.task_done()
-                    await _process_content_task(bot, user_id, merged_task)
-                elif task.task_type == "status_update":
-                    await _process_status_update_task(bot, user_id, task)
-                elif task.task_type == "status_clear":
-                    await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+                async with group_lock:
+                    if task.task_type == "content":
+                        # Try to merge consecutive content tasks
+                        merged_task, merge_count = await _merge_content_tasks(
+                            queue, task, lock
+                        )
+                        if merge_count > 0:
+                            logger.debug("Merged %d tasks for %s", merge_count, key)
+                            # Mark merged tasks as done
+                            for _ in range(merge_count):
+                                queue.task_done()
+                        await _process_content_task(bot, user_id, merged_task)
+                    elif task.task_type == "status_update":
+                        await _process_status_update_task(bot, user_id, task)
+                    elif task.task_type == "status_clear":
+                        await _do_clear_status_message(
+                            bot, user_id, task.thread_id or 0
+                        )
             except RetryAfter as e:
                 retry_secs = (
                     e.retry_after
@@ -316,7 +335,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     link_preview_options=NO_LINK_PREVIEW,
                 )
                 await _send_task_images(bot, chat_id, task)
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
                 raise
@@ -335,7 +353,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         link_preview_options=NO_LINK_PREVIEW,
                     )
                     await _send_task_images(bot, chat_id, task)
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
                     raise
@@ -379,9 +396,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
-
-    # 5. After content, check and send status
-    await _check_and_send_status(bot, user_id, wid, task.thread_id)
 
 
 async def _convert_status_to_content(
@@ -472,16 +486,19 @@ async def _process_status_update_task(
             return
         else:
             # Same window, text changed - edit in place
-            # Send typing indicator when Claude is working
+            # Send typing indicator when Claude is working (throttled)
             if "esc to interrupt" in status_text.lower():
-                try:
-                    await bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.TYPING
-                    )
-                except RetryAfter:
-                    raise
-                except Exception:
-                    pass
+                now = time.monotonic()
+                if now - _last_typing.get(skey, 0) >= TYPING_MIN_INTERVAL:
+                    try:
+                        await bot.send_chat_action(
+                            chat_id=chat_id, action=ChatAction.TYPING
+                        )
+                        _last_typing[skey] = now
+                    except RetryAfter:
+                        raise
+                    except Exception:
+                        pass
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -532,14 +549,17 @@ async def _do_send_status_message(
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
         except Exception:
             pass
-    # Send typing indicator when Claude is working
+    # Send typing indicator when Claude is working (throttled)
     if "esc to interrupt" in text.lower():
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except RetryAfter:
-            raise
-        except Exception:
-            pass
+        now = time.monotonic()
+        if now - _last_typing.get(skey, 0) >= TYPING_MIN_INTERVAL:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                _last_typing[skey] = now
+            except RetryAfter:
+                raise
+            except Exception:
+                pass
     sent = await send_with_fallback(
         bot,
         chat_id,
@@ -565,32 +585,6 @@ async def _do_clear_status_message(
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
             logger.debug(f"Failed to delete status message {msg_id}: {e}")
-
-
-async def _check_and_send_status(
-    bot: Bot,
-    user_id: int,
-    window_id: str,
-    thread_id: int | None = None,
-) -> None:
-    """Check terminal for status line and send status message if present."""
-    # Skip if there are more messages pending in the queue
-    key: _QueueKey = (user_id, thread_id or 0)
-    queue = _message_queues.get(key)
-    if queue and not queue.empty():
-        return
-    w = await tmux_manager.find_window_by_id(window_id)
-    if not w:
-        return
-
-    pane_text = await tmux_manager.capture_pane(w.window_id)
-    if not pane_text:
-        return
-
-    tid = thread_id or 0
-    status_line = parse_status_line(pane_text)
-    if status_line:
-        await _do_send_status_message(bot, user_id, tid, window_id, status_line)
 
 
 async def enqueue_content_message(
@@ -695,4 +689,6 @@ async def shutdown_workers() -> None:
     _queue_workers.clear()
     _message_queues.clear()
     _queue_locks.clear()
+    _group_process_locks.clear()
+    _last_typing.clear()
     logger.info("Message queue workers stopped")
