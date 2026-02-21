@@ -74,6 +74,22 @@ class Config:
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = True
 
+        # Display thinking messages in real-time and history
+        # Set SHOW_THINKING=false to skip thinking blocks (reduces Telegram API calls)
+        self.show_thinking = os.getenv("SHOW_THINKING", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
+        # Display tool_use/tool_result messages in real-time and history
+        # Set SHOW_TOOLS=false to skip tool messages (reduces Telegram API calls)
+        self.show_tools = os.getenv("SHOW_TOOLS", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
             "tmux_session=%s",

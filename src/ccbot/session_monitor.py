@@ -21,6 +21,7 @@ from typing import Any, Callable, Awaitable
 import aiofiles
 
 from .config import config
+from .handlers.interactive_ui import INTERACTIVE_TOOL_NAMES
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
@@ -382,6 +383,20 @@ class SessionMonitor:
                 # Skip user messages unless show_user_messages is enabled
                 if entry.role == "user" and not config.show_user_messages:
                     continue
+                # Skip thinking messages unless show_thinking is enabled
+                if entry.content_type == "thinking" and not config.show_thinking:
+                    continue
+                # Skip tool messages unless show_tools is enabled
+                # Exception: interactive tools (AskUserQuestion, ExitPlanMode) must pass through
+                if (
+                    entry.content_type in ("tool_use", "tool_result")
+                    and not config.show_tools
+                ):
+                    if not (
+                        entry.content_type == "tool_use"
+                        and entry.tool_name in INTERACTIVE_TOOL_NAMES
+                    ):
+                        continue
                 new_messages.append(
                     NewMessage(
                         session_id=session_info.session_id,

@@ -19,6 +19,7 @@ Key components:
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Literal
@@ -81,6 +82,16 @@ _last_typing: dict[tuple[int, int], float] = {}
 
 # Minimum interval between typing indicators to same topic (seconds)
 TYPING_MIN_INTERVAL = 4.0
+
+
+# Regex to strip the stats parenthetical from status lines, e.g.:
+# "Unravelling… (45s · ↓ 2.5k tokens · thought for 25s)" → "Unravelling…"
+_STATUS_STATS_RE = re.compile(r"\s*\([\d]+s\s*·.*\)\s*$")
+
+
+def _strip_status_stats(text: str) -> str:
+    """Strip the timing/stats parenthetical from a status line for dedup."""
+    return _STATUS_STATS_RE.sub("", text)
 
 
 def get_message_queue(
@@ -481,8 +492,8 @@ async def _process_status_update_task(
             # Window changed - delete old and send new
             await _do_clear_status_message(bot, user_id, tid)
             await _do_send_status_message(bot, user_id, tid, wid, status_text)
-        elif status_text == last_text:
-            # Same content, skip edit
+        elif _strip_status_stats(status_text) == _strip_status_stats(last_text):
+            # Same action (ignoring timer changes), skip edit
             return
         else:
             # Same window, text changed - edit in place
@@ -636,11 +647,15 @@ async def enqueue_status_update(
     if flood_end > time.monotonic():
         return
 
-    # Deduplicate: skip if text matches what's already displayed
+    # Deduplicate: skip if action text matches (ignoring timer/stats changes)
     if status_text:
         skey = (user_id, tid)
         info = _status_msg_info.get(skey)
-        if info and info[1] == window_id and info[2] == status_text:
+        if (
+            info
+            and info[1] == window_id
+            and _strip_status_stats(info[2]) == _strip_status_stats(status_text)
+        ):
             return
 
     queue = get_or_create_queue(bot, user_id, thread_id)

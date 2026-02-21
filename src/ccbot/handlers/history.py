@@ -160,6 +160,16 @@ async def send_history(
 
         lines = [header]
         for msg in messages:
+            # Skip thinking messages unless show_thinking is enabled
+            if msg.get("content_type") == "thinking" and not config.show_thinking:
+                continue
+            # Skip tool messages unless show_tools is enabled
+            if (
+                msg.get("content_type") in ("tool_use", "tool_result")
+                and not config.show_tools
+            ):
+                continue
+
             # Format timestamp as HH:MM
             ts = msg.get("timestamp")
             if ts:
