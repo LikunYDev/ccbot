@@ -92,6 +92,60 @@ class TestHandleInteractiveUI:
         assert result is False
         mock_bot.send_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_handle_exit_plan_numbered_sends_keyboard(
+        self, mock_bot: AsyncMock, sample_pane_exit_plan_numbered: str
+    ):
+        """New numbered ExitPlanMode format triggers keyboard send."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(
+                return_value=sample_pane_exit_plan_numbered
+            )
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+        assert result is True
+        mock_bot.send_message.assert_called_once()
+        call_kwargs = mock_bot.send_message.call_args
+        assert call_kwargs.kwargs["reply_markup"] is not None
+
+    @pytest.mark.asyncio
+    async def test_exit_plan_old_format_sends_keyboard(
+        self, mock_bot: AsyncMock, sample_pane_exit_plan: str
+    ):
+        """Old ExitPlanMode format still triggers keyboard send (backward compat)."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_exit_plan)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+        assert result is True
+        mock_bot.send_message.assert_called_once()
+        call_kwargs = mock_bot.send_message.call_args
+        assert call_kwargs.kwargs["reply_markup"] is not None
+
 
 class TestKeyboardLayoutForSettings:
     def test_settings_keyboard_includes_all_nav_keys(self):

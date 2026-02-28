@@ -139,3 +139,108 @@ class TestStatusPollerSettingsDetection:
             assert keyboard is not None
             # Verify the message text contains model picker content
             assert "Select model" in call_kwargs["text"]
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestStatusPollerExitPlanDetection:
+    """Simulate the status poller detecting ExitPlanMode UI (numbered format)."""
+
+    @pytest.mark.asyncio
+    async def test_exit_plan_with_session_defers_to_jsonl(
+        self, mock_bot: AsyncMock, sample_pane_exit_plan_numbered: str
+    ):
+        """ExitPlanMode with active session → set_interactive_mode, no handle_interactive_ui."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        mock_ws = MagicMock()
+        mock_ws.session_id = "uuid-xxx"
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+            patch(
+                "ccbot.handlers.status_polling.set_interactive_mode",
+            ) as mock_set_mode,
+            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(
+                return_value=sample_pane_exit_plan_numbered
+            )
+            mock_sm.get_window_state.return_value = mock_ws
+
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_set_mode.assert_called_once_with(1, window_id, 42)
+            mock_handle_ui.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exit_plan_without_session_sends_immediately(
+        self, mock_bot: AsyncMock, sample_pane_exit_plan_numbered: str
+    ):
+        """ExitPlanMode with no session_id → handle_interactive_ui called (fallback)."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        mock_ws = MagicMock()
+        mock_ws.session_id = ""
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(
+                return_value=sample_pane_exit_plan_numbered
+            )
+            mock_sm.get_window_state.return_value = mock_ws
+            mock_handle_ui.return_value = True
+
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+
+    @pytest.mark.asyncio
+    async def test_permission_prompt_always_sends_immediately(
+        self, mock_bot: AsyncMock, sample_pane_permission: str
+    ):
+        """PermissionPrompt → handle_interactive_ui called regardless of session_id."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        mock_ws = MagicMock()
+        mock_ws.session_id = "uuid-xxx"
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_permission)
+            mock_sm.get_window_state.return_value = mock_ws
+            mock_handle_ui.return_value = True
+
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
