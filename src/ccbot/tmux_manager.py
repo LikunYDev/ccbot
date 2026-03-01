@@ -102,6 +102,9 @@ class TmuxManager:
                     pane = window.active_pane
                     if pane:
                         cwd = pane.pane_current_path or ""
+                        # tmux appends " (deleted)" when cwd no longer exists
+                        if cwd.endswith(" (deleted)"):
+                            cwd = cwd.removesuffix(" (deleted)")
                         pane_cmd = pane.pane_current_command or ""
                     else:
                         cwd = ""

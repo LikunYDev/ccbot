@@ -24,12 +24,14 @@ from telegram import Bot
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import is_interactive_ui, parse_status_line
+from ..terminal_parser import extract_interactive_content, parse_status_line
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
+    INTERACTIVE_TOOL_NAMES,
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
+    set_interactive_mode,
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
@@ -70,7 +72,7 @@ async def update_status_message(
 
     if interactive_window == window_id:
         # User is in interactive mode for THIS window
-        if is_interactive_ui(pane_text):
+        if extract_interactive_content(pane_text) is not None:
             # Interactive UI still showing — skip status update (user is interacting)
             return
         # Interactive UI gone — clear interactive mode, fall through to status check.
@@ -82,10 +84,28 @@ async def update_status_message(
         # Clear stale interactive mode
         await clear_interactive_msg(user_id, bot, thread_id)
 
-    # Check for permission prompt (interactive UI not triggered via JSONL)
-    if should_check_new_ui and is_interactive_ui(pane_text):
-        await handle_interactive_ui(bot, user_id, window_id, thread_id)
-        return
+    # Check for interactive UI in terminal
+    if should_check_new_ui:
+        content = extract_interactive_content(pane_text)
+        if content is not None:
+            if content.name == "Feedback":
+                # Auto-dismiss feedback survey by pressing "0" (Dismiss)
+                await tmux_manager.send_keys(window_id, "0", enter=False, literal=False)
+                logger.info("Auto-dismissed feedback survey in window %s", window_id)
+                return
+            if (
+                content.name in INTERACTIVE_TOOL_NAMES
+                and session_manager.get_window_state(window_id).session_id
+            ):
+                # ExitPlanMode/AskUserQuestion have JSONL entries — the JSONL path
+                # will send the UI via queue.join() ordering (content before UI).
+                # Just set interactive mode to suppress status updates.
+                set_interactive_mode(user_id, window_id, thread_id)
+            else:
+                # PermissionPrompt/RestoreCheckpoint/Settings or no JSONL session:
+                # send immediately (no ordering concern).
+                await handle_interactive_ui(bot, user_id, window_id, thread_id)
+            return
 
     # Normal status line check
     status_line = parse_status_line(pane_text)
@@ -115,13 +135,21 @@ async def status_poll_loop(bot: Bot) -> None:
                     session_manager.iter_thread_bindings()
                 ):
                     try:
-                        await bot.unpin_all_forum_topic_messages(
-                            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+                        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+                        # reopen_forum_topic is a silent probe:
+                        # - open topic → BadRequest("Topic_not_modified")
+                        # - deleted topic → BadRequest("Topic_id_invalid")
+                        await bot.reopen_forum_topic(
+                            chat_id=chat_id,
                             message_thread_id=thread_id,
                         )
                     except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
-                            # Topic deleted — kill window, unbind, and clean up state
+                        err = str(e)
+                        if "not_modified" in err.lower():
+                            # Topic exists and is open — no-op
+                            continue
+                        if "thread not found" in err or "Topic_id_invalid" in err:
+                            # Topic deleted — kill window, unbind, and clean up
                             w = await tmux_manager.find_window_by_id(wid)
                             if w:
                                 await tmux_manager.kill_window(w.window_id)

@@ -84,14 +84,23 @@ _last_typing: dict[tuple[int, int], float] = {}
 TYPING_MIN_INTERVAL = 4.0
 
 
-# Regex to strip the stats parenthetical from status lines, e.g.:
+# Regex to strip the stats parenthetical (and any trailing text) from status lines, e.g.:
 # "Unravelling… (45s · ↓ 2.5k tokens · thought for 25s)" → "Unravelling…"
-_STATUS_STATS_RE = re.compile(r"\s*\([\d]+s\s*·.*\)\s*$")
+# "Enchanting… (2m 9s · ↓ 8.1k tokens · thought for 49s)" → "Enchanting…"
+# "Working… (30s · ↓ 897 tokens) Esc to interrupt" → "Working…"
+_STATUS_STATS_RE = re.compile(r"\s*\([\dhms ]+·.*\).*$")
+
+# Regex to strip trailing time durations embedded directly in the status text, e.g.:
+# "Churned for 9m 58s" → "Churned"
+# "Responding for 30s" → "Responding"
+_STATUS_TIME_RE = re.compile(r"\s+(?:for\s+)?(?:\d+[hms]\s*)+$")
 
 
 def _strip_status_stats(text: str) -> str:
-    """Strip the timing/stats parenthetical from a status line for dedup."""
-    return _STATUS_STATS_RE.sub("", text)
+    """Strip timing/stats from a status line for dedup."""
+    text = _STATUS_STATS_RE.sub("", text)
+    text = _STATUS_TIME_RE.sub("", text)
+    return text
 
 
 def get_message_queue(
