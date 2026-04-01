@@ -78,6 +78,13 @@ UI_PATTERNS: list[UIPattern] = [
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
     ),
+    # Numbered selector: "❯ 1. [ ] ..." or "  1. [x] ..." (tab bar scrolled off)
+    UIPattern(
+        name="AskUserQuestion",
+        top=(re.compile(r"^\s*(?:❯\s+)?\d+\.\s+\["),),
+        bottom=(re.compile(r"^\s*Enter to select"),),
+        min_gap=1,
+    ),
     UIPattern(
         name="PermissionPrompt",
         top=(
