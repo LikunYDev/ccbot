@@ -29,7 +29,6 @@ from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_msg,
-    get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
     set_interactive_mode,
@@ -99,13 +98,9 @@ async def update_status_message(
                 and session_manager.get_window_state(window_id).session_id
             ):
                 # ExitPlanMode/AskUserQuestion have JSONL entries — the JSONL path
-                # will send the UI via queue.join() ordering (content before UI).
-                # Just set interactive mode to suppress status updates.
+                # (bot.py handle_new_message) is the sole sender for these UIs.
+                # Just set interactive mode here to suppress status updates.
                 set_interactive_mode(user_id, window_id, thread_id)
-                # Fallback: if JSONL path failed to send the UI (e.g. pane capture
-                # missed the top marker), send it now from the status poll.
-                if not get_interactive_msg_id(user_id, thread_id):
-                    await handle_interactive_ui(bot, user_id, window_id, thread_id)
             else:
                 # PermissionPrompt/RestoreCheckpoint/Settings or no JSONL session:
                 # send immediately (no ordering concern).
