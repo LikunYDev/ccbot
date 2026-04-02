@@ -1433,9 +1433,14 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             queue = get_message_queue(user_id, thread_id)
             if queue:
                 await queue.join()
-            # Wait briefly for Claude Code to render the question UI
-            await asyncio.sleep(0.3)
-            handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
+            # Retry pane capture with increasing delays — Claude Code may need
+            # time to render the interactive UI after the JSONL entry is written.
+            handled = False
+            for delay in (0.3, 0.7, 1.0):
+                await asyncio.sleep(delay)
+                handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
+                if handled:
+                    break
             if handled:
                 # Update user's read offset
                 session = await session_manager.resolve_session_for_window(wid)
