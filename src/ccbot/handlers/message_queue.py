@@ -30,8 +30,6 @@ from telegram.error import RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
-from ..terminal_parser import parse_status_line
-from ..tmux_manager import tmux_manager
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
