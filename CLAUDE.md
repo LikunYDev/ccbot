@@ -10,7 +10,9 @@ Tech stack: Python, python-telegram-bot, tmux, uv.
 uv run ruff check src/ tests/         # Lint — MUST pass before committing
 uv run ruff format src/ tests/        # Format — auto-fix, then verify with --check
 uv run pyright src/ccbot/             # Type check — MUST be 0 errors before committing
-./scripts/restart.sh                  # Restart the ccbot service after code changes
+uv run python -m pytest               # Run full test suite in repo-local .venv
+./scripts/restart.sh                  # Linux: reinstall + restart systemd service
+./scripts/restart-macos.sh            # macOS: reload launchd agent
 ccbot hook --install                  # Auto-install Claude Code SessionStart hook
 ```
 
@@ -34,6 +36,8 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - Config directory: `~/.ccbot/` by default, override with `CCBOT_DIR` env var.
 - `.env` loading priority: local `.env` > config dir `.env`.
 - State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets).
+- Service management is platform-specific: Linux uses `systemd`; macOS uses `launchd`.
+- For macOS, keep a local agent plist in `~/Library/LaunchAgents/` and use `deploy/macos/com.ccbot.plist` as the template.
 
 ## Hook Configuration
 

@@ -61,6 +61,12 @@ cd ccmux
 uv sync
 ```
 
+For development and testing, install dev dependencies into the repo-local `.venv`:
+
+```bash
+uv sync --extra dev
+```
+
 ## Configuration
 
 **1. Create a Telegram bot and enable Threaded Mode:**
@@ -139,6 +145,31 @@ ccbot
 
 # If installed from source
 uv run ccbot
+```
+
+### Service Management
+
+Linux/systemd users can use the existing restart helpers:
+
+```bash
+./scripts/restart.sh
+```
+
+macOS users should use `launchd` instead of `systemd`:
+
+1. Copy [deploy/macos/com.ccbot.plist](/Users/lkyao/projects/ccbot/deploy/macos/com.ccbot.plist) to `~/Library/LaunchAgents/com.ccbot.plist`
+2. Replace the placeholder repo path and username values
+3. Load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ccbot.plist`
+4. Restart with:
+
+```bash
+./scripts/restart-macos.sh
+```
+
+For local verification, prefer:
+
+```bash
+uv run python -m pytest
 ```
 
 ### Commands
