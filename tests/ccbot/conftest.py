@@ -164,5 +164,29 @@ def sample_pane_settings():
 
 
 @pytest.fixture
+def sample_pane_exit_plan_numbered():
+    """Realistic pane showing numbered ExitPlanMode selector (current format).
+
+    The old markers (Would you like to proceed?, ctrl-g to edit in) are NOT
+    present — only the ❯ 1. Yes / 2. No selector with plan context above.
+    """
+    return (
+        "  I've written a plan to the plan file.\n"
+        "\n"
+        "  Here's a summary of what I'll do:\n"
+        "  1. Update the config parser\n"
+        "  2. Add validation logic\n"
+        "\n"
+        "  ❯ 1. Yes\n"
+        "    2. No\n"
+        "\n"
+        "──────────────────────────────────────\n"
+        "❯ \n"
+        "──────────────────────────────────────\n"
+        "  [Opus 4.6] Context: 34%\n"
+    )
+
+
+@pytest.fixture
 def sample_pane_no_ui():
     return "$ echo hello\nhello\n$\n"

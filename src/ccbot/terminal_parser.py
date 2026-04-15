@@ -59,6 +59,13 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Esc to (cancel|exit)"),
         ),
     ),
+    # Fallback: numbered selector UI (❯ 1. Yes / 2. No) without old markers
+    UIPattern(
+        name="ExitPlanMode",
+        top=(re.compile(r"^\s*❯\s+\d+\.\s+Yes"),),
+        bottom=(),  # extends to last non-empty line
+        min_gap=1,
+    ),
     UIPattern(
         name="AskUserQuestion",
         top=(re.compile(r"^\s*←\s+[☐✔☒]"),),  # Multi-tab: no bottom needed
@@ -68,6 +75,13 @@ UI_PATTERNS: list[UIPattern] = [
     UIPattern(
         name="AskUserQuestion",
         top=(re.compile(r"^\s*[☐✔☒]"),),  # Single-tab: bottom required
+        bottom=(re.compile(r"^\s*Enter to select"),),
+        min_gap=1,
+    ),
+    # Numbered selector: "❯ 1. [ ] ..." or "  1. [x] ..." (tab bar scrolled off)
+    UIPattern(
+        name="AskUserQuestion",
+        top=(re.compile(r"^\s*(?:❯\s+)?\d+\.\s+\["),),
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
     ),
@@ -101,6 +115,12 @@ UI_PATTERNS: list[UIPattern] = [
         name="RestoreCheckpoint",
         top=(re.compile(r"^\s*Restore the code"),),
         bottom=(re.compile(r"^\s*Enter to continue"),),
+    ),
+    UIPattern(
+        name="Feedback",
+        top=(re.compile(r"How is Claude doing this session"),),
+        bottom=(re.compile(r"0:\s*Dismiss"),),
+        min_gap=1,
     ),
     UIPattern(
         name="Settings",

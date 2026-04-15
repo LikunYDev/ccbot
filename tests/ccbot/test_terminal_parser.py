@@ -83,6 +83,23 @@ class TestExtractInteractiveContent:
         assert result.name == "ExitPlanMode"
         assert "Claude has written up a plan" in result.content
 
+    def test_exit_plan_mode_numbered_selector(
+        self, sample_pane_exit_plan_numbered: str
+    ):
+        """New numbered ❯ 1. Yes / 2. No format is detected as ExitPlanMode."""
+        result = extract_interactive_content(sample_pane_exit_plan_numbered)
+        assert result is not None
+        assert result.name == "ExitPlanMode"
+        assert "❯" in result.content
+        assert "Yes" in result.content
+
+    def test_exit_plan_mode_old_format_still_works(self, sample_pane_exit_plan: str):
+        """Backward compat: old ExitPlanMode format still detected."""
+        result = extract_interactive_content(sample_pane_exit_plan)
+        assert result is not None
+        assert result.name == "ExitPlanMode"
+        assert "Would you like to proceed?" in result.content
+
     def test_ask_user_multi_tab(self, sample_pane_ask_user_multi_tab: str):
         result = extract_interactive_content(sample_pane_ask_user_multi_tab)
         assert result is not None

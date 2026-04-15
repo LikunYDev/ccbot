@@ -112,6 +112,22 @@ class Config:
         for var in SENSITIVE_ENV_VARS:
             os.environ.pop(var, None)
 
+        # Display thinking messages in real-time and history
+        # Set SHOW_THINKING=false to skip thinking blocks (reduces Telegram API calls)
+        self.show_thinking = os.getenv("SHOW_THINKING", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
+        # Display tool_use/tool_result messages in real-time and history
+        # Set SHOW_TOOLS=false to skip tool messages (reduces Telegram API calls)
+        self.show_tools = os.getenv("SHOW_TOOLS", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
             "tmux_session=%s, claude_projects_path=%s",
