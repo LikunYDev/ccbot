@@ -25,6 +25,25 @@ from .config import SENSITIVE_ENV_VARS, config
 logger = logging.getLogger(__name__)
 
 
+def build_claude_command(
+    base_command: str,
+    *,
+    permission_mode: str = "",
+    resume_session_id: str | None = None,
+) -> str:
+    """Compose the shell command used to launch Claude Code in a new window.
+
+    `--permission-mode` is placed before `--resume` so mode applies to the
+    resumed session. Both args are only appended when set.
+    """
+    cmd = base_command
+    if permission_mode:
+        cmd = f"{cmd} --permission-mode {permission_mode}"
+    if resume_session_id:
+        cmd = f"{cmd} --resume {resume_session_id}"
+    return cmd
+
+
 @dataclass
 class TmuxWindow:
     """Information about a tmux window."""
@@ -421,9 +440,11 @@ class TmuxManager:
                 if start_claude:
                     pane = window.active_pane
                     if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
+                        cmd = build_claude_command(
+                            config.claude_command,
+                            permission_mode=config.claude_permission_mode,
+                            resume_session_id=resume_session_id,
+                        )
                         pane.send_keys(cmd, enter=True)
 
                 logger.info(

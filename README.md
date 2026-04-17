@@ -99,6 +99,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CCBOT_DIR`             | `~/.ccbot` | Config/state directory (`.env` loaded from here) |
 | `TMUX_SESSION_NAME`     | `ccbot`    | Tmux session name                                |
 | `CLAUDE_COMMAND`        | `claude`   | Command to run in new windows                    |
+| `CLAUDE_PERMISSION_MODE` | _(unset)_ | `default` / `acceptEdits` / `plan` / `auto` / `bypassPermissions`. Appended as `--permission-mode <mode>` when set. |
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
@@ -107,11 +108,13 @@ ALLOWED_USERS=your_telegram_user_id
 Message formatting is always HTML via `chatgpt-md-converter` (`chatgpt_md_converter` package).
 There is no runtime formatter switch to MarkdownV2.
 
-> If running on a VPS where there's no interactive terminal to approve permissions, consider:
+> If running on a VPS where there's no interactive terminal to approve permissions, consider using **auto mode** — Claude Code runs actions automatically but a background classifier blocks risky ones (exfiltration, force-pushes to main, arbitrary downloads, etc.):
 >
 > ```
-> CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
+> CLAUDE_PERMISSION_MODE=auto
 > ```
+>
+> As a last resort, `CLAUDE_PERMISSION_MODE=bypassPermissions` skips all prompts but also disables the classifier — prefer `auto` when your plan/model supports it.
 
 ## Hook Setup (Recommended)
 

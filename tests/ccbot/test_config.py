@@ -93,6 +93,43 @@ class TestConfigClaudeProjectsPath:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestConfigPermissionMode:
+    def test_default_is_empty(self, monkeypatch):
+        monkeypatch.delenv("CLAUDE_PERMISSION_MODE", raising=False)
+        cfg = Config()
+        assert cfg.claude_permission_mode == ""
+
+    @pytest.mark.parametrize(
+        "mode", ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+    )
+    def test_accepts_valid_modes(self, monkeypatch, mode):
+        monkeypatch.setenv("CLAUDE_PERMISSION_MODE", mode)
+        cfg = Config()
+        assert cfg.claude_permission_mode == mode
+
+    def test_whitespace_trimmed(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PERMISSION_MODE", "  auto  ")
+        cfg = Config()
+        assert cfg.claude_permission_mode == "auto"
+
+    def test_empty_string_is_no_op(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PERMISSION_MODE", "")
+        cfg = Config()
+        assert cfg.claude_permission_mode == ""
+
+    def test_rejects_unknown_mode(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PERMISSION_MODE", "yolo")
+        with pytest.raises(ValueError, match="CLAUDE_PERMISSION_MODE"):
+            Config()
+
+    def test_case_sensitive(self, monkeypatch):
+        # Claude CLI is case-sensitive (`acceptEdits` not `acceptedits`).
+        monkeypatch.setenv("CLAUDE_PERMISSION_MODE", "Auto")
+        with pytest.raises(ValueError, match="CLAUDE_PERMISSION_MODE"):
+            Config()
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestConfigOpenAI:
     def test_openai_defaults(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)

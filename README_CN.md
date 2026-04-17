@@ -90,6 +90,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CCBOT_DIR` | `~/.ccbot` | 配置/状态目录（`.env` 从此目录加载） |
 | `TMUX_SESSION_NAME` | `ccbot` | tmux 会话名称 |
 | `CLAUDE_COMMAND` | `claude` | 新窗口中运行的命令 |
+| `CLAUDE_PERMISSION_MODE` | _(未设置)_ | `default` / `acceptEdits` / `plan` / `auto` / `bypassPermissions`。设置后会在启动 claude 时追加 `--permission-mode <mode>`。 |
 | `MONITOR_POLL_INTERVAL` | `2.0` | 轮询间隔（秒） |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | 在目录浏览器中显示隐藏（点开头）目录 |
 | `OPENAI_API_KEY` | _(无)_ | OpenAI API 密钥，用于语音消息转录 |
@@ -98,10 +99,13 @@ ALLOWED_USERS=your_telegram_user_id
 消息格式化目前固定为 HTML，使用 `chatgpt-md-converter`（`chatgpt_md_converter` 包）。
 不再提供运行时切换到 MarkdownV2 的开关。
 
-> 如果在 VPS 上运行且没有交互终端来批准权限，可以考虑：
+> 如果在 VPS 上运行且没有交互终端来批准权限，建议使用 **auto 模式** —— Claude Code 会自动执行动作，同时后台分类器会拦截危险操作（数据外泄、强推 main、任意下载等）：
+>
 > ```
-> CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
+> CLAUDE_PERMISSION_MODE=auto
 > ```
+>
+> 作为兜底方案，`CLAUDE_PERMISSION_MODE=bypassPermissions` 会跳过所有确认，但也会关闭分类器 —— 如果你的套餐/模型支持，优先使用 `auto`。
 
 ## Hook 设置（推荐）
 

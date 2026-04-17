@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 # Env vars that must not leak to child processes (e.g. Claude Code via tmux)
 SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
 
+# Valid values for CLAUDE_PERMISSION_MODE (mirrors `claude --permission-mode`).
+# Empty string / unset means "don't pass the flag".
+CLAUDE_PERMISSION_MODES = frozenset(
+    {"default", "acceptEdits", "plan", "auto", "bypassPermissions"}
+)
+
 
 class Config:
     """Application configuration loaded from environment variables."""
@@ -63,6 +69,19 @@ class Config:
 
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
+
+        # Optional Claude permission mode — appended as `--permission-mode <mode>`
+        # when launching claude. Prefer `auto` over `bypassPermissions`: auto mode
+        # keeps a safety classifier that blocks risky actions, while bypass skips
+        # all checks. See https://code.claude.com/docs/en/permission-modes.md
+        permission_mode = os.getenv("CLAUDE_PERMISSION_MODE", "").strip()
+        if permission_mode and permission_mode not in CLAUDE_PERMISSION_MODES:
+            raise ValueError(
+                f"CLAUDE_PERMISSION_MODE={permission_mode!r} is invalid. "
+                f"Expected one of: {', '.join(sorted(CLAUDE_PERMISSION_MODES))}, "
+                "or leave unset."
+            )
+        self.claude_permission_mode: str = permission_mode
 
         # All state files live under config_dir
         self.state_file = self.config_dir / "state.json"

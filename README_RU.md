@@ -91,6 +91,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CCBOT_DIR` | `~/.ccbot` | Каталог конфигурации/состояния (`.env` грузится отсюда) |
 | `TMUX_SESSION_NAME` | `ccbot` | Имя tmux-сессии |
 | `CLAUDE_COMMAND` | `claude` | Команда запуска в новых окнах |
+| `CLAUDE_PERMISSION_MODE` | _(не задано)_ | `default` / `acceptEdits` / `plan` / `auto` / `bypassPermissions`. Добавляется как `--permission-mode <mode>` при запуске claude. |
 | `MONITOR_POLL_INTERVAL` | `2.0` | Интервал опроса в секундах |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Показывать скрытые (dot) директории в браузере каталогов |
 | `OPENAI_API_KEY` | _(нет)_ | API-ключ OpenAI для транскрипции голосовых сообщений |
@@ -99,11 +100,13 @@ ALLOWED_USERS=your_telegram_user_id
 Форматирование сообщений всегда HTML через `chatgpt-md-converter` (`chatgpt_md_converter`).
 Переключателя формата на MarkdownV2 во время выполнения нет.
 
-> Если бот запущен на VPS без интерактивного терминала для подтверждений, можно использовать:
+> Если бот запущен на VPS без интерактивного терминала для подтверждений, используйте **auto-режим** — Claude Code выполняет действия автоматически, а фоновый классификатор блокирует опасные (утечки, force-push в main, произвольные загрузки и т. п.):
 >
 > ```
-> CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
+> CLAUDE_PERMISSION_MODE=auto
 > ```
+>
+> В крайнем случае `CLAUDE_PERMISSION_MODE=bypassPermissions` пропускает все подтверждения, но отключает и классификатор — предпочитайте `auto`, если ваш план/модель это поддерживают.
 
 ## Настройка Hook (рекомендуется)
 
