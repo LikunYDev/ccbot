@@ -227,17 +227,19 @@ def build_session_picker(
         "Existing sessions found in this directory.\n",
     ]
     for i, s in enumerate(sessions):
-        summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
+        display = s.name or s.summary
+        display = display[:40] + "…" if len(display) > 40 else display
         rel = _relative_time(s.file_path)
         time_str = f" ({rel})" if rel else ""
-        lines.append(f"{i + 1}. {summary} — {s.message_count} msgs{time_str}")
+        lines.append(f"{i + 1}. {display} — {s.message_count} msgs{time_str}")
 
     buttons: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(sessions), 2):
         row = []
         for j in range(min(2, len(sessions) - i)):
             s = sessions[i + j]
-            label = s.summary[:14] + "…" if len(s.summary) > 14 else s.summary
+            label = s.name or s.summary
+            label = label[:14] + "…" if len(label) > 14 else label
             row.append(
                 InlineKeyboardButton(
                     f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
