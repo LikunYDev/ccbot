@@ -80,6 +80,11 @@ class ClaudeSession:
     summary: str
     message_count: int
     file_path: str
+    # Claude Code session title (v2.1.75+). Prefer this over `summary` for
+    # display when non-empty. Sourced from JSONL entries of type
+    # "custom-title" (user-set via /rename or -n) or "agent-name"
+    # (auto-generated); custom-title wins.
+    name: str = ""
 
 
 @dataclass
@@ -616,8 +621,12 @@ class SessionManager:
             else:
                 return None
 
-        # Single pass: read file once, extract summary + count messages
+        # Single pass: read file once, extract summary + name + count messages.
+        # Keep the LAST occurrence of custom-title / agent-name (users can
+        # rename multiple times; the latest one wins).
         summary = ""
+        custom_title = ""
+        agent_name = ""
         last_user_msg = ""
         message_count = 0
         try:
@@ -629,12 +638,19 @@ class SessionManager:
                     message_count += 1
                     try:
                         data = json.loads(line)
-                        # Check for summary
-                        if data.get("type") == "summary":
+                        entry_type = data.get("type")
+                        if entry_type == "summary":
                             s = data.get("summary", "")
                             if s:
                                 summary = s
-                        # Track last user message as fallback
+                        elif entry_type == "custom-title":
+                            t = data.get("customTitle", "")
+                            if t:
+                                custom_title = t
+                        elif entry_type == "agent-name":
+                            n = data.get("agentName", "")
+                            if n:
+                                agent_name = n
                         elif TranscriptParser.is_user_message(data):
                             parsed = TranscriptParser.parse_message(data)
                             if parsed and parsed.text.strip():
@@ -652,6 +668,7 @@ class SessionManager:
             summary=summary,
             message_count=message_count,
             file_path=str(file_path),
+            name=custom_title or agent_name,
         )
 
     # --- Directory session listing ---

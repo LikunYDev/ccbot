@@ -1,7 +1,10 @@
 """Tests for SessionManager pure dict operations."""
 
+import json
+
 import pytest
 
+from ccbot.config import config
 from ccbot.session import SessionManager
 
 
@@ -155,3 +158,103 @@ class TestIsWindowId:
         assert mgr._is_window_id("@") is False
         assert mgr._is_window_id("") is False
         assert mgr._is_window_id("@abc") is False
+
+
+def _write_jsonl(path, entries: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+
+
+class TestSessionNameParsing:
+    """Extracting custom-title / agent-name from session JSONL."""
+
+    @pytest.fixture
+    def session_layout(self, mgr: SessionManager, tmp_path, monkeypatch):
+        """Build ~/.claude/projects/<encoded-cwd>/<sid>.jsonl under tmp_path."""
+        cwd = "/proj/demo"
+        sid = "11111111-2222-3333-4444-555555555555"
+        project_dir = tmp_path / mgr._encode_cwd(cwd)
+        project_dir.mkdir(parents=True)
+        monkeypatch.setattr(config, "claude_projects_path", tmp_path)
+        return cwd, sid, project_dir / f"{sid}.jsonl"
+
+    @pytest.mark.asyncio
+    async def test_custom_title_extracted(
+        self, mgr: SessionManager, session_layout
+    ) -> None:
+        cwd, sid, path = session_layout
+        _write_jsonl(
+            path,
+            [
+                {"type": "summary", "summary": "an old summary"},
+                {"type": "custom-title", "customTitle": "my-feature"},
+            ],
+        )
+        result = await mgr._get_session_direct(sid, cwd)
+        assert result is not None
+        assert result.name == "my-feature"
+        assert result.summary == "an old summary"
+
+    @pytest.mark.asyncio
+    async def test_agent_name_extracted(
+        self, mgr: SessionManager, session_layout
+    ) -> None:
+        cwd, sid, path = session_layout
+        _write_jsonl(
+            path,
+            [
+                {"type": "agent-name", "agentName": "auto-generated-name"},
+                {"type": "summary", "summary": "something"},
+            ],
+        )
+        result = await mgr._get_session_direct(sid, cwd)
+        assert result is not None
+        assert result.name == "auto-generated-name"
+
+    @pytest.mark.asyncio
+    async def test_custom_title_wins_over_agent_name(
+        self, mgr: SessionManager, session_layout
+    ) -> None:
+        cwd, sid, path = session_layout
+        _write_jsonl(
+            path,
+            [
+                {"type": "agent-name", "agentName": "auto-name"},
+                {"type": "custom-title", "customTitle": "user-chose-this"},
+            ],
+        )
+        result = await mgr._get_session_direct(sid, cwd)
+        assert result is not None
+        assert result.name == "user-chose-this"
+
+    @pytest.mark.asyncio
+    async def test_latest_custom_title_wins(
+        self, mgr: SessionManager, session_layout
+    ) -> None:
+        cwd, sid, path = session_layout
+        _write_jsonl(
+            path,
+            [
+                {"type": "custom-title", "customTitle": "first"},
+                {"type": "custom-title", "customTitle": "renamed-later"},
+            ],
+        )
+        result = await mgr._get_session_direct(sid, cwd)
+        assert result is not None
+        assert result.name == "renamed-later"
+
+    @pytest.mark.asyncio
+    async def test_no_name_entries_leaves_name_empty(
+        self, mgr: SessionManager, session_layout
+    ) -> None:
+        cwd, sid, path = session_layout
+        _write_jsonl(
+            path,
+            [
+                {"type": "summary", "summary": "just a summary"},
+                {"type": "user", "message": {"content": "hi"}},
+            ],
+        )
+        result = await mgr._get_session_direct(sid, cwd)
+        assert result is not None
+        assert result.name == ""
+        assert result.summary == "just a summary"
