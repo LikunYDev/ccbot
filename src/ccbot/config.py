@@ -87,6 +87,15 @@ class Config:
         self.state_file = self.config_dir / "state.json"
         self.session_map_file = self.config_dir / "session_map.json"
         self.monitor_state_file = self.config_dir / "monitor_state.json"
+        self.claude_version_file = self.config_dir / "claude_version.json"
+
+        # Auto-restart bound topics when the installed `claude --version` changes.
+        # Triggered at turn-end (no pending tool_use). Disable by setting to "false".
+        self.auto_restart_enabled = os.getenv("CCBOT_AUTO_RESTART", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
         # Claude Code session monitoring configuration
         # Support custom projects path for Claude variants (e.g., cc-mirror, zai)

@@ -78,6 +78,9 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        # Fires once per session after a dispatch batch completes with no
+        # pending tool_use — i.e. the turn has ended and the topic is idle.
+        self._turn_end_callback: Callable[[str], Awaitable[None]] | None = None
         # Fire-and-forget callback tasks (one per session group per poll cycle)
         self._callback_tasks: set[asyncio.Task[None]] = set()
         # Per-session pending tool_use state carried across poll cycles
@@ -92,6 +95,10 @@ class SessionMonitor:
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_turn_end_callback(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        """Register a callback fired when a session's turn ends with no pending tool_use."""
+        self._turn_end_callback = callback
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -512,13 +519,22 @@ class SessionMonitor:
     async def _dispatch_session_messages(
         self, session_id: str, messages: list[NewMessage]
     ) -> None:
-        """Dispatch messages for one session sequentially (fire-and-forget task)."""
+        """Dispatch messages for one session sequentially (fire-and-forget task).
+
+        Fires the turn-end callback once all messages are dispatched and no
+        tool_use is still pending for this session.
+        """
         for msg in messages:
             try:
                 if self._message_callback:
                     await self._message_callback(msg)
             except Exception as e:
                 logger.error("Message callback error (session %s): %s", session_id, e)
+        if self._turn_end_callback and session_id not in self._pending_tools:
+            try:
+                await self._turn_end_callback(session_id)
+            except Exception as e:
+                logger.error("Turn-end callback error (session %s): %s", session_id, e)
 
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.

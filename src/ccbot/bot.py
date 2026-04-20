@@ -1875,7 +1875,20 @@ async def post_init(application: Application) -> None:
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)
 
+    async def turn_end_callback(session_id: str) -> None:
+        from .update_watcher import maybe_restart_for_upgrade
+
+        active_users = await session_manager.find_users_for_session(session_id)
+        for user_id, window_id, thread_id in active_users:
+            queue = get_message_queue(user_id, thread_id)
+            if queue:
+                await queue.join()
+            await maybe_restart_for_upgrade(
+                application.bot, user_id, thread_id, window_id
+            )
+
     monitor.set_message_callback(message_callback)
+    monitor.set_turn_end_callback(turn_end_callback)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
