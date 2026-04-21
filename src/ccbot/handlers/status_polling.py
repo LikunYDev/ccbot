@@ -29,6 +29,7 @@ from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_msg,
+    get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
     set_interactive_mode,
@@ -80,7 +81,18 @@ async def update_status_message(
 
     if interactive_window == window_id:
         # User is in interactive mode for THIS window
-        if extract_interactive_content(pane_text) is not None:
+        content = extract_interactive_content(pane_text)
+        if content is not None:
+            # Rescue case: mode was set (likely by the JSONL-deferred branch
+            # below) without a Telegram message ever being sent, and the pane
+            # now shows a UI type the JSONL path won't forward
+            # (PermissionPrompt / RestoreCheckpoint / BashApproval / Settings).
+            # Without this check, the early return below swallows the prompt.
+            if (
+                get_interactive_msg_id(user_id, thread_id) is None
+                and content.name not in INTERACTIVE_TOOL_NAMES
+            ):
+                await handle_interactive_ui(bot, user_id, window_id, thread_id)
             # Interactive UI still showing — skip status update (user is interacting)
             return
         # Interactive UI gone — clear interactive mode, fall through to status check.
