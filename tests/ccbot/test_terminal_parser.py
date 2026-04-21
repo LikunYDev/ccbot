@@ -118,6 +118,42 @@ class TestExtractInteractiveContent:
         assert result.name == "PermissionPrompt"
         assert "Do you want to proceed?" in result.content
 
+    def test_permission_prompt_three_option_numbered_not_misclassified(self):
+        """Regression: a PermissionPrompt with 3-option numbered selector
+        (❯ 1. Yes / 2. Yes,... / 3. No) must not be swallowed by the
+        ExitPlanMode numbered fallback. The 'Do you want to proceed?' header
+        is the specific marker and must win.
+        """
+        pane = (
+            " Do you want to proceed?\n"
+            " ❯ 1. Yes\n"
+            "   2. Yes, and don't ask again for: launchctl list *\n"
+            "   3. No\n"
+            "\n"
+            " Esc to cancel · Tab to amend · ctrl+e to explain\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "PermissionPrompt"
+
+    def test_permission_prompt_three_option_without_header(self):
+        """Even without the 'Do you want to proceed?' header, a 3-option
+        numbered selector should be classified as PermissionPrompt (min_gap=2
+        filter); only bare 2-option Yes/No falls through to ExitPlanMode.
+        """
+        pane = " ❯ 1. Yes\n   2. Yes, allow access to foo/\n   3. No\n"
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "PermissionPrompt"
+
+    def test_exit_plan_numbered_two_option_still_exit_plan(self):
+        """Fallback ordering invariant: a bare 2-option ❯ 1. Yes / 2. No
+        pane (no other markers) still classifies as ExitPlanMode."""
+        pane = "  Here's my plan.\n\n  ❯ 1. Yes\n    2. No\n"
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ExitPlanMode"
+
     def test_restore_checkpoint(self):
         pane = (
             "  Restore the code to a previous state?\n"

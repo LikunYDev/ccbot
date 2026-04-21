@@ -59,13 +59,6 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Esc to (cancel|exit)"),
         ),
     ),
-    # Fallback: numbered selector UI (❯ 1. Yes / 2. No) without old markers
-    UIPattern(
-        name="ExitPlanMode",
-        top=(re.compile(r"^\s*❯\s+\d+\.\s+Yes"),),
-        bottom=(),  # extends to last non-empty line
-        min_gap=1,
-    ),
     UIPattern(
         name="AskUserQuestion",
         top=(re.compile(r"^\s*←\s+[☐✔☒]"),),  # Multi-tab: no bottom needed
@@ -96,11 +89,26 @@ UI_PATTERNS: list[UIPattern] = [
         bottom=(re.compile(r"^\s*Esc to cancel"),),
     ),
     UIPattern(
-        # Permission menu with numbered choices (no "Esc to cancel" line)
+        # Permission menu with numbered choices (no "Esc to cancel" line).
+        # Distinguished from the ExitPlanMode numbered fallback by requiring
+        # a 3rd option: PermissionPrompt has 3 choices (Yes / Yes,.. / No),
+        # ExitPlanMode has 2 (Yes / No). Must come first so 3-option panes
+        # aren't swallowed by the 2-option ExitPlanMode fallback.
         name="PermissionPrompt",
         top=(re.compile(r"^\s*❯\s*1\.\s*Yes"),),
-        bottom=(),
+        bottom=(re.compile(r"^\s*3\.\s"),),
         min_gap=2,
+    ),
+    # Fallback: numbered selector UI (❯ 1. Yes / 2. No) without old markers.
+    # Kept last because its top marker is shared with PermissionPrompt and
+    # BashApproval numbered prompts — those more-specific patterns must win
+    # first when they have the "Do you want to proceed?" / "Bash command"
+    # headers. Only reached for bare 2-option numbered selectors.
+    UIPattern(
+        name="ExitPlanMode",
+        top=(re.compile(r"^\s*❯\s+\d+\.\s+Yes"),),
+        bottom=(),  # extends to last non-empty line
+        min_gap=1,
     ),
     UIPattern(
         # Bash command approval
