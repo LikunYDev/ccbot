@@ -9,12 +9,21 @@ import pytest
 from ccbot import update_watcher
 from ccbot.config import config
 
+# Captured before the autouse fixture below stubs it, so resolution-specific
+# tests can exercise the real function.
+_REAL_RESOLVE = update_watcher._resolve_claude_binary
+
 
 @pytest.fixture(autouse=True)
 def _reset_state(tmp_path, monkeypatch):
-    """Fresh module-level state + temp claude_version.json per test."""
+    """Fresh module-level state + temp claude_version.json + stub binary resolution."""
     monkeypatch.setattr(config, "claude_version_file", tmp_path / "claude_version.json")
     monkeypatch.setattr(config, "auto_restart_enabled", True)
+    # Pretend the binary is always resolvable; tests that specifically
+    # exercise resolution override this.
+    monkeypatch.setattr(
+        update_watcher, "_resolve_claude_binary", lambda: "/fake/bin/claude"
+    )
     update_watcher.reset_state_for_tests()
     yield
     update_watcher.reset_state_for_tests()
@@ -74,6 +83,47 @@ class TestCurrentClaudeVersion:
     async def test_returns_none_when_binary_missing(self):
         with patch("subprocess.run", side_effect=FileNotFoundError()):
             assert await update_watcher.current_claude_version() is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_resolution_fails(self, monkeypatch):
+        """When shutil.which fails for both PATH and fallbacks, return None."""
+        monkeypatch.setattr(update_watcher, "_resolve_claude_binary", lambda: None)
+        with patch("subprocess.run") as m:
+            assert await update_watcher.current_claude_version() is None
+        m.assert_not_called()
+
+
+class TestResolveClaudeBinary:
+    """Binary-path resolution with fallback to common install locations."""
+
+    def test_uses_path_lookup_when_available(self, monkeypatch):
+        monkeypatch.setattr(config, "claude_command", "claude")
+
+        def which(cmd, path=None):
+            # First call: standard PATH lookup succeeds
+            return "/custom/bin/claude" if path is None else None
+
+        with patch("shutil.which", side_effect=which):
+            assert _REAL_RESOLVE() == "/custom/bin/claude"
+
+    def test_falls_back_to_known_install_dirs(self, monkeypatch):
+        monkeypatch.setattr(config, "claude_command", "claude")
+
+        def which(cmd, path=None):
+            # PATH lookup fails; fallback PATH (the curated list) succeeds
+            if path is None:
+                return None
+            assert ".local/bin" in path  # curated list must include it
+            return "/Users/someone/.local/bin/claude"
+
+        with patch("shutil.which", side_effect=which):
+            resolved = _REAL_RESOLVE()
+        assert resolved == "/Users/someone/.local/bin/claude"
+
+    def test_returns_none_when_all_lookups_fail(self, monkeypatch):
+        monkeypatch.setattr(config, "claude_command", "claude")
+        with patch("shutil.which", return_value=None):
+            assert _REAL_RESOLVE() is None
 
 
 class TestMaybeRestartForUpgrade:

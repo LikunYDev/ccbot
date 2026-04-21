@@ -29,8 +29,11 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- Include ~/.local/bin so the Claude Code native installer binary
+             (~/.local/bin/claude) is resolvable by subprocess calls from
+             ccbot (e.g. `claude --version` in update_watcher). -->
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>

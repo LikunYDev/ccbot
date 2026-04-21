@@ -16,9 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import config
@@ -45,6 +48,33 @@ def _parse_version(output: str) -> str | None:
     return m.group(1) if m else None
 
 
+# Common install locations we'll check if `config.claude_command` isn't on
+# PATH. Covers the native installer (~/.local/bin), Homebrew, and manual
+# /usr/local installs. Order is "most likely first" — the native installer
+# is Anthropic's default per https://code.claude.com/docs/en/setup.md.
+_FALLBACK_BIN_DIRS: tuple[str, ...] = (
+    str(Path.home() / ".local" / "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+)
+
+
+def _resolve_claude_binary() -> str | None:
+    """Resolve `config.claude_command` to an invocable path.
+
+    `shutil.which` handles both PATH lookup and absolute-path validation. If
+    that fails (common when ccbot runs under a service manager with a
+    stripped-down PATH that omits `~/.local/bin`), retry against a curated
+    list of well-known Claude Code install locations.
+    """
+    cmd = config.claude_command
+    resolved = shutil.which(cmd)
+    if resolved:
+        return resolved
+    fallback_path = os.pathsep.join(_FALLBACK_BIN_DIRS)
+    return shutil.which(cmd, path=fallback_path)
+
+
 async def current_claude_version(force: bool = False) -> str | None:
     """Installed claude version, cached 5 min. Returns None on any failure."""
     global _last_check_mono, _last_version
@@ -56,21 +86,32 @@ async def current_claude_version(force: bool = False) -> str | None:
             and now - _last_check_mono < _VERSION_CACHE_TTL
         ):
             return _last_version
+        binary = _resolve_claude_binary()
+        if binary is None:
+            logger.warning(
+                "Could not locate claude binary "
+                "(config.claude_command=%r, PATH=%s). "
+                "Set CLAUDE_COMMAND to an absolute path or add the install "
+                "directory to PATH in the service manager config.",
+                config.claude_command,
+                os.environ.get("PATH", ""),
+            )
+            return None
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
-                [config.claude_command, "--version"],
+                [binary, "--version"],
                 timeout=_SUBPROCESS_TIMEOUT,
                 capture_output=True,
                 text=True,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-            logger.warning("Could not run `%s --version`: %s", config.claude_command, e)
+            logger.warning("Could not run `%s --version`: %s", binary, e)
             return None
         if result.returncode != 0:
             logger.warning(
                 "`%s --version` exited %d: %s",
-                config.claude_command,
+                binary,
                 result.returncode,
                 result.stderr.strip()[:200],
             )
@@ -79,7 +120,7 @@ async def current_claude_version(force: bool = False) -> str | None:
         if not version:
             logger.warning(
                 "Could not parse version from `%s --version` output: %r",
-                config.claude_command,
+                binary,
                 result.stdout[:200],
             )
             return None
