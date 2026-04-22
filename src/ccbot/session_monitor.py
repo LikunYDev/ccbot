@@ -521,16 +521,30 @@ class SessionMonitor:
     ) -> None:
         """Dispatch messages for one session sequentially (fire-and-forget task).
 
-        Fires the turn-end callback once all messages are dispatched and no
-        tool_use is still pending for this session.
+        Fires the turn-end callback after all messages in this batch are
+        dispatched, unless the batch ended on an unpaired tool_use — a
+        conservative signal that Claude is mid-tool-call right now.
+
+        (Earlier versions gated on `session_id not in self._pending_tools`,
+        but `_pending_tools` accumulates unresolved tools across the whole
+        session history; a single canceled or unmatched tool_use left in it
+        would silently block the callback forever.)
         """
+        last_unpaired_tool_use_id: str | None = None
         for msg in messages:
             try:
                 if self._message_callback:
                     await self._message_callback(msg)
             except Exception as e:
                 logger.error("Message callback error (session %s): %s", session_id, e)
-        if self._turn_end_callback and session_id not in self._pending_tools:
+            if msg.content_type == "tool_use" and msg.tool_use_id:
+                last_unpaired_tool_use_id = msg.tool_use_id
+            elif msg.content_type == "tool_result" and msg.tool_use_id:
+                if last_unpaired_tool_use_id == msg.tool_use_id:
+                    last_unpaired_tool_use_id = None
+
+        turn_ended = last_unpaired_tool_use_id is None
+        if self._turn_end_callback and turn_ended:
             try:
                 await self._turn_end_callback(session_id)
             except Exception as e:

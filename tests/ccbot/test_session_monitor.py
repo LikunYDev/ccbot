@@ -5,7 +5,7 @@ import json
 import pytest
 
 from ccbot.monitor_state import TrackedSession
-from ccbot.session_monitor import SessionMonitor
+from ccbot.session_monitor import NewMessage, SessionMonitor
 
 
 class TestReadNewLinesOffsetRecovery:
@@ -93,3 +93,101 @@ class TestReadNewLinesOffsetRecovery:
         # Should reset offset to 0 and read the line
         assert session.last_byte_offset == jsonl_file.stat().st_size
         assert len(result) == 1
+
+
+class TestTurnEndDispatch:
+    """Verify the turn-end callback fires per-batch, not gated on session history."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    def _msg(self, content_type: str, tool_use_id: str | None = None) -> NewMessage:
+        return NewMessage(
+            session_id="s1",
+            text="x",
+            is_complete=True,
+            content_type=content_type,
+            tool_use_id=tool_use_id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fires_on_plain_text_batch(self, monitor):
+        fired: list[str] = []
+
+        async def on_turn_end(sid: str) -> None:
+            fired.append(sid)
+
+        async def on_message(_: NewMessage) -> None:
+            pass
+
+        monitor.set_message_callback(on_message)
+        monitor.set_turn_end_callback(on_turn_end)
+        await monitor._dispatch_session_messages("s1", [self._msg("text")])
+        assert fired == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_fires_when_batch_pairs_tool_use_with_result(self, monitor):
+        fired: list[str] = []
+
+        async def on_turn_end(sid: str) -> None:
+            fired.append(sid)
+
+        async def on_message(_: NewMessage) -> None:
+            pass
+
+        monitor.set_message_callback(on_message)
+        monitor.set_turn_end_callback(on_turn_end)
+        await monitor._dispatch_session_messages(
+            "s1",
+            [
+                self._msg("tool_use", tool_use_id="t1"),
+                self._msg("tool_result", tool_use_id="t1"),
+                self._msg("text"),
+            ],
+        )
+        assert fired == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_defers_when_batch_ends_on_unpaired_tool_use(self, monitor):
+        fired: list[str] = []
+
+        async def on_turn_end(sid: str) -> None:
+            fired.append(sid)
+
+        async def on_message(_: NewMessage) -> None:
+            pass
+
+        monitor.set_message_callback(on_message)
+        monitor.set_turn_end_callback(on_turn_end)
+        await monitor._dispatch_session_messages(
+            "s1", [self._msg("text"), self._msg("tool_use", tool_use_id="t1")]
+        )
+        assert fired == []
+
+    @pytest.mark.asyncio
+    async def test_fires_even_when_session_has_stale_pending_tools(self, monitor):
+        """Regression: _pending_tools is session-wide history; must not gate firing.
+
+        Before this fix, one unpaired tool_use from an earlier batch left the
+        session's entry in _pending_tools forever and silently blocked the
+        turn-end callback. The new gate is per-batch only.
+        """
+        fired: list[str] = []
+
+        async def on_turn_end(sid: str) -> None:
+            fired.append(sid)
+
+        async def on_message(_: NewMessage) -> None:
+            pass
+
+        monitor.set_message_callback(on_message)
+        monitor.set_turn_end_callback(on_turn_end)
+        # Simulate a stuck entry from an earlier batch:
+        monitor._pending_tools["s1"] = {"stale-id": {}}  # type: ignore[assignment]
+        # Current batch is a clean text-only response:
+        await monitor._dispatch_session_messages("s1", [self._msg("text")])
+        assert fired == ["s1"]
