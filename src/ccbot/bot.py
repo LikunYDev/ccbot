@@ -140,6 +140,29 @@ from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_browser_start_path() -> str:
+    """Return the directory the new-session browser should open at.
+
+    Uses ``config.default_dir`` if set and pointing to an existing
+    directory; otherwise falls back to the bot process's cwd.
+    """
+    pinned = config.default_dir
+    if pinned:
+        candidate = Path(pinned).expanduser()
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved.is_dir():
+            return str(resolved)
+        logger.warning(
+            "CCBOT_DEFAULT_DIR=%r is not a directory; falling back to cwd",
+            pinned,
+        )
+    return str(Path.cwd())
+
+
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
 
@@ -1057,6 +1080,15 @@ async def _create_and_bind_window(
                 )
                 ws.session_id = resume_session_id
                 session_manager._save_state()
+
+        # Pin the version that's running in this window so future turn-ends
+        # can detect a binary upgrade just for THIS window. Per-window means
+        # an upgrade in one session doesn't silence the signal for others.
+        from .update_watcher import current_claude_version
+
+        launch_version = await current_claude_version()
+        if launch_version:
+            session_manager.set_claude_launch_version(created_wid, launch_version)
 
         if pending_thread_id is not None:
             # Thread bind flow: bind thread to newly created window
