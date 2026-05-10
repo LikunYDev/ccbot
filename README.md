@@ -102,6 +102,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_PERMISSION_MODE` | _(unset)_ | `default` / `acceptEdits` / `plan` / `auto` / `bypassPermissions`. Appended as `--permission-mode <mode>` when set. |
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
+| `CCBOT_DEFAULT_DIR`      | _(unset)_ | Pinned starting directory for the new-session directory browser. Empty / unset / nonexistent path falls back to `cwd` (with a warning if set but invalid). |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs) |
 
