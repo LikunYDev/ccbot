@@ -154,3 +154,26 @@ class TestConfigOpenAI:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
         Config()
         assert os.environ.get("OPENAI_API_KEY") is None
+
+
+@pytest.mark.usefixtures("_base_env")
+class TestConfigDefaultDir:
+    def test_default_is_empty(self, monkeypatch):
+        monkeypatch.delenv("CCBOT_DEFAULT_DIR", raising=False)
+        cfg = Config()
+        assert cfg.default_dir == ""
+
+    def test_set_value(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_DEFAULT_DIR", "/Users/lkyao/obsidian")
+        cfg = Config()
+        assert cfg.default_dir == "/Users/lkyao/obsidian"
+
+    def test_whitespace_trimmed(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_DEFAULT_DIR", "  /tmp/foo  ")
+        cfg = Config()
+        assert cfg.default_dir == "/tmp/foo"
+
+    def test_empty_string_is_no_op(self, monkeypatch):
+        monkeypatch.setenv("CCBOT_DEFAULT_DIR", "")
+        cfg = Config()
+        assert cfg.default_dir == ""

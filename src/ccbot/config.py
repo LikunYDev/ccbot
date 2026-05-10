@@ -129,6 +129,10 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Pinned starting directory for the new-session directory browser.
+        # Empty / unset / nonexistent path falls back to Path.cwd() at use time.
+        self.default_dir: str = os.getenv("CCBOT_DEFAULT_DIR", "").strip()
+
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(
