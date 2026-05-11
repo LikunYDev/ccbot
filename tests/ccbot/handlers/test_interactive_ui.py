@@ -32,13 +32,19 @@ def mock_bot():
 @pytest.fixture
 def _clear_interactive_state():
     """Ensure interactive state is clean before and after each test."""
-    from ccbot.handlers.interactive_ui import _interactive_mode, _interactive_msgs
+    from ccbot.handlers.interactive_ui import (
+        _interactive_enqueued,
+        _interactive_mode,
+        _interactive_msgs,
+    )
 
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    _interactive_enqueued.clear()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    _interactive_enqueued.clear()
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -145,6 +151,170 @@ class TestHandleInteractiveUI:
         mock_bot.send_message.assert_called_once()
         call_kwargs = mock_bot.send_message.call_args
         assert call_kwargs.kwargs["reply_markup"] is not None
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestInteractiveEnqueuedFlag:
+    """The `_interactive_enqueued` set is the linchpin that prevents
+    status_polling from enqueueing duplicate `interactive_ui` tasks while a
+    previous task is still in the worker's queue. These tests pin the
+    contract before the rewrite touches status_polling."""
+
+    def test_mark_is_idempotent(self):
+        """Marking twice for the same ikey leaves the flag set exactly once."""
+        from ccbot.handlers.interactive_ui import (
+            _interactive_enqueued,
+            is_interactive_enqueued,
+            mark_interactive_enqueued,
+        )
+
+        mark_interactive_enqueued(7, 42)
+        mark_interactive_enqueued(7, 42)
+        assert is_interactive_enqueued(7, 42) is True
+        # Internal: keyed by (user_id, thread_id or 0); de-dup via set semantics
+        assert (7, 42) in _interactive_enqueued
+        assert sum(1 for k in _interactive_enqueued if k == (7, 42)) == 1
+
+    def test_clear_is_idempotent(self):
+        """Clearing when the flag is not set must not raise."""
+        from ccbot.handlers.interactive_ui import (
+            clear_interactive_enqueued,
+            is_interactive_enqueued,
+        )
+
+        # Never set; clear should be a no-op.
+        clear_interactive_enqueued(7, 42)
+        assert is_interactive_enqueued(7, 42) is False
+
+    def test_mark_then_clear_round_trip(self):
+        from ccbot.handlers.interactive_ui import (
+            clear_interactive_enqueued,
+            is_interactive_enqueued,
+            mark_interactive_enqueued,
+        )
+
+        mark_interactive_enqueued(7, 42)
+        assert is_interactive_enqueued(7, 42) is True
+        clear_interactive_enqueued(7, 42)
+        assert is_interactive_enqueued(7, 42) is False
+
+    def test_thread_id_none_treated_as_zero(self):
+        """thread_id=None and thread_id=0 must collapse to the same key, matching
+        the convention used by _interactive_mode / _interactive_msgs."""
+        from ccbot.handlers.interactive_ui import (
+            is_interactive_enqueued,
+            mark_interactive_enqueued,
+        )
+
+        mark_interactive_enqueued(7, None)
+        assert is_interactive_enqueued(7, 0) is True
+        assert is_interactive_enqueued(7, None) is True
+
+    def test_different_ikeys_are_independent(self):
+        from ccbot.handlers.interactive_ui import (
+            clear_interactive_enqueued,
+            is_interactive_enqueued,
+            mark_interactive_enqueued,
+        )
+
+        mark_interactive_enqueued(7, 42)
+        mark_interactive_enqueued(7, 99)
+        clear_interactive_enqueued(7, 42)
+        assert is_interactive_enqueued(7, 42) is False
+        assert is_interactive_enqueued(7, 99) is True
+
+    def test_last_name_round_trip(self):
+        from ccbot.handlers.interactive_ui import (
+            get_interactive_last_name,
+            set_interactive_last_name,
+        )
+
+        assert get_interactive_last_name(7, 42) is None
+        set_interactive_last_name(7, "ExitPlanMode", 42)
+        assert get_interactive_last_name(7, 42) == "ExitPlanMode"
+        set_interactive_last_name(7, "PermissionPrompt", 42)
+        assert get_interactive_last_name(7, 42) == "PermissionPrompt"
+
+    def test_last_name_thread_id_none_treated_as_zero(self):
+        from ccbot.handlers.interactive_ui import (
+            get_interactive_last_name,
+            set_interactive_last_name,
+        )
+
+        set_interactive_last_name(7, "AskUserQuestion", None)
+        assert get_interactive_last_name(7, 0) == "AskUserQuestion"
+
+    @pytest.mark.asyncio
+    async def test_handle_interactive_ui_records_last_name(
+        self, mock_bot: AsyncMock, sample_pane_exit_plan: str
+    ):
+        """On a successful send, handle_interactive_ui must record the UI name
+        in _interactive_last_name so status_polling can detect morphs."""
+        from ccbot.handlers.interactive_ui import get_interactive_last_name
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_exit_plan)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=7, window_id=window_id, thread_id=42
+            )
+
+        assert result is True
+        assert get_interactive_last_name(7, 42) == "ExitPlanMode"
+
+    @pytest.mark.asyncio
+    async def test_clear_interactive_msg_clears_last_name(self, mock_bot: AsyncMock):
+        """clear_interactive_msg must also wipe _interactive_last_name so the
+        next UI in this topic doesn't get classified as a morph of the old."""
+        from ccbot.handlers.interactive_ui import (
+            _interactive_msgs,
+            clear_interactive_msg,
+            get_interactive_last_name,
+            set_interactive_last_name,
+        )
+
+        set_interactive_last_name(7, "ExitPlanMode", 42)
+        _interactive_msgs[(7, 42)] = 999
+
+        with patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            await clear_interactive_msg(7, mock_bot, 42)
+
+        assert get_interactive_last_name(7, 42) is None
+
+    @pytest.mark.asyncio
+    async def test_clear_interactive_msg_clears_enqueued_flag(
+        self, mock_bot: AsyncMock
+    ):
+        """When the UI is dismissed and clear_interactive_msg runs, the
+        `_interactive_enqueued` flag must also be cleared so the next render
+        of a UI in the same topic can enqueue again."""
+        from ccbot.handlers.interactive_ui import (
+            _interactive_msgs,
+            clear_interactive_msg,
+            is_interactive_enqueued,
+            mark_interactive_enqueued,
+        )
+
+        # Simulate: a UI was previously delivered (msg_id set) and a poll-time
+        # enqueue had been recorded but not yet cleared by the worker.
+        mark_interactive_enqueued(7, 42)
+        _interactive_msgs[(7, 42)] = 12345
+
+        with patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            await clear_interactive_msg(7, mock_bot, 42)
+
+        assert is_interactive_enqueued(7, 42) is False
 
 
 class TestKeyboardLayoutForSettings:

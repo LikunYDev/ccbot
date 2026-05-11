@@ -422,6 +422,25 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
+    async def _accepted_session_map_names(self) -> set[str]:
+        """Return the configured tmux session plus any grouped peers."""
+
+        try:
+            names = await tmux_manager.list_group_session_names()
+        except Exception as e:
+            logger.debug("Failed to list grouped tmux sessions: %s", e)
+            names = set()
+        return names or {config.tmux_session_name}
+
+    @staticmethod
+    def _split_session_map_key(key: str) -> tuple[str, str] | None:
+        """Split a session_map key into (session_name, window_key)."""
+
+        session_name, sep, window_key = key.partition(":")
+        if not sep or not session_name or not window_key:
+            return None
+        return session_name, window_key
+
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_key -> session_id mapping.
 
@@ -429,25 +448,41 @@ class SessionMonitor:
         (e.g. "ccbot:@12"). Old-format keys ("ccbot:window_name") are also
         accepted so that sessions running before a code upgrade continue
         to be monitored until the hook re-fires with new format.
-        Only entries matching our tmux_session_name are processed.
+        Accepts entries under our tmux_session_name or any grouped peer
+        session. When the same window_id appears under multiple grouped
+        peers, the configured tmux_session_name's entry wins (alphabetical
+        fallback otherwise) so the monitor tracks the same session that
+        SessionManager has applied to window_state.
         """
         window_to_session: dict[str, str] = {}
-        if config.session_map_file.exists():
-            try:
-                async with aiofiles.open(config.session_map_file, "r") as f:
-                    content = await f.read()
-                session_map = json.loads(content)
-                prefix = f"{config.tmux_session_name}:"
-                for key, info in session_map.items():
-                    # Only process entries for our tmux session
-                    if not key.startswith(prefix):
-                        continue
-                    window_key = key[len(prefix) :]
-                    session_id = info.get("session_id", "")
-                    if session_id:
-                        window_to_session[window_key] = session_id
-            except (json.JSONDecodeError, OSError):
-                pass
+        if not config.session_map_file.exists():
+            return window_to_session
+        try:
+            async with aiofiles.open(config.session_map_file, "r") as f:
+                content = await f.read()
+            session_map = json.loads(content)
+        except (json.JSONDecodeError, OSError):
+            return window_to_session
+
+        accepted_names = await self._accepted_session_map_names()
+        candidates: dict[str, dict[str, str]] = {}
+        for key, info in session_map.items():
+            parts = self._split_session_map_key(key)
+            if parts is None:
+                continue
+            session_name, window_key = parts
+            if session_name not in accepted_names:
+                continue
+            session_id = info.get("session_id", "")
+            if session_id:
+                candidates.setdefault(window_key, {})[session_name] = session_id
+
+        primary = config.tmux_session_name
+        for window_key, by_name in candidates.items():
+            if primary in by_name:
+                window_to_session[window_key] = by_name[primary]
+            else:
+                window_to_session[window_key] = by_name[sorted(by_name)[0]]
         return window_to_session
 
     async def _cleanup_all_stale_sessions(self) -> None:

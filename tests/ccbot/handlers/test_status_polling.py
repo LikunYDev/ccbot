@@ -24,13 +24,41 @@ def mock_bot():
 @pytest.fixture
 def _clear_interactive_state():
     """Ensure interactive state is clean before and after each test."""
-    from ccbot.handlers.interactive_ui import _interactive_mode, _interactive_msgs
+    from ccbot.handlers.interactive_ui import (
+        _interactive_enqueued,
+        _interactive_last_name,
+        _interactive_mode,
+        _interactive_msgs,
+    )
 
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    _interactive_enqueued.clear()
+    _interactive_last_name.clear()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    _interactive_enqueued.clear()
+    _interactive_last_name.clear()
+
+
+def _simulate_worker_dispatched(
+    user_id: int, thread_id: int, ui_name: str, msg_id: int = 12345
+):
+    """Mutate the interactive-UI state dicts as if the message_queue worker
+    had picked up an `interactive_ui` task and successfully delivered it.
+    Use between poll cycles in tests to model the async dispatch the test
+    harness does not actually run."""
+    from ccbot.handlers.interactive_ui import (
+        _interactive_enqueued,
+        _interactive_last_name,
+        _interactive_msgs,
+    )
+
+    ikey = (user_id, thread_id)
+    _interactive_enqueued.discard(ikey)
+    _interactive_msgs[ikey] = msg_id
+    _interactive_last_name[ikey] = ui_name
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -45,7 +73,9 @@ class TestStatusPollerSettingsDetection:
     async def test_settings_ui_detected_and_keyboard_sent(
         self, mock_bot: AsyncMock, sample_pane_settings: str
     ):
-        """Poller captures Settings pane → handle_interactive_ui sends keyboard."""
+        """Poller captures Settings pane → enqueues an interactive_ui task on
+        the per-user message queue. The worker (tested separately) is what
+        ultimately calls handle_interactive_ui."""
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
@@ -53,23 +83,22 @@ class TestStatusPollerSettingsDetection:
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
-            ) as mock_handle_ui,
+            ) as mock_enqueue,
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
-            mock_handle_ui.return_value = True
 
             await update_status_message(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
-            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+            mock_enqueue.assert_called_once_with(mock_bot, 1, window_id, thread_id=42)
 
     @pytest.mark.asyncio
     async def test_normal_pane_no_interactive_ui(self, mock_bot: AsyncMock):
-        """Normal pane text → no handle_interactive_ui call, just status check."""
+        """Normal pane text → no enqueue_interactive_ui call, just status check."""
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
@@ -85,9 +114,9 @@ class TestStatusPollerSettingsDetection:
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
-            ) as mock_handle_ui,
+            ) as mock_enqueue,
             patch(
                 "ccbot.handlers.status_polling.enqueue_status_update",
                 new_callable=AsyncMock,
@@ -100,158 +129,111 @@ class TestStatusPollerSettingsDetection:
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
-            mock_handle_ui.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_settings_ui_end_to_end_sends_telegram_keyboard(
-        self, mock_bot: AsyncMock, sample_pane_settings: str
-    ):
-        """Full end-to-end: poller → is_interactive_ui → handle_interactive_ui
-        → bot.send_message with keyboard.
-
-        Uses real handle_interactive_ui (not mocked) to verify the full path.
-        """
-        window_id = "@5"
-        mock_window = MagicMock()
-        mock_window.window_id = window_id
-
-        with (
-            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux_poll,
-            patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux_ui,
-            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
-        ):
-            mock_tmux_poll.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux_poll.capture_pane = AsyncMock(return_value=sample_pane_settings)
-            mock_tmux_ui.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux_ui.capture_pane = AsyncMock(return_value=sample_pane_settings)
-            mock_sm.resolve_chat_id.return_value = 100
-
-            await update_status_message(
-                mock_bot, user_id=1, window_id=window_id, thread_id=42
-            )
-
-            # Verify bot.send_message was called with keyboard
-            mock_bot.send_message.assert_called_once()
-            call_kwargs = mock_bot.send_message.call_args.kwargs
-            assert call_kwargs["chat_id"] == 100
-            assert call_kwargs["message_thread_id"] == 42
-            keyboard = call_kwargs["reply_markup"]
-            assert keyboard is not None
-            # Verify the message text contains model picker content
-            assert "Select model" in call_kwargs["text"]
+            mock_enqueue.assert_not_called()
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
-class TestStatusPollerExitPlanDetection:
-    """Simulate the status poller detecting ExitPlanMode UI (numbered format)."""
+class TestStatusPollerInteractiveUIDetection:
+    """Pane-as-source design: status poller detects ANY interactive UI in the
+    pane and enqueues a delivery task on the per-user message queue. The
+    poller no longer special-cases AskUserQuestion/ExitPlanMode by deferring
+    to JSONL — pane is the trigger as well as the content source."""
 
     @pytest.mark.asyncio
-    async def test_exit_plan_with_session_defers_to_jsonl(
+    async def test_exit_plan_enqueues_regardless_of_session(
         self, mock_bot: AsyncMock, sample_pane_exit_plan_numbered: str
     ):
-        """ExitPlanMode with active session → set_interactive_mode, no handle_interactive_ui."""
+        """ExitPlanMode in pane → enqueue. The previous 'defer to JSONL when
+        session_id is set' branch is gone — pane is the source of truth."""
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
-
-        mock_ws = MagicMock()
-        mock_ws.session_id = "uuid-xxx"
 
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
-            ) as mock_handle_ui,
+            ) as mock_enqueue,
             patch(
                 "ccbot.handlers.status_polling.set_interactive_mode",
             ) as mock_set_mode,
-            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(
                 return_value=sample_pane_exit_plan_numbered
             )
-            mock_sm.get_window_state.return_value = mock_ws
 
             await update_status_message(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
             mock_set_mode.assert_called_once_with(1, window_id, 42)
-            mock_handle_ui.assert_not_called()
+            mock_enqueue.assert_called_once_with(mock_bot, 1, window_id, thread_id=42)
 
     @pytest.mark.asyncio
-    async def test_exit_plan_without_session_sends_immediately(
-        self, mock_bot: AsyncMock, sample_pane_exit_plan_numbered: str
-    ):
-        """ExitPlanMode with no session_id → handle_interactive_ui called (fallback)."""
-        window_id = "@5"
-        mock_window = MagicMock()
-        mock_window.window_id = window_id
-
-        mock_ws = MagicMock()
-        mock_ws.session_id = ""
-
-        with (
-            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
-            patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
-                new_callable=AsyncMock,
-            ) as mock_handle_ui,
-            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
-        ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.capture_pane = AsyncMock(
-                return_value=sample_pane_exit_plan_numbered
-            )
-            mock_sm.get_window_state.return_value = mock_ws
-            mock_handle_ui.return_value = True
-
-            await update_status_message(
-                mock_bot, user_id=1, window_id=window_id, thread_id=42
-            )
-
-            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
-
-    @pytest.mark.asyncio
-    async def test_permission_prompt_always_sends_immediately(
+    async def test_permission_prompt_enqueues(
         self, mock_bot: AsyncMock, sample_pane_permission: str
     ):
-        """PermissionPrompt → handle_interactive_ui called regardless of session_id."""
+        """PermissionPrompt in pane → enqueue."""
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
 
-        mock_ws = MagicMock()
-        mock_ws.session_id = "uuid-xxx"
-
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
-            ) as mock_handle_ui,
-            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+            ) as mock_enqueue,
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_permission)
-            mock_sm.get_window_state.return_value = mock_ws
-            mock_handle_ui.return_value = True
 
             await update_status_message(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
-            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+            mock_enqueue.assert_called_once_with(mock_bot, 1, window_id, thread_id=42)
+
+    @pytest.mark.asyncio
+    async def test_ask_user_question_enqueues_after_simulated_bot_restart(
+        self,
+        mock_bot: AsyncMock,
+        sample_pane_ask_user_single_tab: str,
+    ):
+        """Regression for the byte-offset-past-tool_use silent failure:
+        clean interactive state (as if bot just restarted) + pane shows
+        AskUserQuestion → the poller must enqueue. JSONL is irrelevant."""
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_enqueue,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(
+                return_value=sample_pane_ask_user_single_tab
+            )
+
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_enqueue.assert_called_once_with(mock_bot, 1, window_id, thread_id=42)
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
-class TestStickyInteractiveModeRescue:
-    """Regression coverage for the 'ExitPlanMode → PermissionPrompt transition'
-    bug: when _interactive_mode was set via the JSONL-deferred branch but no
-    Telegram message was ever sent, a subsequent PermissionPrompt in the same
-    pane must still be forwarded — the sticky mode flag must not swallow it.
+class TestPaneAsSourceInteractiveUI:
+    """Pane-as-source state machine: status_polling enqueues an interactive_ui
+    task whenever the pane shows a UI that is new or has morphed (different
+    UI name than last delivered). Once enqueued, repeat polls are no-ops
+    until the worker dispatches and pane state changes again.
     """
 
     WIN = "@5"
@@ -265,22 +247,17 @@ class TestStickyInteractiveModeRescue:
         return w
 
     async def _poll(self, mock_bot, pane_text, mock_window):
-        """Drive one poll cycle and return the patched handle_interactive_ui
-        mock plus set_interactive_mode mock."""
-        mock_ws = MagicMock()
-        mock_ws.session_id = "uuid-xxx"
+        """Drive one poll cycle and return the patched enqueue_interactive_ui
+        mock so tests can assert whether (and how) a delivery was scheduled."""
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
-            ) as mock_handle_ui,
-            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+            ) as mock_enqueue,
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
-            mock_sm.get_window_state.return_value = mock_ws
-            mock_handle_ui.return_value = True
 
             await update_status_message(
                 mock_bot,
@@ -288,59 +265,90 @@ class TestStickyInteractiveModeRescue:
                 window_id=self.WIN,
                 thread_id=self.THREAD,
             )
-            return mock_handle_ui
+            return mock_enqueue
 
     @pytest.mark.asyncio
-    async def test_exit_plan_then_permission_transition_sends(
+    async def test_first_poll_enqueues_once(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_exit_plan_numbered: str,
+    ):
+        """Pane shows ExitPlanMode for the first time → exactly one enqueue.
+        Mode is set, enqueued flag is set (worker hasn't dispatched yet)."""
+        from ccbot.handlers.interactive_ui import (
+            _interactive_enqueued,
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        enqueue = await self._poll(
+            mock_bot, sample_pane_exit_plan_numbered, mock_window
+        )
+
+        enqueue.assert_called_once_with(
+            mock_bot, self.USER, self.WIN, thread_id=self.THREAD
+        )
+        assert _interactive_mode[(self.USER, self.THREAD)] == self.WIN
+        assert (self.USER, self.THREAD) in _interactive_enqueued
+        # Worker hasn't run in this test harness — msg_id stays unset.
+        assert (self.USER, self.THREAD) not in _interactive_msgs
+
+    @pytest.mark.asyncio
+    async def test_repeated_polls_same_ui_enqueue_once(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_exit_plan_numbered: str,
+    ):
+        """Idempotency: across three polls of the same UI, exactly one
+        enqueue. The in-flight `_interactive_enqueued` flag blocks the second
+        cycle; after the (simulated) worker dispatches, the
+        `last_name == content.name` check blocks the third."""
+        # Cycle 1: enqueue
+        enqueue1 = await self._poll(
+            mock_bot, sample_pane_exit_plan_numbered, mock_window
+        )
+        enqueue1.assert_called_once()
+
+        # Cycle 2: enqueued flag still set, worker hasn't dispatched → no-op
+        enqueue2 = await self._poll(
+            mock_bot, sample_pane_exit_plan_numbered, mock_window
+        )
+        enqueue2.assert_not_called()
+
+        # Simulate worker dispatching the task (sets msg_id, last_name; clears flag)
+        _simulate_worker_dispatched(self.USER, self.THREAD, "ExitPlanMode")
+
+        # Cycle 3: msg_id set + last_name matches → no-op
+        enqueue3 = await self._poll(
+            mock_bot, sample_pane_exit_plan_numbered, mock_window
+        )
+        enqueue3.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_morph_re_enqueues(
         self,
         mock_bot: AsyncMock,
         mock_window: MagicMock,
         sample_pane_exit_plan_numbered: str,
         sample_pane_permission: str,
     ):
-        """The observed production bug.
+        """The observed production bug, in the new model.
 
-        Cycle 1: ExitPlanMode pane → _interactive_mode set, no send (JSONL path).
-        Cycle 2: pane morphs to PermissionPrompt → must send; _interactive_mode
-        is already set for this window but _interactive_msgs is empty.
-        """
-        from ccbot.handlers.interactive_ui import (
-            _interactive_mode,
-            _interactive_msgs,
-        )
-
-        # Cycle 1: JSONL-handled UI — mode-only, no send
-        handle_ui = await self._poll(
+        Cycle 1: ExitPlanMode in pane → enqueue. Worker dispatches.
+        Cycle 2: pane morphed to PermissionPrompt → re-enqueue so the worker
+        can edit the Telegram message with the new UI content."""
+        enqueue1 = await self._poll(
             mock_bot, sample_pane_exit_plan_numbered, mock_window
         )
-        handle_ui.assert_not_called()
-        assert _interactive_mode[(self.USER, self.THREAD)] == self.WIN
-        assert (self.USER, self.THREAD) not in _interactive_msgs
+        enqueue1.assert_called_once()
+        _simulate_worker_dispatched(self.USER, self.THREAD, "ExitPlanMode")
 
-        # Cycle 2: pane morphed to PermissionPrompt — fix must fire
-        handle_ui = await self._poll(mock_bot, sample_pane_permission, mock_window)
-        handle_ui.assert_called_once_with(mock_bot, self.USER, self.WIN, self.THREAD)
-
-    @pytest.mark.asyncio
-    async def test_exit_plan_then_still_exit_plan_stays_silent(
-        self,
-        mock_bot: AsyncMock,
-        mock_window: MagicMock,
-        sample_pane_exit_plan_numbered: str,
-    ):
-        """AskUserQuestion/ExitPlanMode must remain JSONL-only, even if mode is
-        already set but no msg exists — otherwise the poll path starts
-        double-sending."""
-        from ccbot.handlers.interactive_ui import _interactive_mode
-
-        # Cycle 1
-        await self._poll(mock_bot, sample_pane_exit_plan_numbered, mock_window)
-        # Cycle 2: same UI still there
-        handle_ui = await self._poll(
-            mock_bot, sample_pane_exit_plan_numbered, mock_window
+        enqueue2 = await self._poll(mock_bot, sample_pane_permission, mock_window)
+        enqueue2.assert_called_once_with(
+            mock_bot, self.USER, self.WIN, thread_id=self.THREAD
         )
-        handle_ui.assert_not_called()
-        assert _interactive_mode[(self.USER, self.THREAD)] == self.WIN
 
     @pytest.mark.asyncio
     async def test_permission_still_showing_no_duplicate_send(
@@ -349,64 +357,60 @@ class TestStickyInteractiveModeRescue:
         mock_window: MagicMock,
         sample_pane_permission: str,
     ):
-        """Once a PermissionPrompt is sent (mode + msg both set), subsequent
-        polls while the same prompt is visible must NOT re-send — preventing
-        Telegram API flooding."""
-        from ccbot.handlers.interactive_ui import (
-            _interactive_mode,
-            _interactive_msgs,
-        )
+        """msg_id set + last_name matches current UI → no re-enqueue. Guards
+        against Telegram API flooding when the user is just looking at a
+        prompt and not acting on it."""
+        # Simulate previous successful delivery
+        _simulate_worker_dispatched(self.USER, self.THREAD, "PermissionPrompt")
 
-        # Simulate that a previous poll already forwarded the PermissionPrompt:
-        # both mode and msg are populated (as the real handle_interactive_ui
-        # would have done).
-        _interactive_mode[(self.USER, self.THREAD)] = self.WIN
-        _interactive_msgs[(self.USER, self.THREAD)] = 12345
-
-        # Next poll: same prompt still visible — must not resend
-        handle_ui = await self._poll(mock_bot, sample_pane_permission, mock_window)
-        handle_ui.assert_not_called()
+        enqueue = await self._poll(mock_bot, sample_pane_permission, mock_window)
+        enqueue.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_bash_approval_rescued_after_mode_set(
+    async def test_bash_approval_after_exit_plan_re_enqueues(
         self,
         mock_bot: AsyncMock,
         mock_window: MagicMock,
         sample_pane_exit_plan_numbered: str,
     ):
-        """Same class of bug for BashApproval — pane morphed from an
-        ExitPlanMode into a Bash command approval prompt."""
+        """Pane morph from ExitPlanMode to BashApproval must re-enqueue —
+        same class of bug as the ExitPlanMode → PermissionPrompt case."""
         bash_approval_pane = (
             "  Bash command\n"
             "  This command requires approval\n"
             "  ls /\n"
             "  Esc to cancel\n"
         )
-        # Cycle 1: mode-only
-        await self._poll(mock_bot, sample_pane_exit_plan_numbered, mock_window)
-        # Cycle 2: rescue
-        handle_ui = await self._poll(mock_bot, bash_approval_pane, mock_window)
-        handle_ui.assert_called_once_with(mock_bot, self.USER, self.WIN, self.THREAD)
+        enqueue1 = await self._poll(
+            mock_bot, sample_pane_exit_plan_numbered, mock_window
+        )
+        enqueue1.assert_called_once()
+        _simulate_worker_dispatched(self.USER, self.THREAD, "ExitPlanMode")
+
+        enqueue2 = await self._poll(mock_bot, bash_approval_pane, mock_window)
+        enqueue2.assert_called_once_with(
+            mock_bot, self.USER, self.WIN, thread_id=self.THREAD
+        )
 
     @pytest.mark.asyncio
-    async def test_ui_gone_clears_mode(
+    async def test_ui_gone_clears_state(
         self,
         mock_bot: AsyncMock,
         mock_window: MagicMock,
         sample_pane_exit_plan_numbered: str,
         sample_pane_no_ui: str,
     ):
-        """When mode is set but UI disappears, mode must be cleared (fall-through
-        to status check)."""
-        from ccbot.handlers.interactive_ui import _interactive_mode
-
+        """When mode is set (UI was previously delivered) but pane no longer
+        shows a UI, clear_interactive_msg must be called to remove the
+        Telegram message and reset all state."""
+        # Simulate a previous successful delivery so all flags are populated.
         await self._poll(mock_bot, sample_pane_exit_plan_numbered, mock_window)
-        assert (self.USER, self.THREAD) in _interactive_mode
+        _simulate_worker_dispatched(self.USER, self.THREAD, "ExitPlanMode")
 
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
             ),
             patch(
@@ -417,7 +421,6 @@ class TestStickyInteractiveModeRescue:
                 "ccbot.handlers.status_polling.clear_interactive_msg",
                 new_callable=AsyncMock,
             ) as mock_clear,
-            patch("ccbot.handlers.status_polling.session_manager"),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_no_ui)
@@ -439,36 +442,50 @@ class TestStickyInteractiveModeRescue:
         sample_pane_permission: str,
         sample_pane_no_ui: str,
     ):
-        """End-to-end sequence matching the real log trace:
-        ExitPlanMode (mode-only) → PermissionPrompt (rescue sends) → user
-        dismisses (UI gone, mode cleared) → another PermissionPrompt arrives
-        later and must be sent via the normal path."""
+        """Full lifecycle through the pane-as-source state machine:
+        ExitPlanMode delivered → morphs to PermissionPrompt (re-enqueue) →
+        user dismisses (clear) → fresh PermissionPrompt later (enqueue again).
+        """
         from ccbot.handlers.interactive_ui import (
+            _interactive_enqueued,
+            _interactive_last_name,
             _interactive_mode,
             _interactive_msgs,
         )
 
-        # Step 1: ExitPlanMode — mode-only
+        # Step 1: ExitPlanMode → enqueue + dispatch
         h = await self._poll(mock_bot, sample_pane_exit_plan_numbered, mock_window)
-        h.assert_not_called()
+        h.assert_called_once()
+        _simulate_worker_dispatched(self.USER, self.THREAD, "ExitPlanMode")
 
-        # Step 2: PermissionPrompt rescues
+        # Step 2: Pane morphs to PermissionPrompt → re-enqueue
         h = await self._poll(mock_bot, sample_pane_permission, mock_window)
         h.assert_called_once()
-        _interactive_msgs[(self.USER, self.THREAD)] = 500
+        _simulate_worker_dispatched(
+            self.USER, self.THREAD, "PermissionPrompt", msg_id=500
+        )
 
-        # Step 3: dismiss → pane goes idle
+        # Step 3: dismiss → pane idle → clear
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
             ),
             patch(
                 "ccbot.handlers.status_polling.enqueue_status_update",
                 new_callable=AsyncMock,
             ),
-            patch("ccbot.handlers.status_polling.session_manager"),
+            patch(
+                "ccbot.handlers.status_polling.clear_interactive_msg",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: (
+                    _interactive_mode.pop((self.USER, self.THREAD), None),
+                    _interactive_msgs.pop((self.USER, self.THREAD), None),
+                    _interactive_last_name.pop((self.USER, self.THREAD), None),
+                    _interactive_enqueued.discard((self.USER, self.THREAD)),
+                ),
+            ),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_no_ui)
@@ -478,25 +495,24 @@ class TestStickyInteractiveModeRescue:
                 window_id=self.WIN,
                 thread_id=self.THREAD,
             )
-        # clear_interactive_msg popped both dicts
         assert (self.USER, self.THREAD) not in _interactive_mode
         assert (self.USER, self.THREAD) not in _interactive_msgs
+        assert (self.USER, self.THREAD) not in _interactive_last_name
 
-        # Step 4: fresh PermissionPrompt arrives later — normal path
+        # Step 4: fresh PermissionPrompt later → enqueue again
         h = await self._poll(mock_bot, sample_pane_permission, mock_window)
         h.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_different_window_mode_does_not_block_rescue(
+    async def test_stale_mode_for_different_window_does_not_block_enqueue(
         self,
         mock_bot: AsyncMock,
         mock_window: MagicMock,
         sample_pane_permission: str,
     ):
-        """If _interactive_mode is set for a DIFFERENT window and we poll this
-        window with a PermissionPrompt, the existing stale-mode cleanup branch
-        should kick in and the normal path should send the prompt. Regression
-        guard: ensure the new rescue guard does not fire in this branch."""
+        """If `_interactive_mode` is set for a DIFFERENT window (left over
+        from another topic), polling this window with a PermissionPrompt must
+        clear the stale state and still enqueue the new UI."""
         from ccbot.handlers.interactive_ui import _interactive_mode
 
         _interactive_mode[(self.USER, self.THREAD)] = "@99"  # different window
@@ -504,21 +520,16 @@ class TestStickyInteractiveModeRescue:
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive_ui",
                 new_callable=AsyncMock,
-            ) as mock_handle_ui,
+            ) as mock_enqueue,
             patch(
                 "ccbot.handlers.status_polling.clear_interactive_msg",
                 new_callable=AsyncMock,
             ) as mock_clear,
-            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_permission)
-            mock_ws = MagicMock()
-            mock_ws.session_id = "uuid-xxx"
-            mock_sm.get_window_state.return_value = mock_ws
-            mock_handle_ui.return_value = True
 
             await update_status_message(
                 mock_bot,
@@ -527,6 +538,6 @@ class TestStickyInteractiveModeRescue:
                 thread_id=self.THREAD,
             )
             mock_clear.assert_called_once()
-            mock_handle_ui.assert_called_once_with(
-                mock_bot, self.USER, self.WIN, self.THREAD
+            mock_enqueue.assert_called_once_with(
+                mock_bot, self.USER, self.WIN, thread_id=self.THREAD
             )

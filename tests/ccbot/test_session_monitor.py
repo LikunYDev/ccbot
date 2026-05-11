@@ -1,9 +1,11 @@
 """Unit tests for SessionMonitor JSONL reading and offset handling."""
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
+from ccbot.config import config
 from ccbot.monitor_state import TrackedSession
 from ccbot.session_monitor import NewMessage, SessionMonitor
 
@@ -191,3 +193,102 @@ class TestTurnEndDispatch:
         # Current batch is a clean text-only response:
         await monitor._dispatch_session_messages("s1", [self._msg("text")])
         assert fired == ["s1"]
+
+
+class TestGroupedSessionMapLoading:
+    @pytest.fixture
+    def monitor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_load_current_session_map_accepts_grouped_session_prefix(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@5": {"session_id": "sid-1"},
+                    "ccbot-2:@28": {"session_id": "sid-28"},
+                    "other:@9": {"session_id": "sid-9"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session_monitor.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+
+        current_map = await monitor._load_current_session_map()
+
+        assert current_map == {"@5": "sid-1", "@28": "sid-28"}
+
+    @pytest.mark.asyncio
+    async def test_load_current_session_map_dedups_same_window_id_across_peers(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """Grouped tmux sessions share windows, so session_map.json can carry
+        the same window_id under multiple session-name prefixes. Iteration order
+        must not silently pick whichever entry happens to come last on disk —
+        the configured tmux_session_name's entry wins deterministically.
+        """
+        session_map_file = tmp_path / "session_map.json"
+        # Order primary first so a buggy "last-write-wins" loop would land on
+        # sid-peer. The fix must still resolve to sid-primary.
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@48": {"session_id": "sid-primary"},
+                    "ccbot-2:@48": {"session_id": "sid-peer"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session_monitor.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+
+        current_map = await monitor._load_current_session_map()
+
+        assert current_map == {"@48": "sid-primary"}
+
+    @pytest.mark.asyncio
+    async def test_cleanup_all_stale_sessions_keeps_grouped_prefix_session(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps({"ccbot-2:@28": {"session_id": "sid-28"}}), encoding="utf-8"
+        )
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session_monitor.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="sid-28",
+                file_path=str(tmp_path / "sid-28.jsonl"),
+                last_byte_offset=0,
+            )
+        )
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="stale",
+                file_path=str(tmp_path / "stale.jsonl"),
+                last_byte_offset=0,
+            )
+        )
+
+        await monitor._cleanup_all_stale_sessions()
+
+        assert monitor.state.get_session("sid-28") is not None
+        assert monitor.state.get_session("stale") is None

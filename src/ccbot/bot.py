@@ -105,12 +105,10 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
-    clear_interactive_mode,
     clear_interactive_msg,
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
-    set_interactive_mode,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -1769,37 +1767,21 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         return
 
     for user_id, wid, thread_id in active_users:
-        # Handle interactive tools specially - capture terminal and send UI
+        # Pane-as-source: AskUserQuestion/ExitPlanMode UIs are delivered by
+        # status_polling (which captures the rendered pane) → message_queue
+        # worker. The JSONL `tool_use` entry is just a notification that the
+        # tool was invoked; we suppress it here so it doesn't appear as a
+        # regular content message, and advance the read offset so a restart
+        # doesn't reprocess it.
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
-            # Mark interactive mode BEFORE sleeping so polling skips this window
-            set_interactive_mode(user_id, wid, thread_id)
-            # Flush pending messages (e.g. plan content) before sending interactive UI
-            queue = get_message_queue(user_id, thread_id)
-            if queue:
-                await queue.join()
-            # Retry pane capture with increasing delays — Claude Code may need
-            # time to render the interactive UI after the JSONL entry is written.
-            handled = False
-            for delay in (0.3, 0.7, 1.0):
-                await asyncio.sleep(delay)
-                handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
-                if handled:
-                    break
-            if handled:
-                # Update user's read offset
-                session = await session_manager.resolve_session_for_window(wid)
-                if session and session.file_path:
-                    try:
-                        file_size = Path(session.file_path).stat().st_size
-                        session_manager.update_user_window_offset(
-                            user_id, wid, file_size
-                        )
-                    except OSError:
-                        pass
-                continue  # Don't send the normal tool_use message
-            else:
-                # UI not rendered — clear the early-set mode
-                clear_interactive_mode(user_id, thread_id)
+            session = await session_manager.resolve_session_for_window(wid)
+            if session and session.file_path:
+                try:
+                    file_size = Path(session.file_path).stat().st_size
+                    session_manager.update_user_window_offset(user_id, wid, file_size)
+                except OSError:
+                    pass
+            continue  # Pane is the source — JSONL entry suppressed.
 
         # Any non-interactive message means the interaction is complete — delete the UI message
         if get_interactive_msg_id(user_id, thread_id):

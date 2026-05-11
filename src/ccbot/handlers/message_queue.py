@@ -30,6 +30,7 @@ from telegram.error import RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
+from .interactive_ui import clear_interactive_enqueued, handle_interactive_ui
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
@@ -54,7 +55,7 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear"]
+    task_type: Literal["content", "status_update", "status_clear", "interactive_ui"]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -249,18 +250,22 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
         try:
             task = await queue.get()
             try:
-                # Flood control: drop status, wait for content
+                # Flood control: drop status, wait for content / interactive UI.
+                # interactive_ui must be waited (not dropped) so that
+                # _process_interactive_ui_task's `finally` runs to clear the
+                # `_interactive_enqueued` flag — dropping leaks that flag and
+                # makes status_polling silently skip every subsequent re-poll.
                 flood_end = _flood_until.get(key, 0)
                 if flood_end > 0:
                     remaining = flood_end - time.monotonic()
                     if remaining > 0:
-                        if task.task_type != "content":
+                        if task.task_type not in ("content", "interactive_ui"):
                             # Status is ephemeral — safe to drop
                             continue
-                        # Content is actual Claude output — wait then send
                         logger.debug(
-                            "Flood controlled: waiting %.0fs for content (%s)",
+                            "Flood controlled: waiting %.0fs for %s (%s)",
                             remaining,
+                            task.task_type,
                             key,
                         )
                         await asyncio.sleep(remaining)
@@ -286,6 +291,8 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                         await _do_clear_status_message(
                             bot, user_id, task.thread_id or 0
                         )
+                    elif task.task_type == "interactive_ui":
+                        await _process_interactive_ui_task(bot, user_id, task)
             except RetryAfter as e:
                 retry_secs = (
                     e.retry_after
@@ -641,6 +648,51 @@ async def enqueue_content_message(
         content_type=content_type,
         thread_id=thread_id,
         image_data=image_data,
+    )
+    queue.put_nowait(task)
+
+
+async def _process_interactive_ui_task(
+    bot: Bot, user_id: int, task: MessageTask
+) -> None:
+    """Dispatch a queued `interactive_ui` task.
+
+    Clears the in-flight enqueue flag unconditionally — including when
+    `handle_interactive_ui` returns False (pane race between enqueue time and
+    dispatch time). This lets the next 1-second status poll re-enqueue if the
+    UI is still visible.
+    """
+    thread_id = task.thread_id
+    window_id = task.window_id or ""
+    try:
+        await handle_interactive_ui(bot, user_id, window_id, thread_id)
+    finally:
+        clear_interactive_enqueued(user_id, thread_id)
+
+
+async def enqueue_interactive_ui(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None = None,
+) -> None:
+    """Push an interactive UI delivery task onto the per-user queue.
+
+    The worker drains tasks FIFO, so any text/thinking content enqueued before
+    this UI task is dispatched first — preserving the order users see, without
+    needing the queue.join() barrier bot.py used to maintain.
+    """
+    logger.debug(
+        "Enqueue interactive_ui: user=%d, window_id=%s, thread=%s",
+        user_id,
+        window_id,
+        thread_id,
+    )
+    queue = get_or_create_queue(bot, user_id, thread_id)
+    task = MessageTask(
+        task_type="interactive_ui",
+        window_id=window_id,
+        thread_id=thread_id,
     )
     queue.put_nowait(task)
 

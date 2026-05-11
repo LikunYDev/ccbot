@@ -261,6 +261,27 @@ def hook_main() -> None:
                     del session_map[old_key]
                     logger.info("Removed old-format session_map key: %s", old_key)
 
+                # Drop any other entries for the same physical window.
+                # Grouped tmux sessions share windows, so a previous hook fire
+                # under a peer session name (e.g. `ccbot:@48`) leaves a stale
+                # entry when the next fire reports a different `#{session_name}`
+                # (e.g. `ccbot-2:@48`). Without this dedup, session_map.json
+                # accumulates multiple entries for one physical window with
+                # diverging session_ids, and readers have to guess which is
+                # current. Window IDs are unique within one tmux server, so any
+                # other key ending in `:<window_id>` is necessarily this same
+                # window under a different session name — safe to remove.
+                stale_peer_keys = [
+                    k
+                    for k in session_map
+                    if k != session_window_key
+                    and ":" in k
+                    and k.split(":", 1)[1] == window_id
+                ]
+                for k in stale_peer_keys:
+                    del session_map[k]
+                    logger.info("Removed stale grouped-peer session_map key: %s", k)
+
                 from .utils import atomic_write_json
 
                 atomic_write_json(map_file, session_map)

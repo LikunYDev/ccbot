@@ -36,7 +36,10 @@ from .message_sender import NO_LINK_PREVIEW
 
 logger = logging.getLogger(__name__)
 
-# Tool names that trigger interactive UI via JSONL (terminal capture + inline keyboard)
+# Tool names whose JSONL `tool_use` entry must be suppressed in bot.py because
+# the rendered terminal pane is the source of truth for these UIs (pane-as-source
+# design). Other interactive UIs (PermissionPrompt, Settings, RestoreCheckpoint,
+# BashApproval) have no corresponding JSONL `tool_use`, so they don't appear here.
 INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 
 # Track interactive UI message IDs: (user_id, thread_id_or_0) -> message_id
@@ -44,6 +47,16 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
+
+# In-flight enqueue guard: an `interactive_ui` task has been pushed onto the
+# message queue for this ikey but the worker has not yet dispatched it. Prevents
+# status_polling from enqueueing duplicate tasks during the worker's busy window.
+_interactive_enqueued: set[tuple[int, int]] = set()
+
+# Name of the UI most recently delivered to Telegram (e.g. "ExitPlanMode",
+# "PermissionPrompt"). Used by status_polling to detect a pane *morph* — UI
+# type changed in place — and re-enqueue so the worker can edit the message.
+_interactive_last_name: dict[tuple[int, int], str] = {}
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -75,6 +88,36 @@ def clear_interactive_mode(user_id: int, thread_id: int | None = None) -> None:
 def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | None:
     """Get the interactive message ID for a user."""
     return _interactive_msgs.get((user_id, thread_id or 0))
+
+
+def mark_interactive_enqueued(user_id: int, thread_id: int | None = None) -> None:
+    """Record that an `interactive_ui` task is in the message queue for this ikey."""
+    _interactive_enqueued.add((user_id, thread_id or 0))
+
+
+def clear_interactive_enqueued(user_id: int, thread_id: int | None = None) -> None:
+    """Discard the in-flight enqueue flag — called by the worker on dispatch
+    and by `clear_interactive_msg` on dismissal."""
+    _interactive_enqueued.discard((user_id, thread_id or 0))
+
+
+def is_interactive_enqueued(user_id: int, thread_id: int | None = None) -> bool:
+    """True if a worker has been handed an `interactive_ui` task that hasn't
+    been dispatched yet."""
+    return (user_id, thread_id or 0) in _interactive_enqueued
+
+
+def set_interactive_last_name(
+    user_id: int, ui_name: str, thread_id: int | None = None
+) -> None:
+    """Record the name of the UI most recently delivered, so status_polling
+    can detect pane morphs."""
+    _interactive_last_name[(user_id, thread_id or 0)] = ui_name
+
+
+def get_interactive_last_name(user_id: int, thread_id: int | None = None) -> str | None:
+    """Return the UI name last delivered for this ikey, or None."""
+    return _interactive_last_name.get((user_id, thread_id or 0))
 
 
 def _build_interactive_keyboard(
@@ -201,6 +244,7 @@ async def handle_interactive_ui(
                 link_preview_options=NO_LINK_PREVIEW,
             )
             _interactive_mode[ikey] = window_id
+            _interactive_last_name[ikey] = content.name
             return True
         except Exception:
             # Edit failed (message deleted, etc.) - clear stale msg_id and send new
@@ -228,6 +272,7 @@ async def handle_interactive_ui(
     if sent:
         _interactive_msgs[ikey] = sent.message_id
         _interactive_mode[ikey] = window_id
+        _interactive_last_name[ikey] = content.name
         return True
     return False
 
@@ -241,6 +286,8 @@ async def clear_interactive_msg(
     ikey = (user_id, thread_id or 0)
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
+    _interactive_enqueued.discard(ikey)
+    _interactive_last_name.pop(ikey, None)
     logger.debug(
         "Clear interactive msg: user=%d, thread=%s, msg_id=%s",
         user_id,

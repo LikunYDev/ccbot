@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import pwd
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +26,22 @@ import libtmux
 from .config import SENSITIVE_ENV_VARS, config
 
 logger = logging.getLogger(__name__)
+
+# Common claude install locations prepended to PATH inside the window's shell
+# command. Mirrors update_watcher._FALLBACK_BIN_DIRS — they exist for the same
+# reason (service-manager PATH is often stripped of ~/.local/bin etc.).
+_FALLBACK_PATH = "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+
+
+def _user_shell() -> str:
+    """The user's login shell, with /bin/zsh as a last-resort fallback."""
+    try:
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+        if shell:
+            return shell
+    except (KeyError, OSError):
+        pass
+    return "/bin/zsh"
 
 
 def build_claude_command(
@@ -42,6 +61,59 @@ def build_claude_command(
     if resume_session_id:
         cmd = f"{cmd} --resume {resume_session_id}"
     return cmd
+
+
+def build_window_shell_cmd(claude_cmd: str, user_shell: str) -> str:
+    """Compose the value passed as `window_shell` to tmux's new-window.
+
+    tmux executes this via `/bin/sh -c "<value>"`, which is non-interactive
+    and skips zsh init entirely — eliminating the shell-init race where
+    prompts during `.zshrc` (e.g. oh-my-zsh's update prompt) consume the
+    first keystrokes of a `send_keys` payload.
+
+    PATH is prepended with common claude install locations so the binary
+    is findable even when the bot runs under a service manager with a
+    stripped-down PATH. The trailing `; exec <user_shell>` keeps a debug
+    shell in the pane after claude exits, instead of the window closing.
+    """
+    return f'PATH="{_FALLBACK_PATH}:$PATH" {claude_cmd}; exec {user_shell}'
+
+
+def _parse_group_session_names(
+    list_sessions_output: str, configured_session_name: str
+) -> set[str]:
+    """Return tmux session names sharing the configured session's group.
+
+    tmux reports an empty `session_group` for ordinary ungrouped sessions.
+    In that case, matching on the group would incorrectly include every other
+    ungrouped session on the server, so we fall back to the configured name.
+    """
+
+    sessions: list[tuple[str, str]] = []
+    target_group = ""
+
+    for raw_line in list_sessions_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        session_name, sep, session_group = line.partition("|")
+        if not sep or not session_name:
+            return {configured_session_name}
+        sessions.append((session_name, session_group))
+        if session_name == configured_session_name:
+            if not session_group:
+                return {configured_session_name}
+            target_group = session_group
+
+    if not target_group:
+        return {configured_session_name}
+
+    grouped_names = {
+        session_name
+        for session_name, session_group in sessions
+        if session_group == target_group
+    }
+    return grouped_names or {configured_session_name}
 
 
 @dataclass
@@ -190,6 +262,95 @@ class TmuxManager:
                 return window
         logger.debug("Window not found by id: %s", window_id)
         return None
+
+    async def get_pane_current_command(self, window_id: str) -> str | None:
+        """Return the foreground process name in the window's active pane.
+
+        Returns None if the window or pane is gone. Used by the auto-restart
+        health check to verify claude actually started.
+        """
+
+        def _sync_get() -> str | None:
+            session = self.get_session()
+            if not session:
+                return None
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    return None
+                pane = window.active_pane
+                if not pane:
+                    return None
+                return pane.pane_current_command or ""
+            except Exception as e:
+                logger.debug(f"get_pane_current_command({window_id}) failed: {e}")
+                return None
+
+        return await asyncio.to_thread(_sync_get)
+
+    async def get_pane_pid(self, window_id: str) -> int | None:
+        """Return the PID of the window's active pane.
+
+        When claude is launched via `window_shell` (tmux's `new-window <cmd>`
+        form, executed by `/bin/sh -c`), the shell is the pane_pid and claude
+        runs as a child. `get_pane_current_command` reports the shell's name,
+        so the restart health check uses this PID to walk the process tree
+        for claude. Returns None if the pane is gone or the PID is missing.
+        """
+
+        def _sync_get() -> int | None:
+            session = self.get_session()
+            if not session:
+                return None
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    return None
+                pane = window.active_pane
+                if not pane:
+                    return None
+                raw = pane.pane_pid
+                if raw is None:
+                    return None
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return None
+            except Exception as e:
+                logger.debug(f"get_pane_pid({window_id}) failed: {e}")
+                return None
+
+        return await asyncio.to_thread(_sync_get)
+
+    async def list_group_session_names(self) -> set[str]:
+        """Return the configured tmux session plus any grouped peers."""
+
+        def _sync_list() -> set[str]:
+            try:
+                result = subprocess.run(
+                    [
+                        "tmux",
+                        "list-sessions",
+                        "-F",
+                        "#{session_name}|#{session_group}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError as e:
+                logger.debug("list_group_session_names failed to exec tmux: %s", e)
+                return {self.session_name}
+
+            if result.returncode != 0:
+                logger.debug(
+                    "list_group_session_names failed: %s",
+                    result.stderr.strip() or f"exit {result.returncode}",
+                )
+                return {self.session_name}
+
+            return _parse_group_session_names(result.stdout, self.session_name)
+
+        return await asyncio.to_thread(_sync_list)
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a window's active pane.
@@ -421,31 +582,35 @@ class TmuxManager:
             final_window_name = f"{base_name}-{counter}"
             counter += 1
 
+        # Build the window's primary command up-front so it runs as the pane's
+        # process (via tmux's `new-window <shell-command>`, executed by /bin/sh
+        # -c). This bypasses the user's interactive shell init entirely —
+        # no .zshrc, no oh-my-zsh prompts — eliminating the race where
+        # init-time `read` calls eat the first chars of a `send_keys` payload.
+        window_shell_arg: str | None = None
+        if start_claude:
+            inner = build_claude_command(
+                config.claude_command,
+                permission_mode=config.claude_permission_mode,
+                resume_session_id=resume_session_id,
+            )
+            window_shell_arg = build_window_shell_cmd(inner, _user_shell())
+
         # Create window in thread
-        def _create_and_start() -> tuple[bool, str, str, str]:
+        def _create() -> tuple[bool, str, str, str]:
             session = self.get_or_create_session()
             try:
-                # Create new window
                 window = session.new_window(
                     window_name=final_window_name,
                     start_directory=str(path),
+                    window_shell=window_shell_arg,
                 )
 
                 wid = window.window_id or ""
 
-                # Prevent Claude Code from overriding window name
+                # Prevent Claude Code from overriding window name. Defense in
+                # depth — the global `allow-rename` is typically already off.
                 window.set_window_option("allow-rename", "off")
-
-                # Start Claude Code if requested
-                if start_claude:
-                    pane = window.active_pane
-                    if pane:
-                        cmd = build_claude_command(
-                            config.claude_command,
-                            permission_mode=config.claude_permission_mode,
-                            resume_session_id=resume_session_id,
-                        )
-                        pane.send_keys(cmd, enter=True)
 
                 logger.info(
                     "Created window '%s' (id=%s) at %s",
@@ -464,7 +629,7 @@ class TmuxManager:
                 logger.error(f"Failed to create window: {e}")
                 return False, f"Failed to create window: {e}", "", ""
 
-        return await asyncio.to_thread(_create_and_start)
+        return await asyncio.to_thread(_create)
 
 
 # Global instance with default session name

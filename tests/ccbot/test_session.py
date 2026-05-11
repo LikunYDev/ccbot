@@ -1,6 +1,7 @@
 """Tests for SessionManager pure dict operations."""
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -160,6 +161,216 @@ class TestIsWindowId:
         assert mgr._is_window_id("@abc") is False
 
 
+class TestGroupedSessionMapHandling:
+    @pytest.mark.asyncio
+    async def test_load_session_map_accepts_grouped_session_prefix(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@5": {"session_id": "sid-1", "cwd": "/one"},
+                    "ccbot-2:@7": {"session_id": "sid-2", "cwd": "/two"},
+                    "other:@9": {"session_id": "sid-3", "cwd": "/three"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+
+        await mgr.load_session_map()
+
+        assert mgr.get_window_state("@5").session_id == "sid-1"
+        assert mgr.get_window_state("@7").session_id == "sid-2"
+        assert "@9" not in mgr.window_states
+
+    @pytest.mark.asyncio
+    async def test_load_session_map_survives_tmux_query_failure(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@5": {"session_id": "sid-1", "cwd": "/one"},
+                    "ccbot-2:@7": {"session_id": "sid-2", "cwd": "/two"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(side_effect=RuntimeError("tmux down")),
+        )
+
+        await mgr.load_session_map()
+
+        assert mgr.get_window_state("@5").session_id == "sid-1"
+        assert "@7" not in mgr.window_states
+
+    @pytest.mark.asyncio
+    async def test_load_session_map_does_not_wipe_state_from_grouped_prefix(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot-2:@28": {
+                        "session_id": "sid-28",
+                        "cwd": "/proj",
+                        "window_name": "proposal",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+        mgr.get_window_state("@28").session_id = "old-sid"
+
+        await mgr.load_session_map()
+
+        assert mgr.window_states["@28"].session_id == "sid-28"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_session_map_entry_accepts_grouped_session_prefix(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps({"ccbot-2:@28": {"session_id": "sid-28"}}), encoding="utf-8"
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+        load_session_map = AsyncMock()
+        monkeypatch.setattr(mgr, "load_session_map", load_session_map)
+
+        ok = await mgr.wait_for_session_map_entry("@28", timeout=0.1, interval=0.01)
+
+        assert ok is True
+        load_session_map.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stale_session_map_entries_removes_grouped_prefix(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot-2:@7": {"session_id": "sid-7"},
+                    "other:@9": {"session_id": "sid-9"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+
+        await mgr._cleanup_stale_session_map_entries({"@5"})
+
+        remaining = json.loads(session_map_file.read_text(encoding="utf-8"))
+        assert remaining == {"other:@9": {"session_id": "sid-9"}}
+
+    @pytest.mark.asyncio
+    async def test_load_session_map_dedups_same_window_id_across_grouped_peers(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """Grouped tmux sessions share windows, so the SessionStart hook can
+        write the same window_id under multiple session-name prefixes. If
+        load_session_map applied both, window_state.session_id would ping-pong
+        every poll cycle and flood the log. Configured tmux_session_name wins;
+        a re-load on unchanged input must be a no-op (no _save_state call).
+        """
+        session_map_file = tmp_path / "session_map.json"
+        # Write in primary-then-peer order so a buggy last-write-wins picks
+        # `sid-peer` — the fix must still pick `sid-primary`.
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@48": {
+                        "session_id": "sid-primary",
+                        "cwd": "/proj",
+                        "window_name": "name",
+                    },
+                    "ccbot-2:@48": {
+                        "session_id": "sid-peer",
+                        "cwd": "/proj",
+                        "window_name": "name",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+        )
+
+        await mgr.load_session_map()
+        assert mgr.get_window_state("@48").session_id == "sid-primary"
+
+        saves: list[None] = []
+        monkeypatch.setattr(mgr, "_save_state", lambda: saves.append(None))
+
+        await mgr.load_session_map()
+        assert mgr.get_window_state("@48").session_id == "sid-primary"
+        assert saves == [], (
+            "second load_session_map on unchanged input must not mutate state"
+        )
+
+    @pytest.mark.asyncio
+    async def test_load_session_map_falls_back_to_peer_when_primary_missing(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """When only a grouped peer has an entry for a window_id (no entry
+        under the configured tmux_session_name), the peer's entry must still
+        be applied — grouped peers share windows."""
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot-2:@7": {"session_id": "sid-peer", "cwd": "/x"},
+                    "ccbot-3:@7": {"session_id": "sid-peer-3", "cwd": "/x"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot", "ccbot-2", "ccbot-3"}),
+        )
+
+        await mgr.load_session_map()
+        # Deterministic peer pick (sorted name → ccbot-2 wins).
+        assert mgr.get_window_state("@7").session_id == "sid-peer"
+
+
 def _write_jsonl(path, entries: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
 
@@ -257,4 +468,61 @@ class TestSessionNameParsing:
         result = await mgr._get_session_direct(sid, cwd)
         assert result is not None
         assert result.name == ""
-        assert result.summary == "just a summary"
+
+
+class TestWindowStateSerialization:
+    """claude_launch_version round-trips through to_dict/from_dict."""
+
+    def test_to_dict_omits_empty_launch_version(self) -> None:
+        from ccbot.session import WindowState
+
+        ws = WindowState(session_id="sid", cwd="/x")
+        assert "claude_launch_version" not in ws.to_dict()
+
+    def test_to_dict_includes_set_launch_version(self) -> None:
+        from ccbot.session import WindowState
+
+        ws = WindowState(session_id="sid", cwd="/x", claude_launch_version="2.1.118")
+        assert ws.to_dict()["claude_launch_version"] == "2.1.118"
+
+    def test_from_dict_reads_launch_version(self) -> None:
+        from ccbot.session import WindowState
+
+        ws = WindowState.from_dict(
+            {"session_id": "sid", "cwd": "/x", "claude_launch_version": "2.1.117"}
+        )
+        assert ws.claude_launch_version == "2.1.117"
+
+    def test_from_dict_missing_launch_version_defaults_empty(self) -> None:
+        # Existing on-disk state.json files have no field — must load cleanly.
+        from ccbot.session import WindowState
+
+        ws = WindowState.from_dict({"session_id": "sid", "cwd": "/x"})
+        assert ws.claude_launch_version == ""
+
+
+class TestSetClaudeLaunchVersion:
+    def test_sets_field_on_existing_state(self, mgr: SessionManager) -> None:
+        mgr.get_window_state("@1")  # ensure exists
+        mgr.set_claude_launch_version("@1", "2.1.118")
+        assert mgr.get_window_state("@1").claude_launch_version == "2.1.118"
+
+    def test_creates_state_if_missing(self, mgr: SessionManager) -> None:
+        # Backfill path: window_id may not have an entry yet.
+        mgr.set_claude_launch_version("@99", "2.1.118")
+        assert mgr.get_window_state("@99").claude_launch_version == "2.1.118"
+
+    def test_no_op_when_unchanged_skips_save(self, monkeypatch) -> None:
+        # Verify we don't churn state.json on every turn-end when there's
+        # nothing to write.
+        monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+        saved: list[bool] = []
+
+        def fake_save(self) -> None:
+            saved.append(True)
+
+        monkeypatch.setattr(SessionManager, "_save_state", fake_save)
+        m = SessionManager()
+        m.set_claude_launch_version("@1", "2.1.118")
+        m.set_claude_launch_version("@1", "2.1.118")  # no-op
+        assert len(saved) == 1

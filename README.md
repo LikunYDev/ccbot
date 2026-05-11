@@ -161,7 +161,7 @@ Linux/systemd users can use the existing restart helpers:
 
 macOS users should use `launchd` instead of `systemd`:
 
-1. Copy [deploy/macos/com.ccbot.plist](/Users/lkyao/projects/ccbot/deploy/macos/com.ccbot.plist) to `~/Library/LaunchAgents/com.ccbot.plist`
+1. Copy [deploy/macos/com.ccbot.plist](/Users/lkyao/dev/ccbot/deploy/macos/com.ccbot.plist) to `~/Library/LaunchAgents/com.ccbot.plist`
 2. Replace the placeholder repo path and username values
 3. Load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ccbot.plist`
 4. Restart with:

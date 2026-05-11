@@ -48,11 +48,17 @@ class WindowState:
         session_id: Associated Claude session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        claude_launch_version: Installed `claude --version` at the moment this
+            window's claude process was launched. Compared against the live
+            installed version on each turn-end to decide whether to auto-restart
+            this specific window. Per-window (not global) so independent
+            sessions still on the old version each get their own upgrade.
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    claude_launch_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -61,6 +67,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.claude_launch_version:
+            d["claude_launch_version"] = self.claude_launch_version
         return d
 
     @classmethod
@@ -69,6 +77,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            claude_launch_version=data.get("claude_launch_version", ""),
         )
 
 
@@ -351,6 +360,62 @@ class SessionManager:
         await self._cleanup_stale_session_map_entries(live_ids)
         await self._cleanup_old_format_session_map_keys()
 
+    async def _accepted_session_map_names(self) -> set[str]:
+        """Return the configured tmux session plus any grouped peers."""
+
+        try:
+            names = await tmux_manager.list_group_session_names()
+        except Exception as e:
+            logger.debug("Failed to list grouped tmux sessions: %s", e)
+            names = set()
+        return names or {config.tmux_session_name}
+
+    @staticmethod
+    def _split_session_map_key(key: str) -> tuple[str, str] | None:
+        """Split a session_map key into (session_name, window_key)."""
+
+        session_name, sep, window_key = key.partition(":")
+        if not sep or not session_name or not window_key:
+            return None
+        return session_name, window_key
+
+    def _select_canonical_session_map_entries(
+        self,
+        session_map: dict[str, Any],
+        accepted_names: set[str],
+    ) -> dict[str, tuple[str, dict[str, Any]]]:
+        """Pick one (session_name, info) per window_id from accepted entries.
+
+        Grouped tmux sessions share windows, so the SessionStart hook can write
+        the same window_id under multiple session-name prefixes (e.g.
+        ``ccbot:@48`` and ``ccbot-2:@48``). Iterating all of them would
+        ping-pong ``window_state.session_id`` every poll cycle and flood the
+        log. The configured ``tmux_session_name`` wins; otherwise pick the
+        alphabetically-first peer so the choice is deterministic across runs.
+        """
+
+        candidates: dict[str, dict[str, dict[str, Any]]] = {}
+        for key, info in session_map.items():
+            parts = self._split_session_map_key(key)
+            if parts is None:
+                continue
+            session_name, window_id = parts
+            if session_name not in accepted_names:
+                continue
+            if not self._is_window_id(window_id):
+                continue
+            candidates.setdefault(window_id, {})[session_name] = info
+
+        primary = config.tmux_session_name
+        canonical: dict[str, tuple[str, dict[str, Any]]] = {}
+        for window_id, by_name in candidates.items():
+            if primary in by_name:
+                canonical[window_id] = (primary, by_name[primary])
+            else:
+                chosen = sorted(by_name)[0]
+                canonical[window_id] = (chosen, by_name[chosen])
+        return canonical
+
     async def _cleanup_old_format_session_map_keys(self) -> None:
         """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
         if not config.session_map_file.exists():
@@ -362,11 +427,14 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
+        accepted_names = await self._accepted_session_map_names()
         old_keys = [
             key
             for key in session_map
-            if key.startswith(prefix) and not self._is_window_id(key[len(prefix) :])
+            for parts in [self._split_session_map_key(key)]
+            if parts is not None
+            and parts[0] in accepted_names
+            and not self._is_window_id(parts[1])
         ]
         if not old_keys:
             return
@@ -394,13 +462,15 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
+        accepted_names = await self._accepted_session_map_names()
         stale_keys = [
             key
             for key in session_map
-            if key.startswith(prefix)
-            and self._is_window_id(key[len(prefix) :])
-            and key[len(prefix) :] not in live_ids
+            for parts in [self._split_session_map_key(key)]
+            if parts is not None
+            and parts[0] in accepted_names
+            and self._is_window_id(parts[1])
+            and parts[1] not in live_ids
         ]
         if not stale_keys:
             return
@@ -481,6 +551,7 @@ class SessionManager:
     ) -> bool:
         """Poll session_map.json until an entry for window_id appears.
 
+        Accepts the configured tmux session name plus any grouped peers.
         Returns True if the entry was found within timeout, False otherwise.
         """
         logger.debug(
@@ -488,7 +559,6 @@ class SessionManager:
             window_id,
             timeout,
         )
-        key = f"{config.tmux_session_name}:{window_id}"
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -496,14 +566,16 @@ class SessionManager:
                     async with aiofiles.open(config.session_map_file, "r") as f:
                         content = await f.read()
                     session_map = json.loads(content)
-                    info = session_map.get(key, {})
-                    if info.get("session_id"):
-                        # Found — load into window_states immediately
-                        logger.debug(
-                            "session_map entry found for window_id %s", window_id
-                        )
-                        await self.load_session_map()
-                        return True
+                    accepted_names = await self._accepted_session_map_names()
+                    for session_name in accepted_names:
+                        info = session_map.get(f"{session_name}:{window_id}", {})
+                        if info.get("session_id"):
+                            # Found — load into window_states immediately
+                            logger.debug(
+                                "session_map entry found for window_id %s", window_id
+                            )
+                            await self.load_session_map()
+                            return True
             except (json.JSONDecodeError, OSError):
                 pass
             await asyncio.sleep(interval)
@@ -516,7 +588,7 @@ class SessionManager:
         """Read session_map.json and update window_states with new session associations.
 
         Keys in session_map are formatted as "tmux_session:window_id" (e.g. "ccbot:@12").
-        Only entries matching our tmux_session_name are processed.
+        Accepts entries under our tmux_session_name or any grouped peer session.
         Also cleans up window_states entries not in current session_map.
         Updates window_display_names from the "window_name" field in values.
         """
@@ -529,17 +601,14 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
+        accepted_names = await self._accepted_session_map_names()
+        canonical = self._select_canonical_session_map_entries(
+            session_map, accepted_names
+        )
         valid_wids: set[str] = set()
         changed = False
 
-        for key, info in session_map.items():
-            # Only process entries for our tmux session
-            if not key.startswith(prefix):
-                continue
-            window_id = key[len(prefix) :]
-            if not self._is_window_id(window_id):
-                continue
+        for window_id, (_session_name, info) in canonical.items():
             valid_wids.add(window_id)
             new_sid = info.get("session_id", "")
             new_cwd = info.get("cwd", "")
@@ -588,6 +657,22 @@ class SessionManager:
         state.session_id = ""
         self._save_state()
         logger.info("Cleared session for window_id %s", window_id)
+
+    def set_claude_launch_version(self, window_id: str, version: str) -> None:
+        """Record the installed claude version active when this window launched.
+
+        Used by `update_watcher.maybe_restart_for_upgrade` to decide whether
+        a specific window needs an auto-restart. Persisted per-window so an
+        upgrade in one session does not silence the upgrade signal for others.
+        """
+        state = self.get_window_state(window_id)
+        if state.claude_launch_version == version:
+            return
+        state.claude_launch_version = version
+        self._save_state()
+        logger.info(
+            "Set claude_launch_version for window_id %s -> %s", window_id, version
+        )
 
     @staticmethod
     def _encode_cwd(cwd: str) -> str:
