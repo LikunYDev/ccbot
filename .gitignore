@@ -69,3 +69,6 @@ venv.bak/
 # Project specific
 .uv/
 uv.lock
+
+# Claude Code plan-mode scratch files
+.claude/plans/
