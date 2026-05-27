@@ -196,14 +196,177 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     return InteractiveUIContent(content=_shorten_separators(content), name=pattern.name)
 
 
+# ── Bottom-anchored fallback ──────────────────────────────────────────────
+#
+# A tall interactive prompt (e.g. a multi-option AskUserQuestion) can push its
+# *top* marker above the visible 80×24 pane, so the top-down extractor above
+# misses it and the session hangs silently waiting for input it never asked the
+# user for. But an interactive prompt is always the last thing on screen —
+# Claude is blocked, nothing ever prints below it — so its *bottom* marker is
+# always visible. These detectors anchor on that bottom marker and read upward,
+# so detection can no longer silently fail on prompt height.
+#
+# Markers here must be SPECIFIC enough to name the UI unambiguously. The generic
+# "Esc to cancel" is intentionally NOT used as an anchor: it is shared by several
+# short UIs (permission/settings/bash) whose top marker does not scroll off, so
+# the top-down pass already handles them.
+
+# Option/selection structure expected inside a real prompt body. Guards the
+# bottom-anchored path against false positives from incidental marker text in
+# Claude's normal streaming output.
+_RE_OPTION_HINT = re.compile(r"(?:❯|\b\d+[.)]\s|[☐✔☒]|\[[ xX]\])")
+
+# A chrome separator (full-width box rule). An upward read stops here so two
+# stacked UIs / prior output never merge into one block.
+_RE_SEPARATOR = re.compile(r"^─{5,}$")
+
+# How many trailing non-empty lines may hold the bottom marker. The live prompt
+# sits at the very bottom, possibly under a few lines of input-box chrome.
+_BOTTOM_ANCHOR_TAIL = 12
+# Cap on how far up we read when the top marker is off-screen.
+_BOTTOM_ANCHOR_MAX_HEIGHT = 80
+
+
+@dataclass(frozen=True)
+class _BottomAnchor:
+    """A bottom marker that alone identifies an interactive UI, read upward."""
+
+    name: str
+    marker: tuple[re.Pattern[str], ...]  # specific, unambiguous bottom line
+    top_hint: tuple[re.Pattern[str], ...]  # optional top markers to trim to
+
+
+# Order matters (first match wins), like UI_PATTERNS.
+_BOTTOM_ANCHORS: list[_BottomAnchor] = [
+    _BottomAnchor(
+        name="AskUserQuestion",
+        # "Enter to select" is unique to the option selector footer; anchored at
+        # line start so prose like "press Enter to select" can't trigger it.
+        marker=(re.compile(r"^\s*Enter to select"),),
+        top_hint=(
+            re.compile(r"^\s*←\s+[☐✔☒]"),
+            re.compile(r"^\s*[☐✔☒]"),
+            re.compile(r"^\s*(?:❯\s+)?\d+\.\s+\["),
+        ),
+    ),
+    _BottomAnchor(
+        name="ExitPlanMode",
+        marker=(re.compile(r"^\s*ctrl-g to edit in "),),
+        top_hint=(
+            re.compile(r"^\s*Would you like to proceed\?"),
+            re.compile(r"^\s*Claude has written up a plan"),
+        ),
+    ),
+]
+
+
+def _try_extract_from_bottom(
+    lines: list[str], anchor: _BottomAnchor
+) -> InteractiveUIContent | None:
+    """Detect a UI by its bottom marker alone, reading upward.
+
+    Fallback for tall prompts whose top marker has scrolled out of the visible
+    pane. The marker must appear within the last ``_BOTTOM_ANCHOR_TAIL``
+    non-empty lines. Content is captured upward to the top hint if it is still
+    visible, else to a chrome separator or a bounded floor.
+    """
+    bottom_idx: int | None = None
+    seen_nonempty = 0
+    for i in range(len(lines) - 1, -1, -1):
+        if any(p.search(lines[i]) for p in anchor.marker):
+            bottom_idx = i
+            break
+        if lines[i].strip():
+            seen_nonempty += 1
+            if seen_nonempty >= _BOTTOM_ANCHOR_TAIL:
+                break
+    if bottom_idx is None:
+        return None
+
+    floor = max(0, bottom_idx - _BOTTOM_ANCHOR_MAX_HEIGHT)
+    top_idx = floor
+    for i in range(bottom_idx - 1, floor - 1, -1):
+        if any(p.search(lines[i]) for p in anchor.top_hint):
+            top_idx = i
+            break
+        if _RE_SEPARATOR.match(lines[i].strip()):
+            top_idx = i + 1
+            break
+
+    block = lines[top_idx : bottom_idx + 1]
+    # Guard: a real prompt has option/selection structure in the captured block.
+    if not any(_RE_OPTION_HINT.search(ln) for ln in block):
+        return None
+
+    content = "\n".join(block).rstrip()
+    return InteractiveUIContent(content=_shorten_separators(content), name=anchor.name)
+
+
+# ── Never-silent backstop ──────────────────────────────────────────────────
+#
+# If a known interactive footer is visible but no pattern (top-down or
+# bottom-anchored) matched, a prompt still exists and the user must not be left
+# in silence. ``build_degraded_prompt`` surfaces the visible region plus a note
+# so the session never hangs unseen — the invariant that makes pane-as-source
+# safe rather than merely usually-correct.
+
+_FOOTER_MARKERS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*Enter to select"),
+    re.compile(r"^\s*Enter to confirm"),
+    re.compile(r"^\s*Enter to continue"),
+    re.compile(r"^\s*Esc to (?:cancel|exit)"),
+    re.compile(r"^\s*ctrl-g to edit in "),
+)
+
+_DEGRADED_NOTE = (
+    "⚠️ Claude is asking something I couldn't fully parse. Open the session to "
+    "see the full prompt, or use the keys below."
+)
+# Cap on how many visible lines a degraded prompt shows.
+_DEGRADED_MAX_LINES = 30
+
+
+def has_interactive_footer(pane_text: str) -> bool:
+    """True if a known interactive footer is in the last visible lines.
+
+    Used by the never-silent backstop to detect that a prompt exists even when
+    full extraction failed (e.g. an unrecognized future UI).
+    """
+    if not pane_text:
+        return False
+    nonempty = [ln for ln in pane_text.strip().split("\n") if ln.strip()]
+    for ln in nonempty[-_BOTTOM_ANCHOR_TAIL:]:
+        if any(p.search(ln) for p in _FOOTER_MARKERS):
+            return True
+    return False
+
+
+def build_degraded_prompt(pane_text: str) -> InteractiveUIContent | None:
+    """Best-effort content when a footer is visible but no pattern matched.
+
+    Returns the visible UI region (chrome stripped) plus a note, named
+    ``"UnknownPrompt"``. Returns None when no interactive footer is present.
+    """
+    if not has_interactive_footer(pane_text):
+        return None
+    lines = strip_pane_chrome(pane_text.strip().split("\n"))
+    block = [ln for ln in lines if ln.strip()][-_DEGRADED_MAX_LINES:]
+    body = _shorten_separators("\n".join(block)).rstrip()
+    return InteractiveUIContent(
+        content=f"{_DEGRADED_NOTE}\n\n{body}", name="UnknownPrompt"
+    )
+
+
 # ── Public API ───────────────────────────────────────────────────────────
 
 
 def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
     """Extract content from an interactive UI in terminal output.
 
-    Tries each UI pattern in declaration order; first match wins.
-    Returns None if no recognizable interactive UI is found.
+    Tries each UI pattern top-down in declaration order (first match wins),
+    then falls back to bottom-anchored detection for tall prompts whose top
+    marker has scrolled out of the visible pane. Returns None if no
+    recognizable interactive UI is found.
     """
     if not pane_text:
         return None
@@ -211,6 +374,11 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
     lines = pane_text.strip().split("\n")
     for pattern in UI_PATTERNS:
         result = _try_extract(lines, pattern)
+        if result:
+            return result
+    # Fallback: top marker off-screen — anchor on the always-visible bottom.
+    for anchor in _BOTTOM_ANCHORS:
+        result = _try_extract_from_bottom(lines, anchor)
         if result:
             return result
     return None

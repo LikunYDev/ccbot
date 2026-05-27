@@ -159,11 +159,25 @@ class TmuxManager:
             self._scrub_session_env(session)
             return session
 
-        # Create new session with main window named specifically
+        # Create new session with main window named specifically. A generous
+        # detached size (-x/-y) lets tall interactive prompts render fully so
+        # the pane parser sees the whole UI. This runs ONLY at creation of a
+        # fresh session — it never resizes a live/grouped session (that crashed
+        # tmux on 2026-05-27).
         session = self.server.new_session(
             session_name=self.session_name,
             start_directory=str(Path.home()),
+            x=config.pane_cols,
+            y=config.pane_rows,
         )
+        # Pin the size for this detached session and have new windows inherit it.
+        # Session-scoped (not `set -g`) so other servers/sessions are untouched;
+        # guarded so a tmux quirk can't abort session creation.
+        try:
+            session.set_option("window-size", "manual")
+            session.set_option("default-size", f"{config.pane_cols}x{config.pane_rows}")
+        except Exception as e:
+            logger.debug("Could not pin pane size on new session: %s", e)
         # Rename the default window to the main window name
         if session.windows:
             session.windows[0].rename_window(config.tmux_main_window_name)

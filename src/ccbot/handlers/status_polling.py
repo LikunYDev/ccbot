@@ -24,7 +24,12 @@ from telegram import Bot
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import extract_interactive_content, parse_status_line
+from ..terminal_parser import (
+    build_degraded_prompt,
+    extract_interactive_content,
+    has_interactive_footer,
+    parse_status_line,
+)
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
@@ -49,6 +54,14 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# Never-silent backstop: consecutive polls where a footer is visible but no
+# pattern matched before surfacing a degraded prompt. Debounces transient
+# redraw frames (≈ this many seconds at STATUS_POLL_INTERVAL).
+_PROMPT_MISS_THRESHOLD = 3
+
+# (user_id, thread_id_or_0) -> consecutive unparsed-but-footer-present polls.
+_prompt_miss_counts: dict[tuple[int, int], int] = {}
 
 
 async def update_status_message(
@@ -88,6 +101,16 @@ async def update_status_message(
     # than what we last delivered). The worker drains the queue FIFO so any
     # text/thinking already in flight lands first.
     content = extract_interactive_content(pane_text)
+    ikey = (user_id, thread_id or 0)
+    if content is None and has_interactive_footer(pane_text):
+        # A prompt is on screen but no pattern matched. Wait a few polls (to
+        # skip a transient redraw frame), then surface a degraded view rather
+        # than leave the session hanging silently.
+        _prompt_miss_counts[ikey] = _prompt_miss_counts.get(ikey, 0) + 1
+        if _prompt_miss_counts[ikey] >= _PROMPT_MISS_THRESHOLD:
+            content = build_degraded_prompt(pane_text)
+    else:
+        _prompt_miss_counts.pop(ikey, None)
     interactive_window = get_interactive_window(user_id, thread_id)
 
     if content is not None:

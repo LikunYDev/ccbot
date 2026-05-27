@@ -28,6 +28,19 @@ CLAUDE_PERMISSION_MODES = frozenset(
 )
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int env var, falling back to ``default`` if unset or
+    invalid (non-numeric or non-positive)."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class Config:
     """Application configuration loaded from environment variables."""
 
@@ -132,6 +145,15 @@ class Config:
         # Pinned starting directory for the new-session directory browser.
         # Empty / unset / nonexistent path falls back to Path.cwd() at use time.
         self.default_dir: str = os.getenv("CCBOT_DEFAULT_DIR", "").strip()
+
+        # Visible tmux pane size for bot-created sessions. Bigger panes let tall
+        # interactive prompts render fully (see
+        # plans/2026-05-27-bottom-anchored-pane-detection.md). Applied ONLY when
+        # the bot creates the session — never mutates a live one (a live global
+        # resize crashed tmux on 2026-05-27). Detection no longer depends on
+        # this; it is polish, not load-bearing.
+        self.pane_cols: int = _env_int("CCBOT_PANE_COLS", 220)
+        self.pane_rows: int = _env_int("CCBOT_PANE_ROWS", 50)
 
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")

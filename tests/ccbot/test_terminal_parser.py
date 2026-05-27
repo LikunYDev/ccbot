@@ -3,8 +3,10 @@
 import pytest
 
 from ccbot.terminal_parser import (
+    build_degraded_prompt,
     extract_bash_output,
     extract_interactive_content,
+    has_interactive_footer,
     is_interactive_ui,
     parse_status_line,
     strip_pane_chrome,
@@ -225,6 +227,83 @@ class TestExtractInteractiveContent:
     def test_min_gap_too_small_returns_none(self):
         pane = "  Do you want to proceed?\n  Esc to cancel\n"
         assert extract_interactive_content(pane) is None
+
+
+# ── bottom-anchored detection (tall prompts, top marker off-screen) ───────
+
+
+class TestBottomAnchoredDetection:
+    def test_ask_user_top_marker_scrolled_off(self):
+        """Incident repro (2026-05-27): a tall AskUserQuestion whose tab/checkbox
+        header has scrolled above the 80×24 viewport. The top-down extractor
+        misses it (no top marker visible); the bottom-anchored fallback must
+        still detect it via the always-visible 'Enter to select' footer."""
+        pane = (
+            'When you say "escalations" are over-engineered, which do you mean?\n'
+            "❯ 1. The note tier ladder\n"
+            "  2. Cross-scope forced-preview\n"
+            "  3. The auto-archive sweep\n"
+            "  4. Something else\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  [Opus 4.7] Context: 41%\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        assert "The note tier ladder" in result.content
+
+    def test_no_false_positive_on_prose_with_marker(self):
+        """A line starting 'Enter to select' but lacking option structure
+        (no ❯/number/checkbox) must NOT be detected as a prompt."""
+        pane = (
+            "Here is how the model picker works in general.\n"
+            "Enter to select is the phrase shown in its footer.\n"
+        )
+        assert extract_interactive_content(pane) is None
+
+    def test_top_down_still_wins_when_top_visible(self):
+        """When the top marker is visible the normal top-down path handles it;
+        the fallback must not change the outcome."""
+        pane = "  ☐ Option A\n  ☐ Option B\n  Enter to select\n"
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+
+
+# ── never-silent backstop (footer present, no pattern matched) ────────────
+
+
+class TestDegradedBackstop:
+    def test_has_footer_true_for_known_footers(self):
+        assert has_interactive_footer("body\nEnter to select · Esc to cancel\n")
+        assert has_interactive_footer("plan text\nctrl-g to edit in vim\n")
+        assert has_interactive_footer("stuff\nEsc to cancel\n")
+
+    def test_has_footer_false_for_plain_output(self, sample_pane_no_ui: str):
+        assert has_interactive_footer(sample_pane_no_ui) is False
+        assert has_interactive_footer("") is False
+
+    def test_degraded_prompt_for_unknown_ui(self):
+        """An unrecognized dialog with a known footer but no matching top marker
+        yields a degraded view (note + visible body), never silence."""
+        pane = (
+            "Some brand-new dialog we don't have a pattern for\n"
+            "  with a couple of lines\n"
+            "Esc to cancel\n"
+        )
+        # No pattern should match this (no recognized top marker).
+        assert extract_interactive_content(pane) is None
+        degraded = build_degraded_prompt(pane)
+        assert degraded is not None
+        assert degraded.name == "UnknownPrompt"
+        assert "brand-new dialog" in degraded.content
+        assert "couldn't fully parse" in degraded.content
+
+    def test_degraded_none_without_footer(self, sample_pane_no_ui: str):
+        assert build_degraded_prompt(sample_pane_no_ui) is None
 
 
 # ── is_interactive_ui ────────────────────────────────────────────────────

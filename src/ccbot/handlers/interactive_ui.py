@@ -19,7 +19,12 @@ import logging
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..session import session_manager
-from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..terminal_parser import (
+    build_degraded_prompt,
+    extract_interactive_content,
+    has_interactive_footer,
+    is_interactive_ui,
+)
 from ..tmux_manager import tmux_manager
 from .callback_data import (
     CB_ASK_DOWN,
@@ -207,8 +212,10 @@ async def handle_interactive_ui(
         logger.debug("No pane text captured for window_id %s", window_id)
         return False
 
-    # Quick check if it looks like an interactive UI
-    if not is_interactive_ui(pane_text):
+    # Quick check if it looks like an interactive UI. A visible footer (without
+    # a full pattern match) still counts — the degraded fallback below surfaces
+    # it so an unrecognized prompt never hangs silently.
+    if not is_interactive_ui(pane_text) and not has_interactive_footer(pane_text):
         logger.debug(
             "No interactive UI detected in window_id %s (last 3 lines: %s)",
             window_id,
@@ -216,8 +223,11 @@ async def handle_interactive_ui(
         )
         return False
 
-    # Extract content between separators
+    # Extract content between separators; fall back to a degraded view when a
+    # footer is present but no pattern matched (never-silent backstop).
     content = extract_interactive_content(pane_text)
+    if not content:
+        content = build_degraded_prompt(pane_text)
     if not content:
         return False
 
