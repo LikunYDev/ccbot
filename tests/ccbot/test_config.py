@@ -157,30 +157,6 @@ class TestConfigOpenAI:
 
 
 @pytest.mark.usefixtures("_base_env")
-class TestConfigPaneSize:
-    def test_defaults(self, monkeypatch):
-        monkeypatch.delenv("CCBOT_PANE_COLS", raising=False)
-        monkeypatch.delenv("CCBOT_PANE_ROWS", raising=False)
-        cfg = Config()
-        assert cfg.pane_cols == 220
-        assert cfg.pane_rows == 50
-
-    def test_override(self, monkeypatch):
-        monkeypatch.setenv("CCBOT_PANE_COLS", "300")
-        monkeypatch.setenv("CCBOT_PANE_ROWS", "80")
-        cfg = Config()
-        assert cfg.pane_cols == 300
-        assert cfg.pane_rows == 80
-
-    def test_invalid_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("CCBOT_PANE_COLS", "abc")
-        monkeypatch.setenv("CCBOT_PANE_ROWS", "-5")
-        cfg = Config()
-        assert cfg.pane_cols == 220
-        assert cfg.pane_rows == 50
-
-
-@pytest.mark.usefixtures("_base_env")
 class TestConfigDefaultDir:
     def test_default_is_empty(self, monkeypatch):
         monkeypatch.delenv("CCBOT_DEFAULT_DIR", raising=False)
