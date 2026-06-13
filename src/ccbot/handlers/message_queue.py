@@ -759,6 +759,28 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
         _tool_msg_ids.pop(key, None)
 
 
+async def drain_queues(timeout: float = 10.0) -> None:
+    """Wait for live workers to flush every enqueued task, bounded by timeout.
+
+    Call during shutdown AFTER producers stop (status polling, the session
+    monitor's drain) but BEFORE shutdown_workers() cancels the workers. The
+    workers advance `task_done()` only once a task is actually sent, so
+    `queue.join()` blocks until the queue is delivered — turning enqueued-but-
+    unsent messages into delivered ones instead of discarding them with the
+    cancelled worker.
+    """
+    queues = list(_message_queues.values())
+    if not queues:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*(q.join() for q in queues)), timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "drain_queues: timed out flushing %d queue(s) before shutdown",
+            len(queues),
+        )
+
+
 async def shutdown_workers() -> None:
     """Stop all queue workers (called during bot shutdown)."""
     for _, worker in list(_queue_workers.items()):

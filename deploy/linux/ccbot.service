@@ -1,0 +1,36 @@
+[Unit]
+Description=ccbot - Telegram bridge for Claude Code
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/ccbot
+Restart=always
+RestartSec=10
+
+# Only signal the main ccbot process on stop/restart. This LEAVES the tmux
+# server (and every Claude session it hosts) running, so a deploy or a crash
+# does not kill in-flight work. On the next start, ccbot reattaches to its
+# dedicated tmux socket and resumes monitoring from the saved byte offsets.
+#
+# NOTE: ccbot must run on a dedicated tmux socket (TMUX_SOCKET_NAME, default
+# "ccbot") for this to be safe — otherwise it shares the user's interactive
+# tmux server. Attach over SSH with:  tmux -L ccbot attach -t ccbot
+#
+# WARNING: the FIRST deploy/restart onto the dedicated socket is one-time
+# destructive — tmux cannot move sessions between sockets, so sessions on the
+# old (default) socket do NOT carry over. Make this first switch at a clean
+# checkpoint. Every restart after that is non-destructive.
+KillMode=process
+
+# Give post_shutdown time to flush state and deliver in-flight messages before
+# systemd escalates to SIGKILL.
+TimeoutStopSec=30
+
+# Include ~/.local/bin so the Claude Code native installer binary
+# (~/.local/bin/claude) is resolvable by subprocess calls (e.g. update checks).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Uncomment to override the tmux socket name (default: ccbot):
+# Environment=TMUX_SOCKET_NAME=ccbot
+
+[Install]
+WantedBy=default.target

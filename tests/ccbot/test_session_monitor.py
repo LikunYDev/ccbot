@@ -1,5 +1,6 @@
 """Unit tests for SessionMonitor JSONL reading and offset handling."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -292,3 +293,49 @@ class TestGroupedSessionMapLoading:
 
         assert monitor.state.get_session("sid-28") is not None
         assert monitor.state.get_session("stale") is None
+
+
+class TestDrainCallbacks:
+    """Graceful shutdown delivers in-flight dispatch tasks (offsets advance on
+    read, so undelivered reads would otherwise be lost on restart)."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_awaits_in_flight_dispatch(self, monitor):
+        delivered = asyncio.Event()
+
+        async def slow_dispatch():
+            await asyncio.sleep(0.02)
+            delivered.set()
+
+        task = asyncio.create_task(slow_dispatch())
+        monitor._callback_tasks.add(task)
+        task.add_done_callback(monitor._callback_tasks.discard)
+
+        await monitor.drain_callbacks()
+
+        assert delivered.is_set()  # in-flight message was delivered, not dropped
+        assert task.done()
+
+    @pytest.mark.asyncio
+    async def test_no_pending_is_noop(self, monitor):
+        # Should return promptly with nothing queued.
+        await monitor.drain_callbacks()
+
+    @pytest.mark.asyncio
+    async def test_times_out_without_hanging(self, monitor):
+        async def never():
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(never())
+        monitor._callback_tasks.add(task)
+        try:
+            await monitor.drain_callbacks(timeout=0.05)  # returns despite the hang
+        finally:
+            task.cancel()

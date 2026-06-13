@@ -5,11 +5,54 @@ from unittest.mock import patch
 import pytest
 
 from ccbot import tmux_manager as tm
+from ccbot.config import config
 from ccbot.tmux_manager import (
+    TmuxManager,
     _parse_group_session_names,
     build_claude_command,
     build_window_shell_cmd,
 )
+
+
+class TestDedicatedSocket:
+    """ccbot's tmux server lives on a dedicated socket; every daemon-side raw
+    `tmux` call must carry `-L <socket>` (the hook is exempt — it inherits $TMUX)."""
+
+    def test_socket_name_from_config(self, monkeypatch):
+        monkeypatch.setattr(config, "tmux_socket_name", "ccbot-test")
+        mgr = TmuxManager()
+        assert mgr.socket_name == "ccbot-test"
+
+    def test_tmux_argv_prepends_socket_flag(self, monkeypatch):
+        monkeypatch.setattr(config, "tmux_socket_name", "ccbot")
+        mgr = TmuxManager()
+        assert mgr._tmux_argv("capture-pane", "-p", "-t", "@9") == [
+            "tmux",
+            "-L",
+            "ccbot",
+            "capture-pane",
+            "-p",
+            "-t",
+            "@9",
+        ]
+
+    def test_tmux_argv_follows_custom_socket(self, monkeypatch):
+        monkeypatch.setattr(config, "tmux_socket_name", "myproj")
+        mgr = TmuxManager()
+        assert mgr._tmux_argv("list-sessions")[:3] == ["tmux", "-L", "myproj"]
+
+    def test_server_uses_named_socket(self, monkeypatch):
+        monkeypatch.setattr(config, "tmux_socket_name", "ccbot")
+        created = {}
+
+        class FakeServer:
+            def __init__(self, socket_name=None):
+                created["socket_name"] = socket_name
+
+        monkeypatch.setattr(tm.libtmux, "Server", FakeServer)
+        mgr = TmuxManager()
+        _ = mgr.server  # triggers lazy creation
+        assert created["socket_name"] == "ccbot"
 
 
 class TestBuildClaudeCommand:

@@ -112,6 +112,7 @@ from .handlers.interactive_ui import (
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
+    drain_queues,
     enqueue_content_message,
     enqueue_status_update,
     get_message_queue,
@@ -322,6 +323,40 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Send Escape control character (no enter)
     await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Restart this topic's Claude session in place (respawn-pane, --resume).
+
+    Proceeds immediately — the user picks a clean point. The same @window_id is
+    reused (no rebind / no session_map churn) and the session resumes on the
+    current default model, so this also clears a stale model pin.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ /restart only works inside a topic.")
+        return
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    await safe_reply(update.message, "♻️ Restarting this session…")
+    from .update_watcher import restart_topic_in_place
+
+    await restart_topic_in_place(context.bot, user.id, thread_id, w.window_id)
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1890,14 +1925,14 @@ async def post_init(application: Application) -> None:
         await handle_new_message(msg, application.bot)
 
     async def turn_end_callback(session_id: str) -> None:
-        from .update_watcher import maybe_restart_for_upgrade
+        from .update_watcher import maybe_notify_update_or_failure
 
         active_users = await session_manager.find_users_for_session(session_id)
         for user_id, window_id, thread_id in active_users:
             queue = get_message_queue(user_id, thread_id)
             if queue:
                 await queue.join()
-            await maybe_restart_for_upgrade(
+            await maybe_notify_update_or_failure(
                 application.bot, user_id, thread_id, window_id
             )
 
@@ -1925,12 +1960,21 @@ async def post_shutdown(application: Application) -> None:
         _status_poll_task = None
         logger.info("Status polling stopped")
 
-    # Stop all queue workers
-    await shutdown_workers()
-
+    # Order matters: stop producers, flush queues, THEN cancel workers.
+    # 1. The session monitor enqueues already-read-but-unsent messages (offsets
+    #    advance on read, so these would be lost on the next start otherwise).
     if session_monitor:
+        await session_monitor.drain_callbacks()
         session_monitor.stop()
         logger.info("Session monitor stopped")
+
+    # 2. Let the still-running workers actually deliver everything enqueued
+    #    (including the just-drained messages) before we cancel them — a bare
+    #    shutdown_workers() cancels mid-flight and the queued sends are dropped.
+    await drain_queues()
+
+    # 3. Now tear the workers down.
+    await shutdown_workers()
 
     await close_transcribe_client()
 
@@ -1949,6 +1993,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

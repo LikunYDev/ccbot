@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# NOTE: routine restarts are non-destructive — KillMode=process leaves ccbot's
+# dedicated-socket tmux server (and every Claude session) running, and ccbot
+# reattaches on start. The ONE exception is the very first restart that switches
+# ccbot onto the dedicated socket: tmux cannot move sessions between sockets, so
+# sessions on the old (default) socket are left behind. Do that first switch at
+# a clean checkpoint.
+
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Reinstall the package so the systemd service picks up code changes

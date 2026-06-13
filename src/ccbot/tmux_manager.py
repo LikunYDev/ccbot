@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # reason (service-manager PATH is often stripped of ~/.local/bin etc.).
 _FALLBACK_PATH = "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 
+# Upper bound for blocking raw `tmux` subprocess calls, so a wedged tmux server
+# can't pin a thread-pool thread (and hang /restart) indefinitely.
+_TMUX_SUBPROCESS_TIMEOUT = 10.0
+
 
 def _user_shell() -> str:
     """The user's login shell, with /bin/zsh as a last-resort fallback."""
@@ -136,14 +140,24 @@ class TmuxManager:
             session_name: Name of the tmux session to use (default from config)
         """
         self.session_name = session_name or config.tmux_session_name
+        self.socket_name = config.tmux_socket_name
         self._server: libtmux.Server | None = None
 
     @property
     def server(self) -> libtmux.Server:
-        """Get or create tmux server connection."""
+        """Get or create tmux server connection on ccbot's dedicated socket."""
         if self._server is None:
-            self._server = libtmux.Server()
+            self._server = libtmux.Server(socket_name=self.socket_name)
         return self._server
+
+    def _tmux_argv(self, *args: str) -> list[str]:
+        """Build a `tmux -L <socket> ...` argv for raw subprocess calls.
+
+        Daemon-side `tmux` invocations run outside any pane, so (unlike the hook,
+        which inherits ``$TMUX``) they have no way to find ccbot's server and
+        would default to the shared socket. Every raw call must go through here.
+        """
+        return ["tmux", "-L", self.socket_name, *args]
 
     def get_session(self) -> libtmux.Session | None:
         """Get the tmux session if it exists."""
@@ -335,12 +349,11 @@ class TmuxManager:
         def _sync_list() -> set[str]:
             try:
                 result = subprocess.run(
-                    [
-                        "tmux",
+                    self._tmux_argv(
                         "list-sessions",
                         "-F",
                         "#{session_name}|#{session_group}",
-                    ],
+                    ),
                     capture_output=True,
                     text=True,
                 )
@@ -373,12 +386,7 @@ class TmuxManager:
             # Use async subprocess to call tmux capture-pane -e for ANSI colors
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "capture-pane",
-                    "-e",
-                    "-p",
-                    "-t",
-                    window_id,
+                    *self._tmux_argv("capture-pane", "-e", "-p", "-t", window_id),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -553,6 +561,75 @@ class TmuxManager:
                 return False
 
         return await asyncio.to_thread(_sync_kill)
+
+    async def respawn_pane(
+        self,
+        window_id: str,
+        work_dir: str,
+        resume_session_id: str | None = None,
+    ) -> bool:
+        """Restart the claude process in place, reusing the same tmux window.
+
+        Unlike kill_window + create_window, `respawn-pane -k` reuses the
+        existing window (and therefore the same @window_id), so the topic
+        binding and session_map entry stay valid — only the Claude session_id
+        rolls. This is the no-churn path used by `/restart` and avoids the
+        leaked-window-id problem that kill+create caused on every upgrade.
+
+        The launch command matches create_window (no explicit --model), so the
+        respawned session uses the user's current settings.json default model.
+        """
+        path = Path(work_dir).expanduser().resolve()
+        if not path.is_dir():
+            logger.error("respawn_pane: not a directory: %s", work_dir)
+            return False
+
+        inner = build_claude_command(
+            config.claude_command,
+            permission_mode=config.claude_permission_mode,
+            resume_session_id=resume_session_id,
+        )
+        window_shell_arg = build_window_shell_cmd(inner, _user_shell())
+
+        def _sync_respawn() -> bool:
+            try:
+                result = subprocess.run(
+                    self._tmux_argv(
+                        "respawn-pane",
+                        "-k",
+                        "-c",
+                        str(path),
+                        "-t",
+                        window_id,
+                        window_shell_arg,
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=_TMUX_SUBPROCESS_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "respawn_pane(%s): tmux timed out after %.0fs",
+                    window_id,
+                    _TMUX_SUBPROCESS_TIMEOUT,
+                )
+                return False
+            except OSError as e:
+                logger.error("respawn_pane: failed to exec tmux: %s", e)
+                return False
+            if result.returncode != 0:
+                logger.error(
+                    "respawn_pane(%s) failed: %s",
+                    window_id,
+                    result.stderr.strip() or f"exit {result.returncode}",
+                )
+                return False
+            logger.info(
+                "Respawned pane in window %s (resume=%s)", window_id, resume_session_id
+            )
+            return True
+
+        return await asyncio.to_thread(_sync_respawn)
 
     async def create_window(
         self,

@@ -22,6 +22,19 @@
     <key>KeepAlive</key>
     <true/>
 
+    <!-- launchd's analogue of systemd KillMode=process. By default launchd
+         kills the whole process group when the job stops, which would take down
+         the tmux server (and every Claude session) on a restart. Setting this
+         true leaves them running so ccbot reattaches to its dedicated tmux
+         socket on the next start.
+
+         WARNING: the FIRST deploy/restart onto the dedicated socket is one-time
+         destructive — tmux cannot move sessions between sockets, so sessions on
+         the old (default) socket do NOT carry over. Make this first switch at a
+         clean checkpoint. Every restart after that is non-destructive. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
     <key>StandardOutPath</key>
     <string>/Users/USERNAME/.ccbot/ccbot.stdout.log</string>
     <key>StandardErrorPath</key>
@@ -34,6 +47,11 @@
              ccbot (e.g. `claude --version` in update_watcher). -->
         <key>PATH</key>
         <string>/Users/USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- ccbot runs on a dedicated tmux socket (default "ccbot"); uncomment
+             to override. Attach over SSH with: tmux -L ccbot attach -t ccbot
+        <key>TMUX_SOCKET_NAME</key>
+        <string>ccbot</string>
+        -->
     </dict>
 </dict>
 </plist>
