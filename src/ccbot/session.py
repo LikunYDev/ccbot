@@ -50,15 +50,25 @@ class WindowState:
         window_name: Display name of the window
         claude_launch_version: Installed `claude --version` at the moment this
             window's claude process was launched. Compared against the live
-            installed version on each turn-end to decide whether to auto-restart
-            this specific window. Per-window (not global) so independent
-            sessions still on the old version each get their own upgrade.
+            installed version on each turn-end to decide whether to notify the
+            user that an update is available. Per-window (not global) so
+            independent sessions still on the old version each get their own
+            notice.
+        update_notified_version: The installed version we last sent an
+            "update available" notice about for this window. Prevents re-nagging
+            the same drift every turn; a *newer* version re-triggers exactly one
+            fresh notice. Persisted so a ccbot restart does not re-notify.
+        failure_notified: Whether we have already surfaced a "session looks
+            broken" notice for the current failure. Reset when the pane is clean
+            again (or on /restart) so a recurrence re-notifies once.
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
     claude_launch_version: str = ""
+    update_notified_version: str = ""
+    failure_notified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -69,6 +79,10 @@ class WindowState:
             d["window_name"] = self.window_name
         if self.claude_launch_version:
             d["claude_launch_version"] = self.claude_launch_version
+        if self.update_notified_version:
+            d["update_notified_version"] = self.update_notified_version
+        if self.failure_notified:
+            d["failure_notified"] = self.failure_notified
         return d
 
     @classmethod
@@ -78,6 +92,8 @@ class WindowState:
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
             claude_launch_version=data.get("claude_launch_version", ""),
+            update_notified_version=data.get("update_notified_version", ""),
+            failure_notified=data.get("failure_notified", False),
         )
 
 
@@ -661,9 +677,10 @@ class SessionManager:
     def set_claude_launch_version(self, window_id: str, version: str) -> None:
         """Record the installed claude version active when this window launched.
 
-        Used by `update_watcher.maybe_restart_for_upgrade` to decide whether
-        a specific window needs an auto-restart. Persisted per-window so an
-        upgrade in one session does not silence the upgrade signal for others.
+        Used by `update_watcher.maybe_notify_update_or_failure` to decide
+        whether to send this window a one-time "update available" notice.
+        Persisted per-window so an upgrade in one session does not silence the
+        upgrade signal for others.
         """
         state = self.get_window_state(window_id)
         if state.claude_launch_version == version:

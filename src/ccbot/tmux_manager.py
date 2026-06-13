@@ -554,6 +554,68 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_kill)
 
+    async def respawn_pane(
+        self,
+        window_id: str,
+        work_dir: str,
+        resume_session_id: str | None = None,
+    ) -> bool:
+        """Restart the claude process in place, reusing the same tmux window.
+
+        Unlike kill_window + create_window, `respawn-pane -k` reuses the
+        existing window (and therefore the same @window_id), so the topic
+        binding and session_map entry stay valid — only the Claude session_id
+        rolls. This is the no-churn path used by `/restart` and avoids the
+        leaked-window-id problem that kill+create caused on every upgrade.
+
+        The launch command matches create_window (no explicit --model), so the
+        respawned session uses the user's current settings.json default model.
+        """
+        path = Path(work_dir).expanduser().resolve()
+        if not path.is_dir():
+            logger.error("respawn_pane: not a directory: %s", work_dir)
+            return False
+
+        inner = build_claude_command(
+            config.claude_command,
+            permission_mode=config.claude_permission_mode,
+            resume_session_id=resume_session_id,
+        )
+        window_shell_arg = build_window_shell_cmd(inner, _user_shell())
+
+        def _sync_respawn() -> bool:
+            try:
+                result = subprocess.run(
+                    [
+                        "tmux",
+                        "respawn-pane",
+                        "-k",
+                        "-c",
+                        str(path),
+                        "-t",
+                        window_id,
+                        window_shell_arg,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError as e:
+                logger.error("respawn_pane: failed to exec tmux: %s", e)
+                return False
+            if result.returncode != 0:
+                logger.error(
+                    "respawn_pane(%s) failed: %s",
+                    window_id,
+                    result.stderr.strip() or f"exit {result.returncode}",
+                )
+                return False
+            logger.info(
+                "Respawned pane in window %s (resume=%s)", window_id, resume_session_id
+            )
+            return True
+
+        return await asyncio.to_thread(_sync_respawn)
+
     async def create_window(
         self,
         work_dir: str,

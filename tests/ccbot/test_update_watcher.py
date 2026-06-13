@@ -1,4 +1,5 @@
-"""Unit tests for update_watcher: per-window version tracking + upgrade restart."""
+"""Unit tests for update_watcher: version tracking, one-time update/failure
+notices, and in-place restart."""
 
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -124,103 +125,85 @@ class TestResolveClaudeBinary:
             assert _REAL_RESOLVE() is None
 
 
-class TestMaybeRestartForUpgrade:
-    """Per-window upgrade detection: compare current vs WindowState.claude_launch_version."""
+class TestMaybeNotifyUpdateOrFailure:
+    """Turn-end notifier: one-time update + failure notices, never auto-restart."""
 
     @staticmethod
-    def _stub_session_manager(monkeypatch, *, launch_version: str):
-        """Patch session_manager so window_state reads/writes are observable."""
+    def _stub(monkeypatch, *, launch_version: str, pane_text: str | None = None):
+        """Stub session_manager (observable window_state) + pane capture."""
         from ccbot import session
+        from ccbot import tmux_manager as tm
 
-        ws = MagicMock(claude_launch_version=launch_version)
+        ws = MagicMock(
+            claude_launch_version=launch_version,
+            update_notified_version="",
+            failure_notified=False,
+        )
         sm = MagicMock()
         sm.get_window_state.return_value = ws
         sm.set_claude_launch_version = MagicMock()
+        sm._save_state = MagicMock()
         monkeypatch.setattr(session, "session_manager", sm)
+        monkeypatch.setattr(
+            tm.tmux_manager, "capture_pane", AsyncMock(return_value=pane_text)
+        )
         return sm, ws
 
     @pytest.mark.asyncio
     async def test_disabled_is_noop(self, monkeypatch):
         monkeypatch.setattr(config, "auto_restart_enabled", False)
-        with patch("subprocess.run") as m:
-            await update_watcher.maybe_restart_for_upgrade(
+        enqueue = AsyncMock()
+        with (
+            patch("subprocess.run") as m,
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
+        ):
+            await update_watcher.maybe_notify_update_or_failure(
                 bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
             )
         m.assert_not_called()
+        enqueue.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_probe_failure_is_noop(self, monkeypatch):
-        # Version probe failed → no state read, no restart.
-        from ccbot import session
-
-        sm = MagicMock()
-        monkeypatch.setattr(session, "session_manager", sm)
-        restart = AsyncMock()
-        with (
-            patch("subprocess.run", side_effect=FileNotFoundError()),
-            patch.object(update_watcher, "_restart_topic", restart),
-        ):
-            await update_watcher.maybe_restart_for_upgrade(
-                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
-            )
-        restart.assert_not_awaited()
-        sm.get_window_state.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_matching_launch_version_is_noop(self, monkeypatch):
-        self._stub_session_manager(monkeypatch, launch_version="2.1.118")
-        restart = AsyncMock(return_value=True)
+    async def test_matching_version_clean_pane_no_notice(self, monkeypatch):
+        self._stub(monkeypatch, launch_version="2.1.118", pane_text="❯ ready")
+        enqueue = AsyncMock()
         with (
             patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
         ):
-            await update_watcher.maybe_restart_for_upgrade(
+            await update_watcher.maybe_notify_update_or_failure(
                 bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
             )
-        restart.assert_not_awaited()
+        enqueue.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_mismatched_launch_version_triggers_restart(self, monkeypatch):
-        # Per-window upgrade: this window was launched with old version,
-        # installed is newer → restart this specific window.
-        self._stub_session_manager(monkeypatch, launch_version="2.1.117")
-        restart = AsyncMock(return_value=True)
+    async def test_version_drift_notifies_once(self, monkeypatch):
+        # The notice fires once and never re-nags the same drift on later turns.
+        _sm, ws = self._stub(monkeypatch, launch_version="2.1.117")
+        enqueue = AsyncMock()
         bot = MagicMock()
         with (
             patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
         ):
-            await update_watcher.maybe_restart_for_upgrade(
+            await update_watcher.maybe_notify_update_or_failure(
                 bot=bot, user_id=7, thread_id=42, window_id="@9"
             )
-        restart.assert_awaited_once_with(bot, 7, 42, "@9", "2.1.118")
-
-    @pytest.mark.asyncio
-    async def test_failed_restart_leaves_state_unchanged(self, monkeypatch):
-        # On failure _restart_topic returns False; we must NOT advance
-        # claude_launch_version on the old window — next turn-end retries.
-        sm, _ws = self._stub_session_manager(monkeypatch, launch_version="2.1.117")
-        restart = AsyncMock(return_value=False)
-        with (
-            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
-        ):
-            await update_watcher.maybe_restart_for_upgrade(
-                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
+            await update_watcher.maybe_notify_update_or_failure(
+                bot=bot, user_id=7, thread_id=42, window_id="@9"
             )
-        restart.assert_awaited_once()
-        # Backfill path was NOT taken (launch_version was non-empty), so
-        # set_claude_launch_version must not have been called from this fn.
-        sm.set_claude_launch_version.assert_not_called()
+        assert enqueue.await_count == 1
+        text = enqueue.await_args.kwargs["text"]
+        assert "ℹ️" in text and "2.1.118" in text and "2.1.117" in text
+        assert "/restart" in text
+        # marker advanced so it never re-nags; no restart attempted
+        assert ws.update_notified_version == "2.1.118"
 
     @pytest.mark.asyncio
-    async def test_backfill_from_pane_version_triggers_restart(self, monkeypatch):
-        # Pre-existing window (no recorded launch_version): backfill from
-        # the pane's process name, which is the running version string.
-        # Mismatch with current installed → restart fires.
-        # This is the exact case the user reported: pane shows 2.1.116
-        # while installed is 2.1.118.
-        sm, _ws = self._stub_session_manager(monkeypatch, launch_version="")
+    async def test_backfill_from_pane_then_notifies(self, monkeypatch):
+        # Pre-existing window (no recorded launch_version): backfill from the
+        # pane's version string; mismatch with current → one update notice.
+        sm, _ws = self._stub(monkeypatch, launch_version="")
         from ccbot import tmux_manager as tm
 
         monkeypatch.setattr(
@@ -228,22 +211,21 @@ class TestMaybeRestartForUpgrade:
             "get_pane_current_command",
             AsyncMock(return_value="2.1.116"),
         )
-        restart = AsyncMock(return_value=True)
+        enqueue = AsyncMock()
         with (
             patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
         ):
-            await update_watcher.maybe_restart_for_upgrade(
+            await update_watcher.maybe_notify_update_or_failure(
                 bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
             )
         sm.set_claude_launch_version.assert_called_once_with("@0", "2.1.116")
-        restart.assert_awaited_once()
+        assert enqueue.await_count == 1
+        assert "ℹ️" in enqueue.await_args.kwargs["text"]
 
     @pytest.mark.asyncio
-    async def test_backfill_from_pane_version_matches_no_restart(self, monkeypatch):
-        # Backfill reads version that already matches current → silent
-        # migration, no restart.
-        sm, _ws = self._stub_session_manager(monkeypatch, launch_version="")
+    async def test_backfill_matches_current_no_notice(self, monkeypatch):
+        sm, _ws = self._stub(monkeypatch, launch_version="")
         from ccbot import tmux_manager as tm
 
         monkeypatch.setattr(
@@ -251,76 +233,22 @@ class TestMaybeRestartForUpgrade:
             "get_pane_current_command",
             AsyncMock(return_value="2.1.118"),
         )
-        restart = AsyncMock(return_value=True)
+        enqueue = AsyncMock()
         with (
             patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
         ):
-            await update_watcher.maybe_restart_for_upgrade(
+            await update_watcher.maybe_notify_update_or_failure(
                 bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
             )
         sm.set_claude_launch_version.assert_called_once_with("@0", "2.1.118")
-        restart.assert_not_awaited()
+        enqueue.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_backfill_with_ambiguous_pane_defaults_to_current(self, monkeypatch):
-        # Pane shows "claude" (transient state, not a version string) — we
-        # can't tell the running version, so default to current. Silent
-        # migration, no restart. Avoids spurious restart on first turn-end
-        # after deploy.
-        sm, _ws = self._stub_session_manager(monkeypatch, launch_version="")
-        from ccbot import tmux_manager as tm
-
-        monkeypatch.setattr(
-            tm.tmux_manager,
-            "get_pane_current_command",
-            AsyncMock(return_value="claude"),
-        )
-        restart = AsyncMock(return_value=True)
-        with (
-            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
-        ):
-            await update_watcher.maybe_restart_for_upgrade(
-                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
-            )
-        sm.set_claude_launch_version.assert_called_once_with("@0", "2.1.118")
-        restart.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_backfill_with_no_pane_defaults_to_current(self, monkeypatch):
-        # Pane vanished (window dead) — same fallback: assume current,
-        # don't restart.
-        sm, _ws = self._stub_session_manager(monkeypatch, launch_version="")
-        from ccbot import tmux_manager as tm
-
-        monkeypatch.setattr(
-            tm.tmux_manager,
-            "get_pane_current_command",
-            AsyncMock(return_value=None),
-        )
-        restart = AsyncMock(return_value=True)
-        with (
-            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
-        ):
-            await update_watcher.maybe_restart_for_upgrade(
-                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
-            )
-        sm.set_claude_launch_version.assert_called_once_with("@0", "2.1.118")
-        restart.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_backfill_reads_version_from_wrapper_shell_descendant(
-        self, monkeypatch
-    ):
-        # Reproduces the marrige-proposal scenario: window was created via
-        # `window_shell`, so pane_current_command reports the wrapper shell
-        # (zsh) rather than the running claude's version string. Backfill
-        # must walk the process tree to discover the actual running version
-        # — otherwise it defaults to current and silently silences the
-        # upgrade signal forever.
-        sm, _ws = self._stub_session_manager(monkeypatch, launch_version="")
+    async def test_backfill_wrapper_shell_descendant_then_notifies(self, monkeypatch):
+        # window_shell hides claude's version behind the wrapper shell; backfill
+        # walks the process tree to the real running version, then notifies.
+        sm, _ws = self._stub(monkeypatch, launch_version="")
         from ccbot import tmux_manager as tm
 
         monkeypatch.setattr(
@@ -339,19 +267,60 @@ class TestMaybeRestartForUpgrade:
             AsyncMock(return_value="2.1.116"),
             raising=False,
         )
-        restart = AsyncMock(return_value=True)
+        enqueue = AsyncMock()
         with (
             patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
-            patch.object(update_watcher, "_restart_topic", restart),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
         ):
-            await update_watcher.maybe_restart_for_upgrade(
+            await update_watcher.maybe_notify_update_or_failure(
                 bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
             )
-        # Backfill must pin to the OBSERVED running version (2.1.116), not
-        # the fresh installed current (2.1.118). Mismatch then triggers the
-        # restart that the wrapper-shell pane would otherwise hide.
         sm.set_claude_launch_version.assert_called_once_with("@0", "2.1.116")
-        restart.assert_awaited_once()
+        assert enqueue.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failure_signature_notifies_once(self, monkeypatch):
+        # Version matches (no update notice), but the pane shows a fatal error
+        # (a revoked/unavailable model) → one failure notice, deduped after.
+        _sm, ws = self._stub(
+            monkeypatch,
+            launch_version="2.1.118",
+            pane_text="There's an issue with the selected model (claude-fable-5).",
+        )
+        enqueue = AsyncMock()
+        with (
+            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
+        ):
+            await update_watcher.maybe_notify_update_or_failure(
+                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
+            )
+            await update_watcher.maybe_notify_update_or_failure(
+                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
+            )
+        assert enqueue.await_count == 1
+        text = enqueue.await_args.kwargs["text"]
+        assert "⚠️" in text and "/restart" in text
+        assert ws.failure_notified is True
+
+    @pytest.mark.asyncio
+    async def test_failure_clears_resets_flag(self, monkeypatch):
+        # A previously-notified failure that has since cleared resets the flag,
+        # so a future recurrence notifies once again.
+        _sm, ws = self._stub(
+            monkeypatch, launch_version="2.1.118", pane_text="❯ all good"
+        )
+        ws.failure_notified = True
+        enqueue = AsyncMock()
+        with (
+            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
+        ):
+            await update_watcher.maybe_notify_update_or_failure(
+                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
+            )
+        enqueue.assert_not_awaited()
+        assert ws.failure_notified is False
 
 
 class TestWaitForClaudeInPane:
@@ -573,37 +542,36 @@ class TestHasClaudeDescendant:
             assert await update_watcher._has_claude_descendant(100) is True
 
 
-class TestRestartTopic:
-    """End-to-end behavior of _restart_topic with the health check in place."""
+class TestRestartTopicInPlace:
+    """End-to-end behavior of restart_topic_in_place (respawn-pane + health check)."""
 
     def _setup_session_manager(self, monkeypatch, *, sid="sid-abc", cwd="/tmp"):
         from ccbot import session
 
-        ws = MagicMock(session_id=sid, cwd=cwd, window_name="my-topic")
+        ws = MagicMock(
+            session_id=sid,
+            cwd=cwd,
+            window_name="my-topic",
+            update_notified_version="2.1.117",
+            failure_notified=True,
+        )
         sm = MagicMock()
         sm.get_window_state.return_value = ws
         sm.get_display_name.return_value = "my-topic"
-        sm.bind_thread = MagicMock()
         sm._save_state = MagicMock()
         sm.set_claude_launch_version = MagicMock()
         monkeypatch.setattr(session, "session_manager", sm)
         return sm, ws
 
     @pytest.mark.asyncio
-    async def test_success_path_acks_and_returns_true(self, monkeypatch):
+    async def test_success_path_acks_resets_markers(self, monkeypatch):
         sm, ws = self._setup_session_manager(monkeypatch)
         monkeypatch.setattr(update_watcher, "_RESTART_HEALTH_INTERVAL", 0.01)
 
         from ccbot import tmux_manager as tm
 
-        monkeypatch.setattr(
-            tm.tmux_manager, "kill_window", AsyncMock(return_value=True)
-        )
-        monkeypatch.setattr(
-            tm.tmux_manager,
-            "create_window",
-            AsyncMock(return_value=(True, "ok", "my-topic", "@9-new")),
-        )
+        respawn = AsyncMock(return_value=True)
+        monkeypatch.setattr(tm.tmux_manager, "respawn_pane", respawn)
         monkeypatch.setattr(
             tm.tmux_manager,
             "get_pane_current_command",
@@ -611,21 +579,27 @@ class TestRestartTopic:
         )
 
         enqueue = AsyncMock()
-        with patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue):
-            result = await update_watcher._restart_topic(
+        with (
+            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
+        ):
+            result = await update_watcher.restart_topic_in_place(
                 bot=MagicMock(),
                 user_id=1,
                 thread_id=2,
-                old_wid="@9",
+                window_id="@9",
                 new_version="2.1.118",
             )
 
         assert result is True
-        # Override block reassigns sid → save called.
-        sm._save_state.assert_called()
-        # New window's launch version pinned to the upgraded version, so the
-        # next turn-end on this window sees a match instead of looping.
-        sm.set_claude_launch_version.assert_called_once_with("@9-new", "2.1.118")
+        # In-place: same window reused, --resume'd with the original sid.
+        respawn.assert_awaited_once()
+        assert respawn.await_args.args[0] == "@9"
+        assert respawn.await_args.kwargs.get("resume_session_id") == "sid-abc"
+        # Baseline pinned to current; pending notices cleared.
+        sm.set_claude_launch_version.assert_called_once_with("@9", "2.1.118")
+        assert ws.update_notified_version == ""
+        assert ws.failure_notified is False
         # Exactly one message enqueued, and it's the success ack.
         assert enqueue.await_count == 1
         kwargs = enqueue.await_args.kwargs
@@ -634,19 +608,14 @@ class TestRestartTopic:
 
     @pytest.mark.asyncio
     async def test_health_check_failure_warns_and_returns_false(self, monkeypatch):
-        sm, ws = self._setup_session_manager(monkeypatch)
+        sm, _ws = self._setup_session_manager(monkeypatch)
         monkeypatch.setattr(update_watcher, "_RESTART_HEALTH_INTERVAL", 0.01)
         monkeypatch.setattr(update_watcher, "_RESTART_HEALTH_TIMEOUT", 0.05)
 
         from ccbot import tmux_manager as tm
 
         monkeypatch.setattr(
-            tm.tmux_manager, "kill_window", AsyncMock(return_value=True)
-        )
-        monkeypatch.setattr(
-            tm.tmux_manager,
-            "create_window",
-            AsyncMock(return_value=(True, "ok", "my-topic", "@9-new")),
+            tm.tmux_manager, "respawn_pane", AsyncMock(return_value=True)
         )
         # Silent-failure symptom: pane's foreground process is the wrapper
         # shell (zsh) AND claude is not among its descendants — claude never
@@ -669,11 +638,11 @@ class TestRestartTopic:
 
         enqueue = AsyncMock()
         with patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue):
-            result = await update_watcher._restart_topic(
+            result = await update_watcher.restart_topic_in_place(
                 bot=MagicMock(),
                 user_id=1,
                 thread_id=2,
-                old_wid="@9",
+                window_id="@9",
                 new_version="2.1.118",
             )
 
@@ -683,58 +652,50 @@ class TestRestartTopic:
         kwargs = enqueue.await_args.kwargs
         assert "⚠️" in kwargs["text"]
         assert "zsh" in kwargs["text"]
-        # Must NOT have run the resume override (sid pinning).
-        # Override happens only on success — saved exactly once during
-        # bind_thread? bind_thread is mocked, so _save_state should not be
-        # called from _restart_topic itself on the failure path.
-        sm._save_state.assert_not_called()
-        # And the new window's launch_version must NOT be pinned, so the
-        # next turn-end can retry the upgrade.
+        # Baseline must NOT be pinned on failure, so the user can retry.
         sm.set_claude_launch_version.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_create_window_failure_returns_false_no_enqueue(self, monkeypatch):
+    async def test_respawn_failure_warns_and_returns_false(self, monkeypatch):
         sm, _ws = self._setup_session_manager(monkeypatch)
         from ccbot import tmux_manager as tm
 
         monkeypatch.setattr(
-            tm.tmux_manager, "kill_window", AsyncMock(return_value=True)
-        )
-        monkeypatch.setattr(
-            tm.tmux_manager,
-            "create_window",
-            AsyncMock(return_value=(False, "tmux died", "", "")),
+            tm.tmux_manager, "respawn_pane", AsyncMock(return_value=False)
         )
 
         enqueue = AsyncMock()
         with patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue):
-            result = await update_watcher._restart_topic(
+            result = await update_watcher.restart_topic_in_place(
                 bot=MagicMock(),
                 user_id=1,
                 thread_id=2,
-                old_wid="@9",
+                window_id="@9",
                 new_version="2.1.118",
             )
 
         assert result is False
-        enqueue.assert_not_awaited()
+        # The user gets a warning (unlike create_window's silent failure path).
+        assert enqueue.await_count == 1
+        assert "⚠️" in enqueue.await_args.kwargs["text"]
+        sm.set_claude_launch_version.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_missing_cwd_skips_restart(self, monkeypatch):
-        # Defensive path: window state has no cwd → can't recreate.
+        # Defensive path: window state has no cwd → can't relaunch.
         self._setup_session_manager(monkeypatch, cwd="")
         from ccbot import tmux_manager as tm
 
-        kill = AsyncMock()
-        monkeypatch.setattr(tm.tmux_manager, "kill_window", kill)
+        respawn = AsyncMock()
+        monkeypatch.setattr(tm.tmux_manager, "respawn_pane", respawn)
 
-        result = await update_watcher._restart_topic(
+        result = await update_watcher.restart_topic_in_place(
             bot=MagicMock(),
             user_id=1,
             thread_id=2,
-            old_wid="@9",
+            window_id="@9",
             new_version="2.1.118",
         )
 
         assert result is False
-        kill.assert_not_awaited()
+        respawn.assert_not_awaited()

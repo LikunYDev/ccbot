@@ -1,19 +1,21 @@
-"""Auto-restart Claude Code in bound topics when the installed version changes.
+"""Notify (don't auto-restart) when Claude Code updates or a session breaks.
+
+Design: a running session works fine on its old version, and a remote user must
+never have in-flight work killed by surprise. So version drift earns a single
+heads-up — never a restart — and the user runs /restart at a clean point. The
+same turn-end hook also surfaces a session stuck on a fatal error (e.g. a
+revoked model) once. Restarts, when they happen, are IN PLACE (respawn-pane,
+same @window_id) so they cause no window-id / session_map churn.
 
 Invoked from SessionMonitor at the natural turn-end moment for a topic — after
-all new JSONL entries are dispatched and no tool_use is pending. Compares the
-locally installed `claude --version` against the version recorded for THIS
-window when it was launched (`WindowState.claude_launch_version`); on change,
-kills and recreates the tmux window with `--resume` so the topic picks up the
-new version without losing its Claude session.
-
-Per-window comparison (vs. a single global baseline) ensures every still-old
-session triggers its own restart on upgrade — independent sessions do not
-silence each other.
+all new JSONL entries are dispatched and no tool_use is pending. Per-window
+state (`WindowState.claude_launch_version`, `update_notified_version`,
+`failure_notified`) dedupes notices so they never re-nag and survive a restart.
 
 Key functions:
   - current_claude_version: throttled (5 min) subprocess probe of `claude --version`.
-  - maybe_restart_for_upgrade: per-topic hook called after a turn ends.
+  - maybe_notify_update_or_failure: per-topic turn-end hook; sends one-time notices.
+  - restart_topic_in_place: in-place respawn + --resume, triggered by /restart.
 """
 
 from __future__ import annotations
@@ -271,80 +273,91 @@ async def _wait_for_claude_in_pane(window_id: str, timeout: float) -> tuple[bool
     return False, last
 
 
-async def _restart_topic(
+async def restart_topic_in_place(
     bot: "Bot",
     user_id: int,
     thread_id: int,
-    old_wid: str,
-    new_version: str,
+    window_id: str,
+    new_version: str | None = None,
 ) -> bool:
-    """Kill the old tmux window, recreate with --resume, rebind the topic.
+    """Restart the topic's Claude session IN PLACE (respawn-pane, --resume).
 
-    On success: enqueues `♻️ … restarted` ack and returns True (caller saves
-    the new version baseline). On failure (claude doesn't actually start in
-    the pane within the health-check budget): enqueues a `⚠️` warning and
-    returns False, so the caller leaves the baseline alone and we'll retry on
-    the next turn-end.
+    Reuses the same tmux window, so the @window_id is unchanged: no rebind, no
+    orphaned session_map entry, no display-name leak — the whole class of
+    window-id churn that kill+create caused on every upgrade. Only the Claude
+    session_id rolls, and the resume-override re-pins the original sid so the
+    monitor keeps routing to this topic. The respawn uses the user's current
+    settings.json default model (no explicit --model), so /restart also clears
+    a stale model pin (e.g. a now-revoked model).
+
+    User-initiated (via /restart) or offered after a one-time update/failure
+    notice. On failure to relaunch, enqueues a `⚠️` warning and returns False.
     """
     from .handlers.message_queue import enqueue_content_message
     from .session import session_manager
     from .tmux_manager import tmux_manager
 
-    state = session_manager.get_window_state(old_wid)
+    state = session_manager.get_window_state(window_id)
     cwd = state.cwd
     sid = state.session_id or None
-    old_wname = state.window_name or session_manager.get_display_name(old_wid)
 
     if not cwd:
-        logger.warning("auto-restart: missing cwd for window %s; skipping", old_wid)
+        logger.warning(
+            "restart_in_place: missing cwd for window %s; skipping", window_id
+        )
         return False
+
+    # Probe the installed version once: used both for the ack label and to
+    # re-baseline this window so the next turn-end sees a match (no re-notify).
+    current = await current_claude_version()
+    version_label = new_version or current or "the latest version"
 
     logger.info(
-        "auto-restart: killing window %s (user=%d, thread=%d) for upgrade to %s (sid=%s)",
-        old_wid,
+        "in-place restart: respawning window %s (user=%d, thread=%d, sid=%s)",
+        window_id,
         user_id,
         thread_id,
-        new_version,
         sid,
     )
-    await tmux_manager.kill_window(old_wid)
-
-    ok, msg, new_wname, new_wid = await tmux_manager.create_window(
-        cwd,
-        window_name=old_wname or None,
-        resume_session_id=sid,
-    )
+    ok = await tmux_manager.respawn_pane(window_id, cwd, resume_session_id=sid)
     if not ok:
-        logger.error("auto-restart: create_window failed: %s", msg)
-        return False
-
-    session_manager.bind_thread(user_id, thread_id, new_wid, new_wname)
-
-    # Health check: confirm claude actually started in the pane. We don't
-    # block on the SessionStart hook here because (a) for resume sessions we
-    # already know the sid and override window_state below, and (b) the hook
-    # is a downstream consequence of claude starting — the pane process check
-    # is the more direct signal and lets us detect failures faster.
-    healthy, observed_cmd = await _wait_for_claude_in_pane(
-        new_wid, _RESTART_HEALTH_TIMEOUT
-    )
-    if not healthy:
-        logger.error(
-            "auto-restart: claude did not start in window %s after %.1fs "
-            "(last pane_current_command=%r); user-visible failure",
-            new_wid,
-            _RESTART_HEALTH_TIMEOUT,
-            observed_cmd,
-        )
         warn = (
-            f"⚠️ Auto-restart to {new_version} failed: claude is not running "
-            f"in the window (pane shows {observed_cmd or 'nothing'}). "
-            f"Recreate the topic to retry."
+            "⚠️ Restart failed: could not respawn the session in this window. "
+            "You may need to recreate the topic."
         )
         await enqueue_content_message(
             bot=bot,
             user_id=user_id,
-            window_id=new_wid,
+            window_id=window_id,
+            parts=[warn],
+            content_type="text",
+            text=warn,
+            thread_id=thread_id,
+        )
+        return False
+
+    # Health check: confirm claude actually started in the pane. The hook is a
+    # downstream consequence of claude starting — the pane process check is the
+    # more direct signal and lets us detect failures faster.
+    healthy, observed_cmd = await _wait_for_claude_in_pane(
+        window_id, _RESTART_HEALTH_TIMEOUT
+    )
+    if not healthy:
+        logger.error(
+            "in-place restart: claude did not start in window %s after %.1fs "
+            "(last pane_current_command=%r); user-visible failure",
+            window_id,
+            _RESTART_HEALTH_TIMEOUT,
+            observed_cmd,
+        )
+        warn = (
+            f"⚠️ Restart failed: claude is not running in the window "
+            f"(pane shows {observed_cmd or 'nothing'})."
+        )
+        await enqueue_content_message(
+            bot=bot,
+            user_id=user_id,
+            window_id=window_id,
             parts=[warn],
             content_type="text",
             text=warn,
@@ -353,33 +366,31 @@ async def _restart_topic(
         return False
 
     # claude is running. For --resume, the SessionStart hook (when it fires)
-    # will report a *new* session_id but messages continue writing to the
-    # original JSONL — manually pin window_state to the resumed sid so the
-    # monitor routes messages back to this topic regardless of hook timing.
-    if sid:
-        ws = session_manager.get_window_state(new_wid)
-        if ws.session_id != sid:
-            logger.info(
-                "auto-restart resume override: window %s session_id %s -> %s",
-                new_wid,
-                ws.session_id,
-                sid,
-            )
-        ws.session_id = sid
-        ws.cwd = cwd
-        ws.window_name = new_wname
-        session_manager._save_state()
+    # reports a *new* session_id but messages keep writing to the original
+    # JSONL — pin window_state to the resumed sid so routing is stable
+    # regardless of hook timing. window_id is unchanged, so no rebind needed.
+    if sid and state.session_id != sid:
+        logger.info(
+            "in-place restart resume override: window %s session_id %s -> %s",
+            window_id,
+            state.session_id,
+            sid,
+        )
+        state.session_id = sid
 
-    # Pin the new version onto the new window so the next turn-end sees a
-    # match instead of looping the restart. Each window owns its own version
-    # — no global baseline to share.
-    session_manager.set_claude_launch_version(new_wid, new_version)
+    # Reset this window's baselines: it is now current, and any pending
+    # update/failure notice is resolved.
+    state.update_notified_version = ""
+    state.failure_notified = False
+    session_manager._save_state()
+    if current:
+        session_manager.set_claude_launch_version(window_id, current)
 
-    ack = f"♻️ Claude Code upgraded to {new_version}. Session restarted."
+    ack = f"♻️ Restarted on {version_label}, resumed your session."
     await enqueue_content_message(
         bot=bot,
         user_id=user_id,
-        window_id=new_wid,
+        window_id=window_id,
         parts=[ack],
         content_type="text",
         text=ack,
@@ -388,81 +399,134 @@ async def _restart_topic(
     return True
 
 
-async def maybe_restart_for_upgrade(
+# Pane signatures that mean the session is stuck on something only a restart
+# fixes (e.g. a now-unavailable / revoked model). Lower-cased substring match.
+# Extension point: add new fatal banners here.
+_FAILURE_SIGNATURES: tuple[str, ...] = (
+    "issue with the selected model",
+    "may not exist or you may not have access",
+)
+
+
+async def maybe_notify_update_or_failure(
     bot: "Bot",
     user_id: int,
     thread_id: int,
     window_id: str,
 ) -> None:
-    """Restart the topic's Claude session if the installed version changed.
+    """At turn-end, send a ONE-TIME notice if Claude Code updated or the session
+    looks broken — but never restart on its own.
 
-    Compares the live installed version against the version recorded for this
-    specific window when it launched. Per-window comparison ensures every
-    still-old session triggers its own upgrade — they don't silence each other.
+    A running session works fine on its old version, and a remote user must not
+    have in-flight work killed by surprise; so version drift only earns a single
+    heads-up, and the user runs /restart at a clean point. The same channel also
+    surfaces a session stuck on a fatal error (e.g. a revoked model) once, with
+    the same /restart affordance. Both notices are deduped per-window via
+    persisted markers so they never re-nag (and survive a ccbot restart).
 
-    No-op when auto-restart is disabled or when the version probe fails. For
-    windows with no recorded launch version (pre-feature, or capture failed
-    at creation), backfills via the pane's process name (claude renames itself
-    to its version string) and falls back to current on ambiguity.
+    No-op when disabled (CCBOT_AUTO_RESTART=false) or when the version probe
+    fails. Backfills a missing launch version from the pane process name.
     """
+    from .handlers.message_queue import enqueue_content_message
     from .session import session_manager
     from .tmux_manager import tmux_manager
 
     if not config.auto_restart_enabled:
         return
-    current = await current_claude_version()
-    if current is None:
-        return
 
     state = session_manager.get_window_state(window_id)
-    launch = state.claude_launch_version
-    if not launch:
-        # Backfill: recover the running claude version from the pane. claude
-        # renames its own process to its version string, so a stable claude
-        # pane shows e.g. "2.1.118". When the pane's foreground process is
-        # a wrapper shell (window_shell form), walk the process tree since
-        # the shell hides claude's version. Only when both signals miss do
-        # we default to current — a silent migration that won't spuriously
-        # restart.
-        pane_cmd = await tmux_manager.get_pane_current_command(window_id)
-        observed: str | None = None
-        if pane_cmd and _VERSION_ONLY_RE.match(pane_cmd):
-            observed = pane_cmd
-        elif pane_cmd and _WRAPPER_SHELL_RE.match(pane_cmd):
-            pane_pid = await tmux_manager.get_pane_pid(window_id)
-            if pane_pid is not None:
-                observed = await _find_version_descendant(pane_pid)
-        if observed:
-            launch = observed
-            logger.info(
-                "Backfilled claude_launch_version for window %s from pane: %s",
-                window_id,
-                launch,
-            )
-        else:
-            launch = current
-            logger.info(
-                "Backfilled claude_launch_version for window %s to current %s "
-                "(pane=%r, no version-string match)",
-                window_id,
-                launch,
-                pane_cmd,
-            )
-        session_manager.set_claude_launch_version(window_id, launch)
 
-    if current == launch:
-        return
-    logger.info(
-        "Claude version changed for window %s: %s -> %s (user=%d, thread=%d)",
-        window_id,
-        launch,
-        current,
-        user_id,
-        thread_id,
-    )
-    await _restart_topic(bot, user_id, thread_id, window_id, current)
-    # _restart_topic owns updating the new window's launch_version on success;
-    # on failure, the old window's state is unchanged so we'll retry next turn.
+    # --- 1. Version drift → one notice per new version ---
+    current = await current_claude_version()
+    if current is not None:
+        launch = state.claude_launch_version
+        if not launch:
+            # Backfill: recover the running claude version from the pane. claude
+            # renames its own process to its version string, so a stable claude
+            # pane shows e.g. "2.1.118". When the pane's foreground process is
+            # a wrapper shell (window_shell form), walk the process tree since
+            # the shell hides claude's version. Only when both signals miss do
+            # we default to current — a silent migration that won't spuriously
+            # notify.
+            pane_cmd = await tmux_manager.get_pane_current_command(window_id)
+            observed: str | None = None
+            if pane_cmd and _VERSION_ONLY_RE.match(pane_cmd):
+                observed = pane_cmd
+            elif pane_cmd and _WRAPPER_SHELL_RE.match(pane_cmd):
+                pane_pid = await tmux_manager.get_pane_pid(window_id)
+                if pane_pid is not None:
+                    observed = await _find_version_descendant(pane_pid)
+            if observed:
+                launch = observed
+                logger.info(
+                    "Backfilled claude_launch_version for window %s from pane: %s",
+                    window_id,
+                    launch,
+                )
+            else:
+                launch = current
+                logger.info(
+                    "Backfilled claude_launch_version for window %s to current %s "
+                    "(pane=%r, no version-string match)",
+                    window_id,
+                    launch,
+                    pane_cmd,
+                )
+            session_manager.set_claude_launch_version(window_id, launch)
+
+        if current != launch and state.update_notified_version != current:
+            notice = (
+                f"ℹ️ Claude Code updated to {current} — this session is still on "
+                f"{launch} (your work is unaffected). Send /restart at a clean "
+                f"point to pick it up."
+            )
+            await enqueue_content_message(
+                bot=bot,
+                user_id=user_id,
+                window_id=window_id,
+                parts=[notice],
+                content_type="text",
+                text=notice,
+                thread_id=thread_id,
+            )
+            state.update_notified_version = current
+            session_manager._save_state()
+            logger.info(
+                "Notified update for window %s: %s -> %s (user=%d, thread=%d)",
+                window_id,
+                launch,
+                current,
+                user_id,
+                thread_id,
+            )
+
+    # --- 2. Session stuck on a fatal error → one notice until it clears ---
+    pane = await tmux_manager.capture_pane(window_id)
+    sig = None
+    if pane:
+        low = pane.lower()
+        sig = next((s for s in _FAILURE_SIGNATURES if s in low), None)
+    if sig and not state.failure_notified:
+        notice = (
+            "⚠️ This session looks stuck — the pane shows a fatal error "
+            "(likely the selected model is unavailable). Send /restart to "
+            "relaunch it on your current default model."
+        )
+        await enqueue_content_message(
+            bot=bot,
+            user_id=user_id,
+            window_id=window_id,
+            parts=[notice],
+            content_type="text",
+            text=notice,
+            thread_id=thread_id,
+        )
+        state.failure_notified = True
+        session_manager._save_state()
+        logger.info("Notified failure for window %s (sig=%r)", window_id, sig)
+    elif not sig and state.failure_notified:
+        state.failure_notified = False
+        session_manager._save_state()
 
 
 def reset_state_for_tests() -> None:
