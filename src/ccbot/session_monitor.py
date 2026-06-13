@@ -644,6 +644,13 @@ class SessionMonitor:
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
 
+    def _stop_poll_loop(self) -> None:
+        """Stop the background poll loop task. Idempotent."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            self._task = None
+
     async def drain_callbacks(self, timeout: float = 5.0) -> None:
         """Stop the poll loop and AWAIT in-flight dispatch tasks before shutdown.
 
@@ -652,10 +659,7 @@ class SessionMonitor:
         the outstanding dispatch tasks here lets those already-read messages be
         delivered, making a ccbot restart seamless. Call before stop().
         """
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            self._task = None
+        self._stop_poll_loop()
         pending = list(self._callback_tasks)
         if not pending:
             return
@@ -670,10 +674,7 @@ class SessionMonitor:
             )
 
     def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            self._task = None
+        self._stop_poll_loop()
         # Cancel any outstanding fire-and-forget callback tasks. (post_shutdown
         # calls drain_callbacks() first to *deliver* them; this is the backstop
         # for any that remain or for a stop() without a prior drain.)

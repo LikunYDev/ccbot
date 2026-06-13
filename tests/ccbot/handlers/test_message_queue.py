@@ -274,3 +274,92 @@ class TestInteractiveUITask:
         assert len(handle_calls) == 1
         # And the in-flight flag was cleared so the next poll can re-enqueue.
         assert is_interactive_enqueued(7, 42) is False
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestDrainQueues:
+    """drain_queues() lets live workers flush enqueued-but-unsent tasks before
+    shutdown_workers() cancels them — the delivery guarantee on restart."""
+
+    @pytest.mark.asyncio
+    async def test_waits_for_enqueued_message_to_send(self):
+        import asyncio
+
+        from ccbot.handlers.message_queue import (
+            drain_queues,
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        sent: list[str] = []
+
+        async def fake_send(*args, **kwargs):
+            await asyncio.sleep(0.02)  # simulate a slow network send
+            sent.append("content")
+            m = MagicMock()
+            m.message_id = 1
+            return m
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=fake_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["hi"],
+                content_type="text",
+                thread_id=42,
+            )
+            # drain must block until the slow send actually completes.
+            await drain_queues(timeout=5.0)
+
+        assert sent == ["content"]
+
+    @pytest.mark.asyncio
+    async def test_no_queues_is_noop(self):
+        from ccbot.handlers.message_queue import drain_queues
+
+        await drain_queues()  # returns promptly with nothing queued
+
+    @pytest.mark.asyncio
+    async def test_times_out_without_hanging(self):
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+        from ccbot.handlers.message_queue import (
+            drain_queues,
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+
+        async def never_send(*args, **kwargs):
+            await asyncio.sleep(10)
+            return MagicMock()
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=never_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["hi"],
+                content_type="text",
+                thread_id=42,
+            )
+            try:
+                # Returns despite the hung send, instead of blocking forever.
+                await drain_queues(timeout=0.05)
+            finally:
+                for w in list(mq._queue_workers.values()):
+                    w.cancel()

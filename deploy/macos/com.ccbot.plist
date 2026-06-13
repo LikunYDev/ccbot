@@ -26,7 +26,12 @@
          kills the whole process group when the job stops, which would take down
          the tmux server (and every Claude session) on a restart. Setting this
          true leaves them running so ccbot reattaches to its dedicated tmux
-         socket on the next start. -->
+         socket on the next start.
+
+         WARNING: the FIRST deploy/restart onto the dedicated socket is one-time
+         destructive — tmux cannot move sessions between sockets, so sessions on
+         the old (default) socket do NOT carry over. Make this first switch at a
+         clean checkpoint. Every restart after that is non-destructive. -->
     <key>AbandonProcessGroup</key>
     <true/>
 

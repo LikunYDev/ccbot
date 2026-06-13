@@ -322,6 +322,44 @@ class TestMaybeNotifyUpdateOrFailure:
         enqueue.assert_not_awaited()
         assert ws.failure_notified is False
 
+    @pytest.mark.asyncio
+    async def test_capture_failure_preserves_failure_flag(self, monkeypatch):
+        # capture_pane returning None means "couldn't inspect the pane", which
+        # must NOT be treated as "clean" — otherwise a transient tmux hiccup
+        # resets the flag and the notice flaps/re-fires next turn.
+        _sm, ws = self._stub(monkeypatch, launch_version="2.1.118", pane_text=None)
+        ws.failure_notified = True
+        enqueue = AsyncMock()
+        with (
+            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
+        ):
+            await update_watcher.maybe_notify_update_or_failure(
+                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
+            )
+        enqueue.assert_not_awaited()
+        assert ws.failure_notified is True  # preserved, not reset
+
+    @pytest.mark.asyncio
+    async def test_failure_signature_outside_tail_is_ignored(self, monkeypatch):
+        # A signature far up in scrollback (e.g. conversation text) must NOT
+        # trigger — only the tail of the pane (the live banner region) is
+        # scanned. Push the phrase above the last _FAILURE_SCAN_LINES lines.
+        pane = "there's an issue with the selected model in this code\n" + "\n".join(
+            f"line {i}" for i in range(update_watcher._FAILURE_SCAN_LINES + 5)
+        )
+        _sm, ws = self._stub(monkeypatch, launch_version="2.1.118", pane_text=pane)
+        enqueue = AsyncMock()
+        with (
+            patch("subprocess.run", return_value=_make_completed("2.1.118\n")),
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
+        ):
+            await update_watcher.maybe_notify_update_or_failure(
+                bot=MagicMock(), user_id=1, thread_id=2, window_id="@0"
+            )
+        enqueue.assert_not_awaited()
+        assert ws.failure_notified is False
+
 
 class TestWaitForClaudeInPane:
     """Health-check polling that replaces wait_for_session_map_entry."""
@@ -588,7 +626,6 @@ class TestRestartTopicInPlace:
                 user_id=1,
                 thread_id=2,
                 window_id="@9",
-                new_version="2.1.118",
             )
 
         assert result is True
@@ -596,8 +633,8 @@ class TestRestartTopicInPlace:
         respawn.assert_awaited_once()
         assert respawn.await_args.args[0] == "@9"
         assert respawn.await_args.kwargs.get("resume_session_id") == "sid-abc"
-        # Baseline pinned to current; pending notices cleared.
-        sm.set_claude_launch_version.assert_called_once_with("@9", "2.1.118")
+        # Baseline pinned to current (single save); pending notices cleared.
+        assert ws.claude_launch_version == "2.1.118"
         assert ws.update_notified_version == ""
         assert ws.failure_notified is False
         # Exactly one message enqueued, and it's the success ack.
@@ -605,6 +642,42 @@ class TestRestartTopicInPlace:
         kwargs = enqueue.await_args.kwargs
         assert "♻️" in kwargs["text"]
         assert "2.1.118" in kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_failed_version_probe_clears_baseline(self, monkeypatch):
+        # If the version probe fails during /restart, the launch baseline must
+        # be CLEARED (not left at the stale pre-restart version), otherwise the
+        # next turn-end emits a bogus "update available" notice for the version
+        # we just restarted onto.
+        sm, ws = self._setup_session_manager(monkeypatch)
+        monkeypatch.setattr(update_watcher, "_RESTART_HEALTH_INTERVAL", 0.01)
+
+        from ccbot import tmux_manager as tm
+
+        monkeypatch.setattr(
+            tm.tmux_manager, "respawn_pane", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr(
+            tm.tmux_manager,
+            "get_pane_current_command",
+            AsyncMock(return_value="claude"),
+        )
+
+        enqueue = AsyncMock()
+        with (
+            patch("subprocess.run", side_effect=FileNotFoundError()),  # probe → None
+            patch("ccbot.handlers.message_queue.enqueue_content_message", new=enqueue),
+        ):
+            result = await update_watcher.restart_topic_in_place(
+                bot=MagicMock(), user_id=1, thread_id=2, window_id="@9"
+            )
+
+        assert result is True
+        assert ws.claude_launch_version == ""  # cleared, not stale "2.1.117"
+        assert ws.update_notified_version == ""
+        assert ws.failure_notified is False
+        # Ack falls back to the generic label when the version is unknown.
+        assert "the latest version" in enqueue.await_args.kwargs["text"]
 
     @pytest.mark.asyncio
     async def test_health_check_failure_warns_and_returns_false(self, monkeypatch):
@@ -643,7 +716,6 @@ class TestRestartTopicInPlace:
                 user_id=1,
                 thread_id=2,
                 window_id="@9",
-                new_version="2.1.118",
             )
 
         assert result is False
@@ -652,8 +724,8 @@ class TestRestartTopicInPlace:
         kwargs = enqueue.await_args.kwargs
         assert "⚠️" in kwargs["text"]
         assert "zsh" in kwargs["text"]
-        # Baseline must NOT be pinned on failure, so the user can retry.
-        sm.set_claude_launch_version.assert_not_called()
+        # Baseline must NOT be re-saved on failure, so the user can retry.
+        sm._save_state.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_respawn_failure_warns_and_returns_false(self, monkeypatch):
@@ -671,14 +743,13 @@ class TestRestartTopicInPlace:
                 user_id=1,
                 thread_id=2,
                 window_id="@9",
-                new_version="2.1.118",
             )
 
         assert result is False
         # The user gets a warning (unlike create_window's silent failure path).
         assert enqueue.await_count == 1
         assert "⚠️" in enqueue.await_args.kwargs["text"]
-        sm.set_claude_launch_version.assert_not_called()
+        sm._save_state.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_missing_cwd_skips_restart(self, monkeypatch):
@@ -694,7 +765,6 @@ class TestRestartTopicInPlace:
             user_id=1,
             thread_id=2,
             window_id="@9",
-            new_version="2.1.118",
         )
 
         assert result is False

@@ -15,6 +15,11 @@ RestartSec=10
 # NOTE: ccbot must run on a dedicated tmux socket (TMUX_SOCKET_NAME, default
 # "ccbot") for this to be safe — otherwise it shares the user's interactive
 # tmux server. Attach over SSH with:  tmux -L ccbot attach -t ccbot
+#
+# WARNING: the FIRST deploy/restart onto the dedicated socket is one-time
+# destructive — tmux cannot move sessions between sockets, so sessions on the
+# old (default) socket do NOT carry over. Make this first switch at a clean
+# checkpoint. Every restart after that is non-destructive.
 KillMode=process
 
 # Give post_shutdown time to flush state and deliver in-flight messages before

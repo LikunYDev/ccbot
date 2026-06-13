@@ -39,6 +39,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - Service management is platform-specific: Linux uses `systemd`; macOS uses `launchd`.
 - For Linux, use `deploy/linux/ccbot.service` as the unit template; for macOS, keep a local agent plist in `~/Library/LaunchAgents/` and use `deploy/macos/com.ccbot.plist` as the template.
 - **Dedicated tmux socket:** ccbot runs its tmux server on a dedicated socket (`TMUX_SOCKET_NAME`, default `ccbot`) so it is isolated from the user's interactive tmux — foreign sessions can't leak into `session_map`, and the service can restart without killing sessions (unit uses `KillMode=process`; launchd uses `AbandonProcessGroup`). Attach over SSH with `tmux -L ccbot attach -t ccbot` (handy alias: `alias ctmux='tmux -L ccbot'`). On restart, ccbot reattaches to the existing server and resumes monitoring.
+  - ⚠️ **The first deploy/restart onto the dedicated socket is one-time destructive.** tmux cannot move sessions between sockets, so sessions running on the old (default) socket do **not** carry over — they are left behind on the old socket. Make this first switch at a clean checkpoint. **Every restart after that is non-destructive** (`KillMode=process` leaves the tmux server running; ccbot reattaches and resumes from saved byte offsets).
 
 ## Hook Configuration
 

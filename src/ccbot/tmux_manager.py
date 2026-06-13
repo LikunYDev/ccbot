@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # reason (service-manager PATH is often stripped of ~/.local/bin etc.).
 _FALLBACK_PATH = "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 
+# Upper bound for blocking raw `tmux` subprocess calls, so a wedged tmux server
+# can't pin a thread-pool thread (and hang /restart) indefinitely.
+_TMUX_SUBPROCESS_TIMEOUT = 10.0
+
 
 def _user_shell() -> str:
     """The user's login shell, with /bin/zsh as a last-resort fallback."""
@@ -601,7 +605,15 @@ class TmuxManager:
                     ),
                     capture_output=True,
                     text=True,
+                    timeout=_TMUX_SUBPROCESS_TIMEOUT,
                 )
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "respawn_pane(%s): tmux timed out after %.0fs",
+                    window_id,
+                    _TMUX_SUBPROCESS_TIMEOUT,
+                )
+                return False
             except OSError as e:
                 logger.error("respawn_pane: failed to exec tmux: %s", e)
                 return False

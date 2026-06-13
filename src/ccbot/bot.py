@@ -112,6 +112,7 @@ from .handlers.interactive_ui import (
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
+    drain_queues,
     enqueue_content_message,
     enqueue_status_update,
     get_message_queue,
@@ -1959,15 +1960,21 @@ async def post_shutdown(application: Application) -> None:
         _status_poll_task = None
         logger.info("Status polling stopped")
 
-    # Stop all queue workers
-    await shutdown_workers()
-
+    # Order matters: stop producers, flush queues, THEN cancel workers.
+    # 1. The session monitor enqueues already-read-but-unsent messages (offsets
+    #    advance on read, so these would be lost on the next start otherwise).
     if session_monitor:
-        # Deliver already-read-but-unsent messages before stopping, so a
-        # restart (e.g. a deploy) doesn't drop in-flight output.
         await session_monitor.drain_callbacks()
         session_monitor.stop()
         logger.info("Session monitor stopped")
+
+    # 2. Let the still-running workers actually deliver everything enqueued
+    #    (including the just-drained messages) before we cancel them — a bare
+    #    shutdown_workers() cancels mid-flight and the queued sends are dropped.
+    await drain_queues()
+
+    # 3. Now tear the workers down.
+    await shutdown_workers()
 
     await close_transcribe_client()
 

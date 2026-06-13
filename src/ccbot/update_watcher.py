@@ -278,7 +278,6 @@ async def restart_topic_in_place(
     user_id: int,
     thread_id: int,
     window_id: str,
-    new_version: str | None = None,
 ) -> bool:
     """Restart the topic's Claude session IN PLACE (respawn-pane, --resume).
 
@@ -290,12 +289,23 @@ async def restart_topic_in_place(
     settings.json default model (no explicit --model), so /restart also clears
     a stale model pin (e.g. a now-revoked model).
 
-    User-initiated (via /restart) or offered after a one-time update/failure
-    notice. On failure to relaunch, enqueues a `⚠️` warning and returns False.
+    User-initiated via /restart. On failure to relaunch, enqueues a `⚠️`
+    warning and returns False.
     """
     from .handlers.message_queue import enqueue_content_message
     from .session import session_manager
     from .tmux_manager import tmux_manager
+
+    async def _enqueue_text(text: str) -> None:
+        await enqueue_content_message(
+            bot=bot,
+            user_id=user_id,
+            window_id=window_id,
+            parts=[text],
+            content_type="text",
+            text=text,
+            thread_id=thread_id,
+        )
 
     state = session_manager.get_window_state(window_id)
     cwd = state.cwd
@@ -310,7 +320,7 @@ async def restart_topic_in_place(
     # Probe the installed version once: used both for the ack label and to
     # re-baseline this window so the next turn-end sees a match (no re-notify).
     current = await current_claude_version()
-    version_label = new_version or current or "the latest version"
+    version_label = current or "the latest version"
 
     logger.info(
         "in-place restart: respawning window %s (user=%d, thread=%d, sid=%s)",
@@ -321,18 +331,9 @@ async def restart_topic_in_place(
     )
     ok = await tmux_manager.respawn_pane(window_id, cwd, resume_session_id=sid)
     if not ok:
-        warn = (
+        await _enqueue_text(
             "⚠️ Restart failed: could not respawn the session in this window. "
             "You may need to recreate the topic."
-        )
-        await enqueue_content_message(
-            bot=bot,
-            user_id=user_id,
-            window_id=window_id,
-            parts=[warn],
-            content_type="text",
-            text=warn,
-            thread_id=thread_id,
         )
         return False
 
@@ -350,18 +351,9 @@ async def restart_topic_in_place(
             _RESTART_HEALTH_TIMEOUT,
             observed_cmd,
         )
-        warn = (
+        await _enqueue_text(
             f"⚠️ Restart failed: claude is not running in the window "
             f"(pane shows {observed_cmd or 'nothing'})."
-        )
-        await enqueue_content_message(
-            bot=bot,
-            user_id=user_id,
-            window_id=window_id,
-            parts=[warn],
-            content_type="text",
-            text=warn,
-            thread_id=thread_id,
         )
         return False
 
@@ -378,34 +370,41 @@ async def restart_topic_in_place(
         )
         state.session_id = sid
 
-    # Reset this window's baselines: it is now current, and any pending
-    # update/failure notice is resolved.
+    # Re-baseline this window in a single save: it now runs the installed
+    # version and any pending update/failure notice is resolved. When the probe
+    # failed (current is None), clear the launch baseline rather than leaving
+    # the stale pre-restart version — otherwise the next turn-end would compare
+    # against it and emit a bogus "update available" notice for the version we
+    # just restarted onto. An empty baseline makes the next turn-end re-derive
+    # it from the pane.
+    state.claude_launch_version = current or ""
     state.update_notified_version = ""
     state.failure_notified = False
     session_manager._save_state()
-    if current:
-        session_manager.set_claude_launch_version(window_id, current)
 
-    ack = f"♻️ Restarted on {version_label}, resumed your session."
-    await enqueue_content_message(
-        bot=bot,
-        user_id=user_id,
-        window_id=window_id,
-        parts=[ack],
-        content_type="text",
-        text=ack,
-        thread_id=thread_id,
-    )
+    await _enqueue_text(f"♻️ Restarted on {version_label}, resumed your session.")
     return True
 
 
 # Pane signatures that mean the session is stuck on something only a restart
 # fixes (e.g. a now-unavailable / revoked model). Lower-cased substring match.
 # Extension point: add new fatal banners here.
+#
+# NOTE: this is a best-effort screen-scrape of Claude Code's TUI wording — it is
+# inherently brittle (a rewording upstream silently disables detection) and can
+# in principle match the same phrase in conversation text. We mitigate the
+# latter by scanning only the tail of the pane (see _FAILURE_SCAN_LINES), where
+# a live fatal banner sits. A more robust signal (JSONL error entries) would be
+# the proper fix but is out of scope here.
 _FAILURE_SIGNATURES: tuple[str, ...] = (
     "issue with the selected model",
     "may not exist or you may not have access",
 )
+
+# Only the last N lines of the visible pane are scanned for failure signatures:
+# a fatal banner is the most recent output, and bounding the window keeps older
+# conversation text from triggering a false positive.
+_FAILURE_SCAN_LINES = 30
 
 
 async def maybe_notify_update_or_failure(
@@ -501,32 +500,36 @@ async def maybe_notify_update_or_failure(
             )
 
     # --- 2. Session stuck on a fatal error → one notice until it clears ---
+    # Runs every turn-end (the cheapest available failure signal is the pane
+    # itself; turn-end is not the hot poll loop). When capture returns None we
+    # could NOT inspect the pane — leave the prior state untouched rather than
+    # treating "couldn't check" as "clean", which would flap the notice on a
+    # transient tmux hiccup.
     pane = await tmux_manager.capture_pane(window_id)
-    sig = None
-    if pane:
-        low = pane.lower()
-        sig = next((s for s in _FAILURE_SIGNATURES if s in low), None)
-    if sig and not state.failure_notified:
-        notice = (
-            "⚠️ This session looks stuck — the pane shows a fatal error "
-            "(likely the selected model is unavailable). Send /restart to "
-            "relaunch it on your current default model."
-        )
-        await enqueue_content_message(
-            bot=bot,
-            user_id=user_id,
-            window_id=window_id,
-            parts=[notice],
-            content_type="text",
-            text=notice,
-            thread_id=thread_id,
-        )
-        state.failure_notified = True
-        session_manager._save_state()
-        logger.info("Notified failure for window %s (sig=%r)", window_id, sig)
-    elif not sig and state.failure_notified:
-        state.failure_notified = False
-        session_manager._save_state()
+    if pane is not None:
+        tail = "\n".join(pane.splitlines()[-_FAILURE_SCAN_LINES:]).lower()
+        sig = next((s for s in _FAILURE_SIGNATURES if s in tail), None)
+        if sig and not state.failure_notified:
+            notice = (
+                "⚠️ This session looks stuck — the pane shows a fatal error "
+                "(likely the selected model is unavailable). Send /restart to "
+                "relaunch it on your current default model."
+            )
+            await enqueue_content_message(
+                bot=bot,
+                user_id=user_id,
+                window_id=window_id,
+                parts=[notice],
+                content_type="text",
+                text=notice,
+                thread_id=thread_id,
+            )
+            state.failure_notified = True
+            session_manager._save_state()
+            logger.info("Notified failure for window %s (sig=%r)", window_id, sig)
+        elif not sig and state.failure_notified:
+            state.failure_notified = False
+            session_manager._save_state()
 
 
 def reset_state_for_tests() -> None:
