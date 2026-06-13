@@ -66,6 +66,13 @@ class Config:
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
         self.tmux_main_window_name = "__main__"
+        # Dedicated tmux socket (tmux -L <name>) so ccbot's server is isolated
+        # from the user's interactive tmux: foreign sessions can't leak into
+        # session_map, and an interactive `tmux kill-server` can't take ccbot's
+        # sessions down. Combined with systemd KillMode=process, this lets ccbot
+        # restart without killing the running sessions. Attach over SSH with
+        # `tmux -L <name> attach`.
+        self.tmux_socket_name = os.getenv("TMUX_SOCKET_NAME", "ccbot")
 
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")

@@ -644,12 +644,39 @@ class SessionMonitor:
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
 
+    async def drain_callbacks(self, timeout: float = 5.0) -> None:
+        """Stop the poll loop and AWAIT in-flight dispatch tasks before shutdown.
+
+        Byte offsets advance on read (before dispatch), so a message that was
+        read but not yet delivered would be skipped on the next start. Awaiting
+        the outstanding dispatch tasks here lets those already-read messages be
+        delivered, making a ccbot restart seamless. Call before stop().
+        """
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            self._task = None
+        pending = list(self._callback_tasks)
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "drain_callbacks: timed out awaiting %d in-flight dispatch task(s)",
+                len(pending),
+            )
+
     def stop(self) -> None:
         self._running = False
         if self._task:
             self._task.cancel()
             self._task = None
-        # Cancel outstanding fire-and-forget callback tasks
+        # Cancel any outstanding fire-and-forget callback tasks. (post_shutdown
+        # calls drain_callbacks() first to *deliver* them; this is the backstop
+        # for any that remain or for a stop() without a prior drain.)
         for task in list(self._callback_tasks):
             task.cancel()
         self._callback_tasks.clear()

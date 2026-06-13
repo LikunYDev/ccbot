@@ -136,14 +136,24 @@ class TmuxManager:
             session_name: Name of the tmux session to use (default from config)
         """
         self.session_name = session_name or config.tmux_session_name
+        self.socket_name = config.tmux_socket_name
         self._server: libtmux.Server | None = None
 
     @property
     def server(self) -> libtmux.Server:
-        """Get or create tmux server connection."""
+        """Get or create tmux server connection on ccbot's dedicated socket."""
         if self._server is None:
-            self._server = libtmux.Server()
+            self._server = libtmux.Server(socket_name=self.socket_name)
         return self._server
+
+    def _tmux_argv(self, *args: str) -> list[str]:
+        """Build a `tmux -L <socket> ...` argv for raw subprocess calls.
+
+        Daemon-side `tmux` invocations run outside any pane, so (unlike the hook,
+        which inherits ``$TMUX``) they have no way to find ccbot's server and
+        would default to the shared socket. Every raw call must go through here.
+        """
+        return ["tmux", "-L", self.socket_name, *args]
 
     def get_session(self) -> libtmux.Session | None:
         """Get the tmux session if it exists."""
@@ -335,12 +345,11 @@ class TmuxManager:
         def _sync_list() -> set[str]:
             try:
                 result = subprocess.run(
-                    [
-                        "tmux",
+                    self._tmux_argv(
                         "list-sessions",
                         "-F",
                         "#{session_name}|#{session_group}",
-                    ],
+                    ),
                     capture_output=True,
                     text=True,
                 )
@@ -373,12 +382,7 @@ class TmuxManager:
             # Use async subprocess to call tmux capture-pane -e for ANSI colors
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "capture-pane",
-                    "-e",
-                    "-p",
-                    "-t",
-                    window_id,
+                    *self._tmux_argv("capture-pane", "-e", "-p", "-t", window_id),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -586,8 +590,7 @@ class TmuxManager:
         def _sync_respawn() -> bool:
             try:
                 result = subprocess.run(
-                    [
-                        "tmux",
+                    self._tmux_argv(
                         "respawn-pane",
                         "-k",
                         "-c",
@@ -595,7 +598,7 @@ class TmuxManager:
                         "-t",
                         window_id,
                         window_shell_arg,
-                    ],
+                    ),
                     capture_output=True,
                     text=True,
                 )

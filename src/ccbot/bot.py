@@ -1963,6 +1963,9 @@ async def post_shutdown(application: Application) -> None:
     await shutdown_workers()
 
     if session_monitor:
+        # Deliver already-read-but-unsent messages before stopping, so a
+        # restart (e.g. a deploy) doesn't drop in-flight output.
+        await session_monitor.drain_callbacks()
         session_monitor.stop()
         logger.info("Session monitor stopped")
 
