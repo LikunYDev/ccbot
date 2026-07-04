@@ -2,8 +2,8 @@
 
 Parses captured tmux pane content to detect:
   - Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt,
-    RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
-    delimiters.
+    ResumeSession, RestoreCheckpoint) via regex-based UIPattern matching
+    with top/bottom delimiters.
   - Status line (spinner characters + working text) by scanning from bottom up.
 
 All Claude Code text patterns live here. To support a new UI type or
@@ -118,6 +118,22 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*This command requires approval"),
         ),
         bottom=(re.compile(r"^\s*Esc to cancel"),),
+    ),
+    UIPattern(
+        # Session-resume cost prompt (Claude Code daemon/resume flow): offers
+        # resuming a large session from a summary vs in full. Numbered options
+        # all start with "Resume"/"Don't"/"Start", so no other pattern's
+        # markers collide with it.
+        name="ResumeSession",
+        top=(
+            re.compile(r"^\s*Resuming the full session will consume"),
+            re.compile(r"^\s*(?:❯\s+)?1\.\s+Resume from summary"),
+        ),
+        bottom=(
+            re.compile(r"^\s*(?:❯\s+)?\d+\.\s+Don.t ask me again"),
+            re.compile(r"^\s*(?:❯\s+)?\d+\.\s+Start new session"),
+        ),
+        min_gap=1,
     ),
     UIPattern(
         name="RestoreCheckpoint",

@@ -273,6 +273,60 @@ class TestBottomAnchoredDetection:
         assert result.name == "AskUserQuestion"
 
 
+# ── session-resume cost prompt ────────────────────────────────────────────
+
+
+class TestResumeSessionPrompt:
+    """Claude Code's daemon/resume flow asks whether to resume a large session
+    from a summary or in full. Previously unrecognized — fell to the degraded
+    UnknownPrompt backstop."""
+
+    PANE = (
+        " Resuming the full session will consume a substantial portion of your\n"
+        " usage limits. We recommend resuming from a summary.\n"
+        "\n"
+        " ❯ 1. Resume from summary (recommended)\n"
+        "   2. Resume full session as-is\n"
+        "   3. Don't ask me again\n"
+        "\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+
+    def test_full_prompt_extracts(self):
+        result = extract_interactive_content(self.PANE)
+        assert result is not None
+        assert result.name == "ResumeSession"
+        assert "Resuming the full session" in result.content
+        assert "Resume from summary (recommended)" in result.content
+        assert "Don't ask me again" in result.content
+
+    def test_description_scrolled_off_still_extracts(self):
+        pane = "\n".join(self.PANE.split("\n")[3:])
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ResumeSession"
+        assert "Resume full session as-is" in result.content
+
+    def test_selection_on_other_option_still_extracts(self):
+        pane = (
+            "   1. Resume from summary (recommended)\n"
+            " ❯ 2. Resume full session as-is\n"
+            "   3. Don't ask me again\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ResumeSession"
+
+    def test_start_new_session_variant(self):
+        pane = " ❯ 1. Resume from summary (recommended)\n   2. Start new session\n"
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ResumeSession"
+
+    def test_is_interactive(self):
+        assert is_interactive_ui(self.PANE) is True
+
+
 # ── never-silent backstop (footer present, no pattern matched) ────────────
 
 

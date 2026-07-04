@@ -131,6 +131,173 @@ def _install_hook() -> int:
     return 0
 
 
+def _tmux_socket_name() -> str:
+    """Resolve ccbot's dedicated tmux socket name (mirrors config.tmux_socket_name).
+
+    config.py can't be imported here (it requires TELEGRAM_BOT_TOKEN), so
+    check $TMUX_SOCKET_NAME, then the config dir's .env, then the default.
+    """
+    name = os.environ.get("TMUX_SOCKET_NAME", "")
+    if name:
+        return name
+
+    from .utils import ccbot_dir
+
+    env_file = ccbot_dir() / ".env"
+    try:
+        for line in env_file.read_text().splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key == "TMUX_SOCKET_NAME":
+                value = value.strip().strip("'\"")
+                if value:
+                    return value
+    except OSError:
+        pass
+    return "ccbot"
+
+
+def _resolve_window_by_pane(pane_id: str) -> tuple[str, str, str] | None:
+    """Resolve (session_name, window_id, window_name) from a tmux pane id."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-t",
+            pane_id,
+            "-p",
+            "#{session_name}:#{window_id}:#{window_name}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    raw_output = result.stdout.strip()
+    # Expected format: "session_name:@id:window_name"
+    parts = raw_output.split(":", 2)
+    if len(parts) < 3:
+        logger.warning(
+            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
+            pane_id,
+            raw_output,
+        )
+        return None
+    tmux_session_name, window_id, window_name = parts
+    return tmux_session_name, window_id, window_name
+
+
+def _panes_running_claude(pane_pids: list[str]) -> set[str]:
+    """Return the subset of pane PIDs with a live ``claude`` process at or
+    below them.
+
+    Even under the daemon architecture the pane keeps a thin ``claude``
+    client running, so this distinguishes a window hosting a Claude Code UI
+    from an idle shell parked in the same directory.
+    """
+    result = subprocess.run(
+        ["ps", "-A", "-o", "pid=,ppid=,comm="],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return set()
+    children: dict[str, list[str]] = {}
+    comm: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, name = parts[0], parts[1], parts[2].strip()
+        children.setdefault(ppid, []).append(pid)
+        # basename: Linux comm is the bare name, macOS comm is the full path
+        comm[pid] = os.path.basename(name)
+
+    matched: set[str] = set()
+    for pane_pid in pane_pids:
+        stack = [pane_pid]
+        while stack:
+            p = stack.pop()
+            if comm.get(p) == "claude":
+                matched.add(pane_pid)
+                break
+            stack.extend(children.get(p, []))
+    return matched
+
+
+def _resolve_window_by_cwd(cwd: str) -> tuple[str, str, str] | None:
+    """Resolve (session_name, window_id, window_name) by matching the cwd.
+
+    Daemon-hosted Claude Code sessions (``claude --bg-pty-host …``) run hooks
+    with TMUX/TMUX_PANE stripped from the environment, so the pane cannot be
+    read from env. Ask ccbot's tmux server directly (explicit ``-L`` socket,
+    since $TMUX is also absent) which live window's pane sits in the session's
+    cwd. Shells merely parked in the directory are filtered out by requiring
+    a running claude client; only a unique match resolves — with two claude
+    windows on the same directory the window cannot be named, and a wrong
+    guess is worse than a stale map.
+    """
+    if not cwd:
+        return None
+    result = subprocess.run(
+        [
+            "tmux",
+            "-L",
+            _tmux_socket_name(),
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_id}\t#{window_name}\t"
+            "#{pane_current_path}\t#{pane_pid}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "tmux list-panes failed (rc=%s): %s",
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return None
+
+    target = os.path.realpath(cwd)
+    matches: dict[str, tuple[str, str, str]] = {}
+    pane_pids: dict[str, list[str]] = {}  # window_id -> its panes' PIDs
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 4)
+        if len(parts) != 5:
+            continue
+        session_name, window_id, window_name, pane_path, pane_pid = parts
+        if os.path.realpath(pane_path) == target:
+            matches[window_id] = (session_name, window_id, window_name)
+            pane_pids.setdefault(window_id, []).append(pane_pid)
+
+    if len(matches) > 1:
+        running = _panes_running_claude(
+            [pid for pids in pane_pids.values() for pid in pids]
+        )
+        matches = {
+            wid: info
+            for wid, info in matches.items()
+            if any(pid in running for pid in pane_pids[wid])
+        }
+
+    if len(matches) != 1:
+        logger.warning(
+            "TMUX_PANE not set and cwd %s matches %d live claude windows; "
+            "cannot determine window",
+            cwd,
+            len(matches),
+        )
+        return None
+    resolved = next(iter(matches.values()))
+    logger.info(
+        "Resolved window by cwd fallback: %s:%s (%s)",
+        resolved[0],
+        resolved[1],
+        resolved[2],
+    )
+    return resolved
+
+
 def hook_main() -> None:
     """Process a Claude Code hook event from stdin, or install the hook."""
     # Configure logging for the hook subprocess (main.py logging doesn't apply here)
@@ -187,35 +354,25 @@ def hook_main() -> None:
         return
 
     # Get tmux session:window key for the pane running this hook.
-    # TMUX_PANE is set by tmux for every process inside a pane.
+    # TMUX_PANE is set by tmux for every process inside a pane. Daemon-hosted
+    # sessions (claude --bg-pty-host …) strip it, so fall back to matching the
+    # session cwd against live panes — but only for continuation sources
+    # (clear/compact/resume): a fresh `claude` started outside tmux also lacks
+    # TMUX_PANE, and must not steal a window's mapping.
+    source = payload.get("source", "")
     pane_id = os.environ.get("TMUX_PANE", "")
-    if not pane_id:
+    by_cwd_fallback = False
+    if pane_id:
+        resolved = _resolve_window_by_pane(pane_id)
+    elif source and source != "startup":
+        resolved = _resolve_window_by_cwd(cwd)
+        by_cwd_fallback = True
+    else:
         logger.warning("TMUX_PANE not set, cannot determine window")
         return
-
-    result = subprocess.run(
-        [
-            "tmux",
-            "display-message",
-            "-t",
-            pane_id,
-            "-p",
-            "#{session_name}:#{window_id}:#{window_name}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    raw_output = result.stdout.strip()
-    # Expected format: "session_name:@id:window_name"
-    parts = raw_output.split(":", 2)
-    if len(parts) < 3:
-        logger.warning(
-            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
-            pane_id,
-            raw_output,
-        )
+    if resolved is None:
         return
-    tmux_session_name, window_id, window_name = parts
+    tmux_session_name, window_id, window_name = resolved
     # Key uses window_id for uniqueness
     session_window_key = f"{tmux_session_name}:{window_id}"
 
@@ -247,6 +404,25 @@ def hook_main() -> None:
                         logger.warning(
                             "Failed to read existing session_map, starting fresh"
                         )
+
+                if by_cwd_fallback:
+                    # A cwd match may only re-point a window this hook has
+                    # already bound in-pane (first registration always runs
+                    # inside the pane, where TMUX_PANE is set). Creating or
+                    # re-purposing entries from a cwd guess would let any
+                    # outside-tmux claude in a coincidental directory hijack
+                    # a window's mapping.
+                    prior_cwd = session_map.get(session_window_key, {}).get("cwd", "")
+                    if not prior_cwd or os.path.realpath(prior_cwd) != os.path.realpath(
+                        cwd
+                    ):
+                        logger.warning(
+                            "cwd fallback matched %s but it has no prior entry "
+                            "for cwd %s; refusing to bind without TMUX_PANE",
+                            session_window_key,
+                            cwd,
+                        )
+                        return
 
                 session_map[session_window_key] = {
                     "session_id": session_id,
