@@ -22,8 +22,23 @@ class TestParseLine:
             ("not-json", None),
             ("", None),
             ("   \t  ", None),
+            ("[1, 2]", None),
+            ('"str"', None),
+            ("42", None),
+            ("null", None),
+            ("false", None),
         ],
-        ids=["valid_json", "invalid_json", "empty", "whitespace"],
+        ids=[
+            "valid_json",
+            "invalid_json",
+            "empty",
+            "whitespace",
+            "list",
+            "string",
+            "number",
+            "null",
+            "bool",
+        ],
     )
     def test_parse_line(self, line: str, expected: dict | None):
         assert TranscriptParser.parse_line(line) == expected

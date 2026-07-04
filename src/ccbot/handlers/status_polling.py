@@ -248,7 +248,7 @@ async def status_poll_loop(bot: Bot) -> None:
                         skip_status=skip_status,
                     )
                 except Exception as e:
-                    logger.debug(
+                    logger.warning(
                         f"Status update error for user {user_id} "
                         f"thread {thread_id}: {e}"
                     )

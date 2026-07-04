@@ -262,7 +262,7 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                         if task.task_type not in ("content", "interactive_ui"):
                             # Status is ephemeral — safe to drop
                             continue
-                        logger.debug(
+                        logger.info(
                             "Flood controlled: waiting %.0fs for %s (%s)",
                             remaining,
                             task.task_type,
@@ -314,8 +314,13 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                         retry_secs,
                     )
                     await asyncio.sleep(retry_secs)
-            except Exception as e:
-                logger.error("Error processing message task for %s: %s", key, e)
+            except Exception:
+                logger.exception(
+                    "Error processing %s task for %s (window %s)",
+                    task.task_type,
+                    key,
+                    task.window_id,
+                )
             finally:
                 queue.task_done()
         except asyncio.CancelledError:

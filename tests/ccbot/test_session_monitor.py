@@ -97,6 +97,62 @@ class TestReadNewLinesOffsetRecovery:
         assert session.last_byte_offset == jsonl_file.stat().st_size
         assert len(result) == 1
 
+    @pytest.mark.asyncio
+    async def test_complete_corrupt_line_is_skipped(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """A complete-but-malformed line is skipped and the offset advances
+        past it, so subsequent valid lines are still parsed and a bad line
+        can never wedge reads forever."""
+        jsonl_file = tmp_path / "session.jsonl"
+        entry = make_jsonl_entry(msg_type="assistant", content="after corruption")
+        jsonl_file.write_text(
+            "not-json-but-terminated\n" + json.dumps(entry) + "\n",
+            encoding="utf-8",
+        )
+
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        result = await monitor._read_new_lines(session, jsonl_file)
+
+        # The corrupt line is skipped; the valid line after it is still read.
+        assert len(result) == 1
+        assert result[0]["message"]["content"] == "after corruption"
+
+        # Offset advances past the corrupt line all the way to EOF.
+        assert session.last_byte_offset == jsonl_file.stat().st_size
+
+    @pytest.mark.asyncio
+    async def test_trailing_partial_line_retried(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """A line with no trailing newline (file tail, likely mid-write) is
+        retried next cycle — the offset does not advance past it."""
+        jsonl_file = tmp_path / "session.jsonl"
+        entry = make_jsonl_entry(msg_type="assistant", content="complete")
+        complete_line = json.dumps(entry) + "\n"
+        partial_line = '{"type": "assistant", "message": {"conte'  # no newline
+        jsonl_file.write_text(complete_line + partial_line, encoding="utf-8")
+
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        result = await monitor._read_new_lines(session, jsonl_file)
+
+        # Only the complete line is parsed; the partial tail is not consumed.
+        assert len(result) == 1
+        assert result[0]["message"]["content"] == "complete"
+
+        # Offset stops at the start of the partial line, not past it.
+        assert session.last_byte_offset == len(complete_line.encode("utf-8"))
+
 
 class TestTurnEndDispatch:
     """Verify the turn-end callback fires per-batch, not gated on session history."""

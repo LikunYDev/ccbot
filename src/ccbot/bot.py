@@ -137,7 +137,7 @@ from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
-from .utils import ccbot_dir
+from .utils import ccbot_dir, supervise_loop
 
 logger = logging.getLogger(__name__)
 
@@ -1965,13 +1965,17 @@ async def post_init(application: Application) -> None:
     session_monitor = monitor
     logger.info("Session monitor started")
 
-    # Start status polling task
-    _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
+    # Start status polling task (supervised: restarts on crash/unexpected exit)
+    _status_poll_task = asyncio.create_task(
+        supervise_loop("status polling", lambda: status_poll_loop(application.bot))
+    )
     logger.info("Status polling task started")
 
-    # Start local-state maintenance task (session_map hygiene)
+    # Start local-state maintenance task (session_map hygiene), supervised
     global _maintenance_task
-    _maintenance_task = asyncio.create_task(maintenance_loop(application.bot))
+    _maintenance_task = asyncio.create_task(
+        supervise_loop("maintenance", lambda: maintenance_loop(application.bot))
+    )
     logger.info("Maintenance task started")
 
 

@@ -1,5 +1,6 @@
 """Unit tests for build_claude_command — shell command string assembly."""
 
+import time
 from unittest.mock import patch
 
 import pytest
@@ -149,6 +150,58 @@ class TestUserShell:
 
         with patch("ccbot.tmux_manager.pwd.getpwuid", return_value=_Stub()):
             assert tm._user_shell() == "/usr/bin/fish"
+
+
+class TestBounded:
+    """`_bounded` must return the caller's default (not hang) when the
+    wrapped blocking call outlives `_TMUX_SUBPROCESS_TIMEOUT` — this is the
+    guard against a wedged tmux server freezing session-monitor/status-poll
+    callers forever (review findings f19/f60)."""
+
+    async def test_returns_default_and_logs_on_timeout(self, monkeypatch, caplog):
+        monkeypatch.setattr(tm, "_TMUX_SUBPROCESS_TIMEOUT", 0.05)
+        mgr = TmuxManager()
+
+        def _blocking() -> str:
+            time.sleep(0.3)  # far longer than the patched timeout
+            return "unreachable"
+
+        start = time.monotonic()
+        with caplog.at_level("ERROR", logger="ccbot.tmux_manager"):
+            result = await mgr._bounded("test-call", _blocking, "fallback")
+        elapsed = time.monotonic() - start
+
+        assert result == "fallback"
+        # Returned near the (tiny) timeout, not after the blocking call finished.
+        assert elapsed < 0.2
+        assert any(
+            "test-call" in record.getMessage() and "timed out" in record.getMessage()
+            for record in caplog.records
+        )
+
+    async def test_returns_real_value_when_call_completes_in_time(self):
+        mgr = TmuxManager()
+        result = await mgr._bounded("fast-call", lambda: "value", "fallback")
+        assert result == "value"
+
+
+class TestListWindowsTimeout:
+    """One representative call-site test: a wedged `get_session()` must not
+    hang `list_windows` — it should come back with the safe default `[]`."""
+
+    async def test_list_windows_returns_empty_list_on_timeout(self, monkeypatch):
+        monkeypatch.setattr(tm, "_TMUX_SUBPROCESS_TIMEOUT", 0.05)
+        mgr = TmuxManager()
+
+        def _blocking_get_session():
+            time.sleep(0.3)
+            return None
+
+        monkeypatch.setattr(mgr, "get_session", _blocking_get_session)
+
+        result = await mgr.list_windows()
+
+        assert result == []
 
 
 class TestParseGroupSessionNames:

@@ -6,7 +6,9 @@ Wraps libtmux to provide async-friendly operations on a single tmux session:
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
 
-All blocking libtmux calls are wrapped in asyncio.to_thread().
+All blocking libtmux calls are wrapped in asyncio.to_thread() and bounded by
+`TmuxManager._bounded()` (timeout `_TMUX_SUBPROCESS_TIMEOUT`), so a wedged
+tmux server can't hang a caller coroutine forever.
 
 Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
@@ -14,12 +16,15 @@ Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import pwd
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 import libtmux
 
@@ -35,6 +40,8 @@ _FALLBACK_PATH = "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 # Upper bound for blocking raw `tmux` subprocess calls, so a wedged tmux server
 # can't pin a thread-pool thread (and hang /restart) indefinitely.
 _TMUX_SUBPROCESS_TIMEOUT = 10.0
+
+_T = TypeVar("_T")
 
 
 def _user_shell() -> str:
@@ -159,6 +166,27 @@ class TmuxManager:
         """
         return ["tmux", "-L", self.socket_name, *args]
 
+    async def _bounded(self, label: str, fn: Callable[[], _T], default: _T) -> _T:
+        """Run a blocking libtmux/tmux call in a thread, bounded by
+        `_TMUX_SUBPROCESS_TIMEOUT`.
+
+        A wedged tmux server can leave `fn` blocked in libtmux's untimed
+        `Popen.communicate()` forever. `asyncio.wait_for` can't cancel that
+        thread — the pool thread is abandoned running `fn` — but that's
+        deliberate: leaking one thread-pool thread is far cheaper than
+        permanently freezing the caller coroutine (this backs the
+        session-monitor and status-polling loops).
+        """
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(fn), timeout=_TMUX_SUBPROCESS_TIMEOUT
+            )
+        except TimeoutError:
+            logger.error(
+                "tmux call %s timed out after %.0fs", label, _TMUX_SUBPROCESS_TIMEOUT
+            )
+            return default
+
     def get_session(self) -> libtmux.Session | None:
         """Get the tmux session if it exists."""
         try:
@@ -250,7 +278,7 @@ class TmuxManager:
 
             return windows
 
-        return await asyncio.to_thread(_sync_list_windows)
+        return await self._bounded("list_windows", _sync_list_windows, [])
 
     async def list_all_window_ids(self) -> set[str] | None:
         """Window IDs of every window on ccbot's tmux server, across all
@@ -337,7 +365,9 @@ class TmuxManager:
                 logger.debug(f"get_pane_current_command({window_id}) failed: {e}")
                 return None
 
-        return await asyncio.to_thread(_sync_get)
+        return await self._bounded(
+            f"get_pane_current_command({window_id})", _sync_get, None
+        )
 
     async def get_pane_pid(self, window_id: str) -> int | None:
         """Return the PID of the window's active pane.
@@ -371,7 +401,7 @@ class TmuxManager:
                 logger.debug(f"get_pane_pid({window_id}) failed: {e}")
                 return None
 
-        return await asyncio.to_thread(_sync_get)
+        return await self._bounded(f"get_pane_pid({window_id})", _sync_get, None)
 
     async def list_group_session_names(self) -> set[str]:
         """Return the configured tmux session plus any grouped peers."""
@@ -386,7 +416,14 @@ class TmuxManager:
                     ),
                     capture_output=True,
                     text=True,
+                    timeout=_TMUX_SUBPROCESS_TIMEOUT,
                 )
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "list_group_session_names: tmux timed out after %.0fs",
+                    _TMUX_SUBPROCESS_TIMEOUT,
+                )
+                return {self.session_name}
             except OSError as e:
                 logger.debug("list_group_session_names failed to exec tmux: %s", e)
                 return {self.session_name}
@@ -400,7 +437,9 @@ class TmuxManager:
 
             return _parse_group_session_names(result.stdout, self.session_name)
 
-        return await asyncio.to_thread(_sync_list)
+        return await self._bounded(
+            "list_group_session_names", _sync_list, {self.session_name}
+        )
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a window's active pane.
@@ -420,7 +459,20 @@ class TmuxManager:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, stderr = await proc.communicate()
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=_TMUX_SUBPROCESS_TIMEOUT
+                    )
+                except TimeoutError:
+                    logger.error(
+                        "capture_pane(%s): tmux timed out after %.0fs",
+                        window_id,
+                        _TMUX_SUBPROCESS_TIMEOUT,
+                    )
+                    proc.kill()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
+                    return None
                 if proc.returncode == 0:
                     return stdout.decode("utf-8")
                 logger.error(
@@ -449,7 +501,7 @@ class TmuxManager:
                 logger.error(f"Failed to capture pane {window_id}: {e}")
                 return None
 
-        return await asyncio.to_thread(_sync_capture)
+        return await self._bounded(f"capture_pane({window_id})", _sync_capture, None)
 
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
@@ -512,18 +564,30 @@ class TmuxManager:
             # Claude Code's ! command mode: send "!" first so the TUI
             # switches to bash mode, wait 1s, then send the rest.
             if text.startswith("!"):
-                if not await asyncio.to_thread(_send_literal, "!"):
+                if not await self._bounded(
+                    f"send_keys:literal({window_id})", lambda: _send_literal("!"), False
+                ):
                     return False
                 rest = text[1:]
                 if rest:
                     await asyncio.sleep(1.0)
-                    if not await asyncio.to_thread(_send_literal, rest):
+                    if not await self._bounded(
+                        f"send_keys:literal({window_id})",
+                        lambda: _send_literal(rest),
+                        False,
+                    ):
                         return False
             else:
-                if not await asyncio.to_thread(_send_literal, text):
+                if not await self._bounded(
+                    f"send_keys:literal({window_id})",
+                    lambda: _send_literal(text),
+                    False,
+                ):
                     return False
             await asyncio.sleep(0.5)
-            return await asyncio.to_thread(_send_enter)
+            return await self._bounded(
+                f"send_keys:enter({window_id})", _send_enter, False
+            )
 
         # Other cases: special keys (literal=False) or no-enter
         def _sync_send_keys() -> bool:
@@ -550,7 +614,7 @@ class TmuxManager:
                 logger.error(f"Failed to send keys to window {window_id}: {e}")
                 return False
 
-        return await asyncio.to_thread(_sync_send_keys)
+        return await self._bounded(f"send_keys({window_id})", _sync_send_keys, False)
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a tmux window by its ID."""
@@ -570,7 +634,7 @@ class TmuxManager:
                 logger.error(f"Failed to rename window {window_id}: {e}")
                 return False
 
-        return await asyncio.to_thread(_sync_rename)
+        return await self._bounded(f"rename_window({window_id})", _sync_rename, False)
 
     async def kill_window(self, window_id: str) -> bool:
         """Kill a tmux window by its ID."""
@@ -590,7 +654,7 @@ class TmuxManager:
                 logger.error(f"Failed to kill window {window_id}: {e}")
                 return False
 
-        return await asyncio.to_thread(_sync_kill)
+        return await self._bounded(f"kill_window({window_id})", _sync_kill, False)
 
     async def respawn_pane(
         self,
@@ -659,7 +723,7 @@ class TmuxManager:
             )
             return True
 
-        return await asyncio.to_thread(_sync_respawn)
+        return await self._bounded(f"respawn_pane({window_id})", _sync_respawn, False)
 
     async def create_window(
         self,
@@ -743,7 +807,11 @@ class TmuxManager:
                 logger.error(f"Failed to create window: {e}")
                 return False, f"Failed to create window: {e}", "", ""
 
-        return await asyncio.to_thread(_create)
+        return await self._bounded(
+            f"create_window({final_window_name})",
+            _create,
+            (False, "tmux timed out", "", ""),
+        )
 
 
 # Global instance with default session name

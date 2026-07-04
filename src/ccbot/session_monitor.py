@@ -25,7 +25,7 @@ from .handlers.interactive_ui import INTERACTIVE_TOOL_NAMES
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import read_cwd_from_jsonl
+from .utils import read_cwd_from_jsonl, supervise_loop
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +210,13 @@ class SessionMonitor:
 
         Detects file truncation (e.g. after /clear) and resets offset.
         Recovers from corrupted offsets (mid-line) by scanning to next line.
+
+        A line that fails to parse is either corrupt (it ends with a newline,
+        so it's a complete-but-malformed record) or partial (no trailing
+        newline — the file tail, likely mid-write). Corrupt lines are logged
+        and skipped with the offset advanced past them, so one bad line can
+        never wedge reads forever; partial lines keep the existing
+        break-and-retry-next-cycle behavior.
         """
         new_entries = []
         try:
@@ -256,19 +263,29 @@ class SessionMonitor:
                 safe_offset = session.last_byte_offset
                 async for line in f:
                     data = TranscriptParser.parse_line(line)
-                    if data:
+                    if data is not None:
                         new_entries.append(data)
                         safe_offset = await f.tell()
-                    elif line.strip():
-                        # Partial JSONL line — don't advance offset past it
+                    elif not line.strip():
+                        # Empty line — safe to skip
+                        safe_offset = await f.tell()
+                    elif line.endswith("\n"):
+                        # Complete line that failed to parse — permanently
+                        # corrupt, not a race with an in-progress write.
+                        # Skip and advance past it so it can't wedge reads.
                         logger.warning(
+                            "Skipping corrupt JSONL line in session %s",
+                            session.session_id,
+                        )
+                        safe_offset = await f.tell()
+                    else:
+                        # No trailing newline — likely the file tail
+                        # mid-write. Don't advance offset; retry next cycle.
+                        logger.debug(
                             "Partial JSONL line in session %s, will retry next cycle",
                             session.session_id,
                         )
                         break
-                    else:
-                        # Empty line — safe to skip
-                        safe_offset = await f.tell()
 
                 session.last_byte_offset = safe_offset
 
@@ -358,7 +375,7 @@ class SessionMonitor:
             to_read, read_results, strict=True
         ):
             if isinstance(result, BaseException):
-                logger.debug(
+                logger.warning(
                     "Error reading session %s: %s", session_info.session_id, result
                 )
                 continue
@@ -630,8 +647,8 @@ class SessionMonitor:
                         self._callback_tasks.add(task)
                         task.add_done_callback(self._callback_tasks.discard)
 
-            except Exception as e:
-                logger.error(f"Monitor loop error: {e}")
+            except Exception:
+                logger.exception("Monitor loop error")
 
             await asyncio.sleep(self.poll_interval)
 
@@ -642,7 +659,13 @@ class SessionMonitor:
             logger.warning("Monitor already running")
             return
         self._running = True
-        self._task = asyncio.create_task(self._monitor_loop())
+        self._task = asyncio.create_task(
+            supervise_loop(
+                "session monitor",
+                self._monitor_loop,
+                should_run=lambda: self._running,
+            )
+        )
 
     def _stop_poll_loop(self) -> None:
         """Stop the background poll loop task. Idempotent."""

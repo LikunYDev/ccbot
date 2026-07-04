@@ -84,16 +84,25 @@ class TranscriptParser:
             line: A single line from the JSONL file
 
         Returns:
-            Parsed dict or None if line is empty/invalid
+            Parsed dict, or None if the line is empty/invalid or if it is
+            valid JSON that doesn't decode to an object (e.g. a bare
+            string/number/list/null) — those can never carry a "type" field
+            and would otherwise crash downstream `.get()` calls.
         """
         line = line.strip()
         if not line:
             return None
 
         try:
-            return json.loads(line)
+            value = json.loads(line)
         except json.JSONDecodeError:
             return None
+
+        if not isinstance(value, dict):
+            logger.debug("Ignoring non-dict JSONL line: %r", line[:200])
+            return None
+
+        return value
 
     @staticmethod
     def get_message_type(data: dict) -> str | None:
