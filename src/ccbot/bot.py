@@ -44,6 +44,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    Message,
     Update,
 )
 from telegram.constants import ChatAction
@@ -112,6 +113,7 @@ from .handlers.interactive_ui import (
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    send_ui_key,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -661,6 +663,33 @@ _IMAGES_DIR = ccbot_dir() / "images"
 _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+async def _media_blocked_by_ui(
+    bot: Bot,
+    message: Message,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+) -> bool:
+    """Refuse to forward media into a window with a pending interactive UI.
+
+    text_handler deliberately still sends text when a UI is on screen — a
+    short reply may legitimately BE the menu answer (e.g. "1", "yes"). Photo
+    captions and voice transcripts can never be a menu answer — they're a
+    file path / free-form transcript — so unlike text, blocking here is
+    unambiguously correct rather than a design trade-off.
+    """
+    pane_text = await tmux_manager.capture_pane(window_id)
+    if not pane_text or not is_interactive_ui(pane_text):
+        return False
+    await handle_interactive_ui(bot, user_id, window_id, thread_id)
+    await safe_reply(
+        message,
+        "⚠️ Claude is waiting on an interactive prompt in this topic — "
+        "answer it first (dialog above), then resend.",
+    )
+    return True
+
+
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle photos sent by the user: download and forward path to Claude Code."""
     user = update.effective_user
@@ -702,6 +731,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
             "Send a message to start a new session.",
         )
+        return
+
+    if await _media_blocked_by_ui(context.bot, update.message, user.id, wid, thread_id):
         return
 
     # Download the highest-resolution photo
@@ -780,6 +812,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
             "Send a message to start a new session.",
         )
+        return
+
+    if await _media_blocked_by_ui(context.bot, update.message, user.id, wid, thread_id):
         return
 
     # Download voice as in-memory bytes
@@ -1633,100 +1668,59 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Up", thread_id)
+        await query.answer(None if status == "Up" else status)
 
     # Interactive UI: Down arrow
     elif data.startswith(CB_ASK_DOWN):
         window_id = data[len(CB_ASK_DOWN) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Down", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Down", thread_id)
+        await query.answer(None if status == "Down" else status)
 
     # Interactive UI: Left arrow
     elif data.startswith(CB_ASK_LEFT):
         window_id = data[len(CB_ASK_LEFT) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Left", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Left", thread_id)
+        await query.answer(None if status == "Left" else status)
 
     # Interactive UI: Right arrow
     elif data.startswith(CB_ASK_RIGHT):
         window_id = data[len(CB_ASK_RIGHT) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Right", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Right", thread_id)
+        await query.answer(None if status == "Right" else status)
 
     # Interactive UI: Escape
     elif data.startswith(CB_ASK_ESC):
         window_id = data[len(CB_ASK_ESC) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Escape", enter=False, literal=False
-            )
-            await clear_interactive_msg(user.id, context.bot, thread_id)
-        await query.answer("⎋ Esc")
+        status = await send_ui_key(
+            context.bot, user.id, window_id, "Escape", thread_id, clear_on_send=True
+        )
+        await query.answer("⎋ Esc" if status == "Escape" else status)
 
     # Interactive UI: Enter
     elif data.startswith(CB_ASK_ENTER):
         window_id = data[len(CB_ASK_ENTER) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Enter", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("⏎ Enter")
+        status = await send_ui_key(context.bot, user.id, window_id, "Enter", thread_id)
+        await query.answer("⏎ Enter" if status == "Enter" else status)
 
     # Interactive UI: Space
     elif data.startswith(CB_ASK_SPACE):
         window_id = data[len(CB_ASK_SPACE) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Space", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("␣ Space")
+        status = await send_ui_key(context.bot, user.id, window_id, "Space", thread_id)
+        await query.answer("␣ Space" if status == "Space" else status)
 
     # Interactive UI: Tab
     elif data.startswith(CB_ASK_TAB):
         window_id = data[len(CB_ASK_TAB) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("⇥ Tab")
+        status = await send_ui_key(context.bot, user.id, window_id, "Tab", thread_id)
+        await query.answer("⇥ Tab" if status == "Tab" else status)
 
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):
