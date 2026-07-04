@@ -271,6 +271,12 @@ class TestHookMainCwdFallback:
             seed_map=self.SESSION_MAP,
         )
         assert result == self.SESSION_MAP
+        # The refusal is recorded for the maintenance loop to surface.
+        failures = (tmp_path / "hook_failures.jsonl").read_text().splitlines()
+        assert len(failures) == 1
+        failure = json.loads(failures[0])
+        assert failure["cwd"] == "/proj"
+        assert failure["session_id"] == "33333333-3333-3333-3333-333333333333"
 
     def test_startup_source_never_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path

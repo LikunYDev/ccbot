@@ -303,6 +303,45 @@ class TestGroupedSessionMapHandling:
         }
 
     @pytest.mark.asyncio
+    async def test_repoint_updates_every_prefix_for_the_window(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@41": {"session_id": "sid-old", "cwd": "/proj"},
+                    "ccbot-2:@41": {"session_id": "sid-old", "cwd": "/proj"},
+                    "ccbot:@49": {"session_id": "sid-49", "cwd": "/other"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+
+        ok = await mgr.repoint_window_session("@41", "sid-new")
+
+        assert ok is True
+        result = json.loads(session_map_file.read_text(encoding="utf-8"))
+        assert result["ccbot:@41"]["session_id"] == "sid-new"
+        assert result["ccbot-2:@41"]["session_id"] == "sid-new"
+        assert result["ccbot:@49"]["session_id"] == "sid-49"
+
+    @pytest.mark.asyncio
+    async def test_repoint_returns_false_when_window_absent(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        original = {"ccbot:@49": {"session_id": "sid-49"}}
+        session_map_file.write_text(json.dumps(original), encoding="utf-8")
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+
+        ok = await mgr.repoint_window_session("@77", "sid-new")
+
+        assert ok is False
+        assert json.loads(session_map_file.read_text(encoding="utf-8")) == original
+
+    @pytest.mark.asyncio
     async def test_sweep_is_a_noop_when_tmux_unreachable(
         self, mgr: SessionManager, tmp_path, monkeypatch
     ) -> None:

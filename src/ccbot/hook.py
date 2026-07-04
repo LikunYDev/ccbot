@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,26 @@ def _tmux_socket_name() -> str:
     except OSError:
         pass
     return "ccbot"
+
+
+def _record_hook_failure(cwd: str, session_id: str, reason: str) -> None:
+    """Append a window-mapping failure to <CCBOT_DIR>/hook_failures.jsonl.
+
+    The bot's maintenance loop tails this file and surfaces the failure in
+    the topic(s) bound to this cwd — otherwise the failure dies in hook
+    stderr, only visible by transcript archaeology, and the topic goes
+    silent with no explanation (the 2026-07-04 incident mode).
+    """
+    from .utils import ccbot_dir
+
+    try:
+        line = json.dumps(
+            {"ts": time.time(), "cwd": cwd, "session_id": session_id, "reason": reason}
+        )
+        with open(ccbot_dir() / "hook_failures.jsonl", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        logger.debug("Failed to record hook failure: %s", e)
 
 
 def _resolve_window_by_pane(pane_id: str) -> tuple[str, str, str] | None:
@@ -381,6 +402,12 @@ def hook_main() -> None:
         logger.warning("TMUX_PANE not set, cannot determine window")
         return
     if resolved is None:
+        if by_cwd_fallback:
+            _record_hook_failure(
+                cwd,
+                session_id,
+                "no TMUX_PANE and no unique live claude window for this cwd",
+            )
         return
     tmux_session_name, window_id, window_name = resolved
     # Key uses window_id for uniqueness
@@ -431,6 +458,12 @@ def hook_main() -> None:
                             "for cwd %s; refusing to bind without TMUX_PANE",
                             session_window_key,
                             cwd,
+                        )
+                        _record_hook_failure(
+                            cwd,
+                            session_id,
+                            f"cwd fallback matched {session_window_key} but it "
+                            "has no prior entry for this cwd",
                         )
                         return
 

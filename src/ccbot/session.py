@@ -517,6 +517,31 @@ class SessionManager:
 
         await asyncio.to_thread(self._locked_session_map_update, mutate)
 
+    async def repoint_window_session(self, window_id: str, session_id: str) -> bool:
+        """Re-point a window's session_map entry at a different session id.
+
+        User-approved recovery for stale tracking (the divergence notice's
+        button). Updates every key for this window_id; the monitor observes
+        the change on its next poll, drops the old session, and starts
+        tracking the new one at end-of-file. Returns False when no entry
+        exists for the window.
+        """
+        repointed = False
+
+        def mutate(session_map: dict[str, Any]) -> bool:
+            nonlocal repointed
+            for key, info in session_map.items():
+                parts = self._split_session_map_key(key)
+                if parts is not None and parts[1] == window_id:
+                    info["session_id"] = session_id
+                    repointed = True
+            if repointed:
+                logger.info("Re-pointed window %s -> session %s", window_id, session_id)
+            return repointed
+
+        await asyncio.to_thread(self._locked_session_map_update, mutate)
+        return repointed
+
     # --- Display name management ---
 
     def get_display_name(self, window_id: str) -> str:

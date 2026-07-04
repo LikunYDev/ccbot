@@ -75,6 +75,7 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_REPOINT,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -1736,6 +1737,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
+
+    # Divergence notice: re-point a window's session_map entry (human-approved)
+    elif data.startswith(CB_REPOINT):
+        rest = data[len(CB_REPOINT) :]
+        window_id, _, new_sid = rest.partition(":")
+        if not window_id or not new_sid:
+            await query.answer("Invalid data")
+            return
+        ok = await session_manager.repoint_window_session(window_id, new_sid)
+        if ok:
+            await query.answer("Re-pointed")
+            try:
+                await query.edit_message_text(
+                    f"✅ This window now tracks session {new_sid[:8]}… — "
+                    "new messages will flow again shortly."
+                )
+            except Exception:
+                pass  # Original notice may be old or already edited
+        else:
+            await query.answer("No session_map entry for this window", show_alert=True)
 
     # Screenshot quick keys: send key to tmux window
     elif data.startswith(CB_KEYS_PREFIX):
