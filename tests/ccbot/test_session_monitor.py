@@ -2,12 +2,12 @@
 
 import asyncio
 import json
-from unittest.mock import AsyncMock
 
 import pytest
 
 from ccbot.config import config
 from ccbot.monitor_state import TrackedSession
+from ccbot.session import WindowState, session_manager
 from ccbot.session_monitor import NewMessage, SessionMonitor
 
 
@@ -252,7 +252,13 @@ class TestTurnEndDispatch:
         assert fired == ["s1"]
 
 
-class TestGroupedSessionMapLoading:
+class TestSessionMapFromWindowStates:
+    """SessionMonitor derives its window->session map from
+    session_manager.window_states — the reconciled authority (hook events
+    with pins applied) — instead of re-parsing session_map.json itself
+    (review findings f16/f47, root cause RC2).
+    """
+
     @pytest.fixture
     def monitor(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
@@ -261,75 +267,75 @@ class TestGroupedSessionMapLoading:
             state_file=tmp_path / "monitor_state.json",
         )
 
+    @pytest.fixture(autouse=True)
+    def _isolate_window_states(self):
+        """Snapshot/restore the singleton's window_states around each test
+        to avoid cross-test pollution."""
+        original = session_manager.window_states
+        session_manager.window_states = {}
+        yield
+        session_manager.window_states = original
+
     @pytest.mark.asyncio
-    async def test_load_current_session_map_accepts_grouped_session_prefix(
-        self, monitor, tmp_path, monkeypatch
-    ):
-        session_map_file = tmp_path / "session_map.json"
-        session_map_file.write_text(
-            json.dumps(
-                {
-                    "ccbot:@5": {"session_id": "sid-1"},
-                    "ccbot-2:@28": {"session_id": "sid-28"},
-                    "other:@9": {"session_id": "sid-9"},
-                }
-            ),
-            encoding="utf-8",
-        )
-        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
-        monkeypatch.setattr(
-            "ccbot.session_monitor.tmux_manager.list_group_session_names",
-            AsyncMock(return_value={"ccbot", "ccbot-2"}),
-        )
+    async def test_load_current_session_map_reads_window_states(self, monitor):
+        session_manager.window_states = {
+            "@5": WindowState(session_id="sid-1"),
+            "@28": WindowState(session_id="sid-28"),
+            "@9": WindowState(session_id=""),  # not yet detected -- excluded
+        }
 
         current_map = await monitor._load_current_session_map()
 
         assert current_map == {"@5": "sid-1", "@28": "sid-28"}
 
     @pytest.mark.asyncio
-    async def test_load_current_session_map_dedups_same_window_id_across_peers(
-        self, monitor, tmp_path, monkeypatch
+    async def test_load_current_session_map_ignores_session_map_json_on_disk(
+        self, monitor, tmp_path
     ):
-        """Grouped tmux sessions share windows, so session_map.json can carry
-        the same window_id under multiple session-name prefixes. Iteration order
-        must not silently pick whichever entry happens to come last on disk —
-        the configured tmux_session_name's entry wins deterministically.
-        """
-        session_map_file = tmp_path / "session_map.json"
-        # Order primary first so a buggy "last-write-wins" loop would land on
-        # sid-peer. The fix must still resolve to sid-primary.
-        session_map_file.write_text(
-            json.dumps(
-                {
-                    "ccbot:@48": {"session_id": "sid-primary"},
-                    "ccbot-2:@48": {"session_id": "sid-peer"},
-                }
-            ),
+        """The monitor no longer parses session_map.json directly; only
+        session_manager.window_states (populated by
+        session_manager.load_session_map()) matters."""
+        (tmp_path / "session_map.json").write_text(
+            json.dumps({"ccbot:@5": {"session_id": "totally-different-sid"}}),
             encoding="utf-8",
         )
-        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
-        monkeypatch.setattr(
-            "ccbot.session_monitor.tmux_manager.list_group_session_names",
-            AsyncMock(return_value={"ccbot", "ccbot-2"}),
-        )
+        session_manager.window_states = {"@5": WindowState(session_id="sid-1")}
 
         current_map = await monitor._load_current_session_map()
 
-        assert current_map == {"@48": "sid-primary"}
+        assert current_map == {"@5": "sid-1"}
 
     @pytest.mark.asyncio
-    async def test_cleanup_all_stale_sessions_keeps_grouped_prefix_session(
-        self, monitor, tmp_path, monkeypatch
+    async def test_resume_pin_stays_active_even_when_hook_reports_old_sid(
+        self, monitor, tmp_path
     ):
-        session_map_file = tmp_path / "session_map.json"
-        session_map_file.write_text(
-            json.dumps({"ccbot-2:@28": {"session_id": "sid-28"}}), encoding="utf-8"
+        """Regression (f16/f47, RC2): after a resume, window_states holds the
+        pinned (real) session_id while session_map.json on disk may still
+        only report the pre-resume hook session_id. Before this fix, the
+        monitor parsed session_map.json itself and never saw the pinned sid,
+        so active_session_ids never contained it and the topic went
+        permanently silent.
+        """
+        (tmp_path / "session_map.json").write_text(
+            json.dumps({"ccbot:@5": {"session_id": "hook-uuid"}}),
+            encoding="utf-8",
         )
-        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
-        monkeypatch.setattr(
-            "ccbot.session_monitor.tmux_manager.list_group_session_names",
-            AsyncMock(return_value={"ccbot", "ccbot-2"}),
-        )
+        session_manager.window_states = {
+            "@5": WindowState(session_id="orig-uuid", pinned_over="hook-uuid"),
+        }
+
+        current_map = await monitor._load_current_session_map()
+
+        assert current_map == {"@5": "orig-uuid"}
+        # check_for_updates treats orig-uuid (not hook-uuid) as active.
+        assert "orig-uuid" in set(current_map.values())
+        assert "hook-uuid" not in set(current_map.values())
+
+    @pytest.mark.asyncio
+    async def test_cleanup_all_stale_sessions_uses_window_states(
+        self, monitor, tmp_path
+    ):
+        session_manager.window_states = {"@28": WindowState(session_id="sid-28")}
         monitor.state.update_session(
             TrackedSession(
                 session_id="sid-28",

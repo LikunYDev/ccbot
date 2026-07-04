@@ -1,8 +1,10 @@
 """Session monitoring service — watches JSONL files for new messages.
 
 Runs an async polling loop that:
-  1. Loads the current session_map to know which sessions to watch.
-  2. Detects session_map changes (new/changed/deleted windows) and cleans up.
+  1. Reads session_manager.window_states (the reconciled window->session
+     authority: hook events with manual pins applied) to know which
+     sessions to watch.
+  2. Detects window->session changes (new/changed/deleted windows) and cleans up.
   3. Reads new JSONL lines from each session file using byte-offset tracking.
   4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
 
@@ -85,9 +87,9 @@ class SessionMonitor:
         self._callback_tasks: set[asyncio.Task[None]] = set()
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
-        # Track last known session_map for detecting changes
-        # Keys may be window_id (@12) or window_name (old format) during transition
-        self._last_session_map: dict[str, str] = {}  # window_key -> session_id
+        # Track last known window_id -> session_id map (from session_manager
+        # .window_states) for detecting changes
+        self._last_session_map: dict[str, str] = {}  # window_id -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
 
@@ -439,68 +441,24 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
-    async def _accepted_session_map_names(self) -> set[str]:
-        """Return the configured tmux session plus any grouped peers."""
-
-        try:
-            names = await tmux_manager.list_group_session_names()
-        except Exception as e:
-            logger.debug("Failed to list grouped tmux sessions: %s", e)
-            names = set()
-        return names or {config.tmux_session_name}
-
-    @staticmethod
-    def _split_session_map_key(key: str) -> tuple[str, str] | None:
-        """Split a session_map key into (session_name, window_key)."""
-
-        session_name, sep, window_key = key.partition(":")
-        if not sep or not session_name or not window_key:
-            return None
-        return session_name, window_key
-
     async def _load_current_session_map(self) -> dict[str, str]:
-        """Load current session_map and return window_key -> session_id mapping.
+        """Return window_id -> session_id from the reconciled authority.
 
-        Keys in session_map are formatted as "tmux_session:window_id"
-        (e.g. "ccbot:@12"). Old-format keys ("ccbot:window_name") are also
-        accepted so that sessions running before a code upgrade continue
-        to be monitored until the hook re-fires with new format.
-        Accepts entries under our tmux_session_name or any grouped peer
-        session. When the same window_id appears under multiple grouped
-        peers, the configured tmux_session_name's entry wins (alphabetical
-        fallback otherwise) so the monitor tracks the same session that
-        SessionManager has applied to window_state.
+        session_manager.window_states is the reconciled authority: it is
+        built from hook events (session_map.json) with manual pins
+        (WindowState.pinned_over) applied on top, via
+        session_manager.load_session_map(). The monitor no longer parses
+        session_map.json itself, so a resumed session's pinned session_id
+        (which may differ from what the hook currently reports) is tracked
+        correctly instead of silently filtered out.
         """
-        window_to_session: dict[str, str] = {}
-        if not config.session_map_file.exists():
-            return window_to_session
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            return window_to_session
+        from .session import session_manager
 
-        accepted_names = await self._accepted_session_map_names()
-        candidates: dict[str, dict[str, str]] = {}
-        for key, info in session_map.items():
-            parts = self._split_session_map_key(key)
-            if parts is None:
-                continue
-            session_name, window_key = parts
-            if session_name not in accepted_names:
-                continue
-            session_id = info.get("session_id", "")
-            if session_id:
-                candidates.setdefault(window_key, {})[session_name] = session_id
-
-        primary = config.tmux_session_name
-        for window_key, by_name in candidates.items():
-            if primary in by_name:
-                window_to_session[window_key] = by_name[primary]
-            else:
-                window_to_session[window_key] = by_name[sorted(by_name)[0]]
-        return window_to_session
+        return {
+            wid: ws.session_id
+            for wid, ws in session_manager.window_states.items()
+            if ws.session_id
+        }
 
     async def _cleanup_all_stale_sessions(self) -> None:
         """Clean up all tracked sessions not in current session_map (used on startup)."""
@@ -612,6 +570,11 @@ class SessionMonitor:
         # Deferred import to avoid circular dependency (cached once)
         from .session import session_manager
 
+        # Populate the reconciled authority (window_states) before it is
+        # read below — otherwise startup cleanup and the initial
+        # _last_session_map would see an empty map and wrongly treat every
+        # tracked session as stale.
+        await session_manager.load_session_map()
         # Clean up all stale sessions on startup
         await self._cleanup_all_stale_sessions()
         # Initialize last known session_map

@@ -62,6 +62,13 @@ class WindowState:
         failure_notified: Whether we have already surfaced a "session looks
             broken" notice for the current failure. Reset when the pane is clean
             again (or on /restart) so a recurrence re-notifies once.
+        pinned_over: When not None, session_id/cwd were set manually (resume
+            override or hook-timeout recovery) and outrank hook entries in
+            session_map.json that still report session_id == pinned_over. A
+            hook entry with a DIFFERENT non-empty session_id (e.g. after
+            /clear) unpins and is accepted normally. An empty string pins
+            over nothing, so any future hook entry with a non-empty
+            session_id unpins it.
     """
 
     session_id: str = ""
@@ -70,6 +77,7 @@ class WindowState:
     claude_launch_version: str = ""
     update_notified_version: str = ""
     failure_notified: bool = False
+    pinned_over: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -84,6 +92,8 @@ class WindowState:
             d["update_notified_version"] = self.update_notified_version
         if self.failure_notified:
             d["failure_notified"] = self.failure_notified
+        if self.pinned_over is not None:
+            d["pinned_over"] = self.pinned_over
         return d
 
     @classmethod
@@ -95,6 +105,7 @@ class WindowState:
             claude_launch_version=data.get("claude_launch_version", ""),
             update_notified_version=data.get("update_notified_version", ""),
             failure_notified=data.get("failure_notified", False),
+            pinned_over=data.get("pinned_over"),
         )
 
 
@@ -240,14 +251,34 @@ class SessionManager:
         1. Old-format migration: window_name keys → window_id keys
         2. Stale IDs: window_id no longer exists but display name matches a live window
 
-        Builds {window_name: window_id} from live windows, then remaps or drops entries.
+        Builds {window_name: [window_id, ...]} from live windows, then remaps
+        or drops entries. A display name shared by more than one live window
+        is ambiguous — silently picking one (e.g. "last one wins") risks
+        cross-wiring a stale entry onto the WRONG live window/session (RC3/RC4:
+        window renames are never checked for uniqueness), so ambiguous names
+        are dropped exactly like a no-match, never guessed.
         """
         windows = await tmux_manager.list_windows()
-        live_by_name: dict[str, str] = {}  # window_name -> window_id
+        live_by_name: dict[str, list[str]] = {}  # window_name -> [window_id, ...]
         live_ids: set[str] = set()
         for w in windows:
-            live_by_name[w.window_name] = w.window_id
+            live_by_name.setdefault(w.window_name, []).append(w.window_id)
             live_ids.add(w.window_id)
+
+        def resolve_name(name: str) -> str | None:
+            """Resolve a display name to a live window_id, refusing ambiguity."""
+            candidates = live_by_name.get(name)
+            if not candidates:
+                return None
+            if len(candidates) > 1:
+                logger.warning(
+                    "ambiguous display name %s matches %d windows; "
+                    "dropping stale entry",
+                    name,
+                    len(candidates),
+                )
+                return None
+            return candidates[0]
 
         changed = False
 
@@ -260,7 +291,7 @@ class SessionManager:
                 else:
                     # Stale ID — try re-resolve by display name
                     display = self.window_display_names.get(key, ws.window_name or key)
-                    new_id = live_by_name.get(display)
+                    new_id = resolve_name(display)
                     if new_id:
                         logger.info(
                             "Re-resolved stale window_id %s -> %s (name=%s)",
@@ -280,7 +311,7 @@ class SessionManager:
                         changed = True
             else:
                 # Old format: key is window_name
-                new_id = live_by_name.get(key)
+                new_id = resolve_name(key)
                 if new_id:
                     logger.info("Migrating window_state key %s -> %s", key, new_id)
                     ws.window_name = key
@@ -303,7 +334,7 @@ class SessionManager:
                         new_bindings[tid] = val
                     else:
                         display = self.window_display_names.get(val, val)
-                        new_id = live_by_name.get(display)
+                        new_id = resolve_name(display)
                         if new_id:
                             logger.info(
                                 "Re-resolved thread binding %s -> %s (name=%s)",
@@ -324,7 +355,7 @@ class SessionManager:
                             changed = True
                 else:
                     # Old format: val is window_name
-                    new_id = live_by_name.get(val)
+                    new_id = resolve_name(val)
                     if new_id:
                         logger.info("Migrating thread binding %s -> %s", val, new_id)
                         new_bindings[tid] = new_id
@@ -354,14 +385,14 @@ class SessionManager:
                         new_offsets[key] = offset
                     else:
                         display = self.window_display_names.get(key, key)
-                        new_id = live_by_name.get(display)
+                        new_id = resolve_name(display)
                         if new_id:
                             new_offsets[new_id] = offset
                             changed = True
                         else:
                             changed = True
                 else:
-                    new_id = live_by_name.get(key)
+                    new_id = resolve_name(key)
                     if new_id:
                         new_offsets[new_id] = offset
                         changed = True
@@ -673,7 +704,29 @@ class SessionManager:
             if not new_sid:
                 continue
             state = self.get_window_state(window_id)
-            if state.session_id != new_sid or state.cwd != new_cwd:
+            if state.pinned_over is not None:
+                if new_sid == state.pinned_over:
+                    # Hook still reports the outranked sid — keep the manual
+                    # override in place, only sync display name below.
+                    pass
+                else:
+                    logger.info(
+                        "unpinning window %s: hook reports new session %s",
+                        window_id,
+                        new_sid,
+                    )
+                    state.pinned_over = None
+                    if state.session_id != new_sid or state.cwd != new_cwd:
+                        logger.info(
+                            "Session map: window_id %s updated sid=%s, cwd=%s",
+                            window_id,
+                            new_sid,
+                            new_cwd,
+                        )
+                        state.session_id = new_sid
+                        state.cwd = new_cwd
+                    changed = True
+            elif state.session_id != new_sid or state.cwd != new_cwd:
                 logger.info(
                     "Session map: window_id %s updated sid=%s, cwd=%s",
                     window_id,
@@ -690,8 +743,15 @@ class SessionManager:
                     self.window_display_names[window_id] = new_wname
                     changed = True
 
-        # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
+        # Clean up window_states entries not in current session_map. Pinned
+        # entries (manual override / hook-timeout recovery) may legitimately
+        # have no session_map entry yet — keep them; resolve_stale_ids' live
+        # tmux-window check still drops truly dead windows at startup.
+        stale_wids = [
+            w
+            for w, ws in self.window_states.items()
+            if w and w not in valid_wids and ws.pinned_over is None
+        ]
         for wid in stale_wids:
             logger.info("Removing stale window_state: %s", wid)
             del self.window_states[wid]
@@ -712,6 +772,7 @@ class SessionManager:
         """Clear session association for a window (e.g., after /clear command)."""
         state = self.get_window_state(window_id)
         state.session_id = ""
+        state.pinned_over = None
         self._save_state()
         logger.info("Cleared session for window_id %s", window_id)
 
@@ -894,15 +955,45 @@ class SessionManager:
 
     def bind_thread(
         self, user_id: int, thread_id: int, window_id: str, window_name: str = ""
-    ) -> None:
+    ) -> bool:
         """Bind a Telegram topic thread to a tmux window.
+
+        Enforces the '1 topic = 1 window' invariant at the source: a
+        window_id already bound to a DIFFERENT (user_id, thread_id) pair is
+        refused rather than silently double-bound (RC3/RC4 — without this,
+        two topics can end up routed to the same tmux window/session, so
+        Claude's replies bleed into both and either topic's input lands in
+        the shared session). Re-binding the SAME (user_id, thread_id) to the
+        same window_id (e.g. re-confirming an existing binding) stays
+        allowed and idempotent.
 
         Args:
             user_id: Telegram user ID
             thread_id: Telegram topic thread ID
             window_id: Tmux window ID (e.g. '@0')
             window_name: Display name for the window (optional)
+
+        Returns:
+            True if the binding was made. False if window_id is already
+            bound to a different (user_id, thread_id) pair — the caller must
+            treat the topic as NOT bound in that case.
         """
+        for bound_user, bound_thread, bound_window in self.iter_thread_bindings():
+            if bound_window == window_id and (bound_user, bound_thread) != (
+                user_id,
+                thread_id,
+            ):
+                logger.warning(
+                    "Refusing to bind thread %d (user %d) to window_id %s: "
+                    "already bound to thread %d (user %d)",
+                    thread_id,
+                    user_id,
+                    window_id,
+                    bound_thread,
+                    bound_user,
+                )
+                return False
+
         if user_id not in self.thread_bindings:
             self.thread_bindings[user_id] = {}
         self.thread_bindings[user_id][thread_id] = window_id
@@ -917,6 +1008,7 @@ class SessionManager:
             display,
             user_id,
         )
+        return True
 
     def unbind_thread(self, user_id: int, thread_id: int) -> str | None:
         """Remove a thread binding. Returns the previously bound window_id, or None."""
