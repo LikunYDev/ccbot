@@ -363,3 +363,237 @@ class TestDrainQueues:
             finally:
                 for w in list(mq._queue_workers.values()):
                     w.cancel()
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestContentRetryAndFailureNotice:
+    """Deliver-or-loudly-drop: RetryAfter retries a content/interactive_ui
+    task in place (bounded), and a content task that is ultimately dropped
+    gets a best-effort user-visible notice instead of vanishing silently."""
+
+    @pytest.mark.asyncio
+    async def test_retries_retryafter_in_place_then_succeeds_fifo_preserved(self):
+        """A single RetryAfter is retried in place and delivers exactly one
+        message. A second task enqueued only after the retry has begun must
+        still be processed strictly after the first — FIFO is preserved."""
+        import asyncio
+
+        from telegram.error import RetryAfter
+
+        from ccbot.handlers.message_queue import (
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        sent: list[str] = []
+        call_count = 0
+        first_attempt_started = asyncio.Event()
+
+        async def fake_send(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                first_attempt_started.set()
+                raise RetryAfter(retry_after=0)
+            text = args[2]
+            sent.append(text)
+            m = MagicMock()
+            m.message_id = 1
+            return m
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=fake_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["hello1"],
+                content_type="text",
+                thread_id=42,
+            )
+            # Wait until the first send attempt has actually happened (and
+            # raised) before enqueuing the second task, so the two are never
+            # merged and the second genuinely arrives "after".
+            await asyncio.wait_for(first_attempt_started.wait(), timeout=5.0)
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["hello2"],
+                content_type="text",
+                thread_id=42,
+            )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert sent == ["hello1", "hello2"]
+        assert call_count == 3  # hello1 fails once then succeeds, then hello2
+        bot.send_message.assert_not_called()  # no failure notice — it delivered
+
+    @pytest.mark.asyncio
+    async def test_drops_content_after_max_retries_with_error_log_and_notice(
+        self, caplog
+    ):
+        """A send that always raises RetryAfter is retried up to the cap,
+        then dropped with an error log and a best-effort failure notice."""
+        import asyncio
+        import logging
+
+        from telegram.error import RetryAfter
+
+        from ccbot.handlers.message_queue import (
+            DELIVERY_FAILURE_NOTICE,
+            MAX_CONTENT_RETRY_ATTEMPTS,
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        call_count = 0
+
+        async def always_fail(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise RetryAfter(retry_after=0)
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=always_fail),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            with caplog.at_level(logging.ERROR, logger="ccbot.handlers.message_queue"):
+                await enqueue_content_message(
+                    bot,
+                    user_id=7,
+                    window_id="@5",
+                    parts=["hello"],
+                    content_type="text",
+                    thread_id=42,
+                )
+                await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert call_count == MAX_CONTENT_RETRY_ATTEMPTS
+        assert any(
+            "Giving up on content task" in record.message for record in caplog.records
+        )
+        bot.send_message.assert_awaited_once_with(
+            chat_id=100,
+            text=DELIVERY_FAILURE_NOTICE,
+            message_thread_id=42,
+        )
+
+    @pytest.mark.asyncio
+    async def test_merged_batch_survives_transient_retryafter(self):
+        """Three mergeable content tasks folded into one send: a RetryAfter
+        on the first attempt must not discard the merged batch — join()
+        completes and every part is actually delivered."""
+        import asyncio
+
+        from telegram.error import RetryAfter
+
+        from ccbot.handlers.message_queue import (
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        sent: list[str] = []
+        call_count = 0
+
+        async def fake_send(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RetryAfter(retry_after=0)
+            text = args[2]
+            sent.append(text)
+            m = MagicMock()
+            m.message_id = 1
+            return m
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=fake_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            for i in range(3):
+                await enqueue_content_message(
+                    bot,
+                    user_id=7,
+                    window_id="@5",
+                    parts=[f"part{i}"],
+                    content_type="text",
+                    thread_id=42,
+                )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert sent == ["part0", "part1", "part2"]
+        assert queue.qsize() == 0
+        bot.send_message.assert_not_called()  # delivered — no failure notice
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_on_content_notifies_and_worker_continues(self):
+        """A non-RetryAfter Exception on a content send is dropped with a
+        failure notice, and the worker keeps processing the next task."""
+        import asyncio
+
+        from ccbot.handlers.message_queue import (
+            DELIVERY_FAILURE_NOTICE,
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        attempted: list[str] = []
+
+        async def flaky_send(*args, **kwargs):
+            text = args[2]
+            attempted.append(text)
+            if text == "boom":
+                raise ValueError("kaboom")
+            m = MagicMock()
+            m.message_id = 1
+            return m
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=flaky_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            # Different window_ids so the two tasks are never merged — this
+            # pins "worker continues with the next task" as a separate task.
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["boom"],
+                content_type="text",
+                thread_id=42,
+            )
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@6",
+                parts=["ok"],
+                content_type="text",
+                thread_id=42,
+            )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert attempted == ["boom", "ok"]
+        bot.send_message.assert_awaited_once_with(
+            chat_id=100,
+            text=DELIVERY_FAILURE_NOTICE,
+            message_thread_id=42,
+        )

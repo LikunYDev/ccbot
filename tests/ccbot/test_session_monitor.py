@@ -8,7 +8,7 @@ import pytest
 from ccbot.config import config
 from ccbot.monitor_state import TrackedSession
 from ccbot.session import WindowState, session_manager
-from ccbot.session_monitor import NewMessage, SessionMonitor
+from ccbot.session_monitor import NewMessage, SessionInfo, SessionMonitor
 
 
 class TestReadNewLinesOffsetRecovery:
@@ -357,9 +357,354 @@ class TestSessionMapFromWindowStates:
         assert monitor.state.get_session("stale") is None
 
 
+class TestScanProjectsFallbackRecovery:
+    """scan_projects() gates every session on its recorded project path
+    matching a live tmux window's CURRENT cwd. If the project directory is
+    renamed/moved after the session started (or the sessions-index path
+    drifts), scan_projects silently drops the session from every future
+    scan, forever, with no log — check_for_updates must recover it instead
+    (review f59/RC27).
+    """
+
+    @pytest.fixture
+    def monitor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.fixture(autouse=True)
+    def _isolate_window_states(self):
+        """Snapshot/restore the singleton's window_states around each test
+        to avoid cross-test pollution."""
+        original = session_manager.window_states
+        session_manager.window_states = {}
+        yield
+        session_manager.window_states = original
+
+    @pytest.mark.asyncio
+    async def test_tracked_session_with_existing_file_is_still_read(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """(a) Already tracked with a file that still exists on disk: the
+        session is recovered directly from the tracked record — the cwd
+        gate is irrelevant since the file location is already known."""
+        jsonl_file = tmp_path / "moved-sid.jsonl"
+        entry = make_jsonl_entry(msg_type="assistant", content="hello from moved dir")
+        jsonl_file.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="moved-sid",
+                file_path=str(jsonl_file),
+                last_byte_offset=0,
+            )
+        )
+
+        async def fake_scan_projects():
+            # Project dir renamed/moved: no active tmux cwd matches it
+            # anymore, so the normal scan can no longer find this session.
+            return []
+
+        monitor.scan_projects = fake_scan_projects  # type: ignore[method-assign]
+
+        messages, commits = await monitor.check_for_updates({"moved-sid"})
+
+        assert [m.text for m in messages] == ["hello from moved dir"]
+        assert "moved-sid" in commits
+
+    @pytest.mark.asyncio
+    async def test_untracked_session_recovered_via_fallback_glob(
+        self, monitor, tmp_path, make_jsonl_entry, caplog
+    ):
+        """(b) Not tracked at all: recovered via a one-level glob under the
+        projects root for `*/<session_id>.jsonl`, and the recovery is
+        logged as a warning since this failure mode is otherwise silent
+        and permanent."""
+        project_dir = tmp_path / "projects" / "-renamed-project-dir"
+        project_dir.mkdir(parents=True)
+        jsonl_file = project_dir / "glob-sid.jsonl"
+        entry = make_jsonl_entry(msg_type="assistant", content="hello via glob")
+        jsonl_file.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+        async def fake_scan_projects():
+            return []
+
+        monitor.scan_projects = fake_scan_projects  # type: ignore[method-assign]
+
+        with caplog.at_level("WARNING"):
+            messages, commits = await monitor.check_for_updates({"glob-sid"})
+
+        # A brand-new (untracked) session's first poll only seeds tracking
+        # at EOF (existing behavior); it starts reading from there on the
+        # next cycle — see TestNewSessionOffsetSeeding.
+        assert messages == []
+        assert commits == {}
+        assert monitor.state.get_session("glob-sid") is not None
+        assert any(
+            "fallback glob" in record.getMessage() and "glob-sid" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_glob_miss_is_cached_and_not_retried_immediately(
+        self, monitor, tmp_path
+    ):
+        """A session_id that is neither tracked nor found by the glob is
+        cached for 60s so a truly-gone session isn't re-globbed every poll."""
+
+        async def fake_scan_projects():
+            return []
+
+        monitor.scan_projects = fake_scan_projects  # type: ignore[method-assign]
+
+        messages, commits = await monitor.check_for_updates({"gone-sid"})
+        assert messages == []
+        assert commits == {}
+        assert "gone-sid" in monitor._glob_miss_until
+
+        # Materializing the file after the miss was cached must not be
+        # picked up until the TTL elapses (glob is skipped entirely).
+        project_dir = tmp_path / "projects" / "-late-project-dir"
+        project_dir.mkdir(parents=True)
+        (project_dir / "gone-sid.jsonl").write_text("", encoding="utf-8")
+
+        messages, commits = await monitor.check_for_updates({"gone-sid"})
+        assert monitor.state.get_session("gone-sid") is None
+
+
+class TestNewSessionOffsetSeeding:
+    """Regression for f17/RC38: seeding a newly-noticed session's offset at
+    current EOF silently skips a reply that landed in the transcript before
+    the monitor's first poll (or before it ever noticed the session — e.g.
+    monitor_state was lost). The hook records the transcript size at
+    SessionStart (WindowState.session_start_size); check_for_updates must
+    seed from there instead so that reply is still delivered.
+    """
+
+    @pytest.fixture
+    def monitor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.fixture(autouse=True)
+    def _isolate_window_states(self):
+        """Snapshot/restore the singleton's window_states around each test
+        to avoid cross-test pollution."""
+        original = session_manager.window_states
+        session_manager.window_states = {}
+        yield
+        session_manager.window_states = original
+
+    @pytest.mark.asyncio
+    async def test_first_poll_delivers_reply_already_beyond_start_size(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        jsonl_file = tmp_path / "new-sid.jsonl"
+        preamble = make_jsonl_entry(msg_type="assistant", content="before start")
+        jsonl_file.write_text(json.dumps(preamble) + "\n", encoding="utf-8")
+        start_size = jsonl_file.stat().st_size
+
+        # The reply lands before the monitor ever polls this session.
+        reply = make_jsonl_entry(msg_type="assistant", content="fast reply")
+        with jsonl_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(reply) + "\n")
+
+        session_manager.window_states = {
+            "@1": WindowState(session_id="new-sid", session_start_size=start_size),
+        }
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id="new-sid", file_path=jsonl_file)]
+
+        monitor.scan_projects = fake_scan_projects  # type: ignore[method-assign]
+
+        # First call only starts tracking (seeds the offset); it never reads
+        # in the same cycle it starts tracking a session.
+        messages, commits = await monitor.check_for_updates({"new-sid"})
+        assert messages == []
+        assert commits == {}
+        assert monitor.state.get_session("new-sid").last_byte_offset == start_size
+
+        # Next poll cycle reads from the seeded offset (start_size), not
+        # from EOF (which would have skipped the reply too).
+        messages, commits = await monitor.check_for_updates({"new-sid"})
+        assert [m.text for m in messages] == ["fast reply"]
+        assert "new-sid" in commits
+
+    @pytest.mark.asyncio
+    async def test_unknown_start_size_still_seeds_at_eof(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """No matching window_state (or session_start_size == -1) preserves
+        the prior default behavior: seed at current EOF."""
+        jsonl_file = tmp_path / "new-sid.jsonl"
+        preamble = make_jsonl_entry(msg_type="assistant", content="already there")
+        jsonl_file.write_text(json.dumps(preamble) + "\n", encoding="utf-8")
+
+        session_manager.window_states = {
+            "@1": WindowState(session_id="new-sid"),  # session_start_size == -1
+        }
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id="new-sid", file_path=jsonl_file)]
+
+        monitor.scan_projects = fake_scan_projects  # type: ignore[method-assign]
+
+        messages, commits = await monitor.check_for_updates({"new-sid"})
+
+        assert messages == []
+        assert commits == {}
+        assert monitor.state.get_session("new-sid").last_byte_offset == (
+            jsonl_file.stat().st_size
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_size_beyond_current_file_size_is_clamped(
+        self, monitor, tmp_path
+    ):
+        """A start_size larger than the file's current size (e.g. the file
+        was truncated/replaced) must not seed an offset past EOF."""
+        jsonl_file = tmp_path / "new-sid.jsonl"
+        jsonl_file.write_text("", encoding="utf-8")
+
+        session_manager.window_states = {
+            "@1": WindowState(session_id="new-sid", session_start_size=999),
+        }
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id="new-sid", file_path=jsonl_file)]
+
+        monitor.scan_projects = fake_scan_projects  # type: ignore[method-assign]
+
+        await monitor.check_for_updates({"new-sid"})
+
+        assert monitor.state.get_session("new-sid").last_byte_offset == 0
+
+
+class TestFinalDrainOnSessionChange:
+    """Trailing unread lines in the OLD jsonl are delivered before its
+    tracking is removed when a window's session_id changes underneath it
+    (/clear, resume) — review f50/RC23.
+
+    Before this fix, `_detect_and_cleanup_changes` removed the old
+    session's tracking the instant it observed the session_id flip,
+    without checking whether any lines had been appended to the old file
+    since the last read — silently losing them forever.
+    """
+
+    @pytest.fixture
+    def monitor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.fixture(autouse=True)
+    def _isolate_window_states(self):
+        """Snapshot/restore the singleton's window_states around each test
+        to avoid cross-test pollution."""
+        original = session_manager.window_states
+        session_manager.window_states = {}
+        yield
+        session_manager.window_states = original
+
+    @pytest.mark.asyncio
+    async def test_drains_trailing_lines_before_removing_old_session(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        old_file = tmp_path / "old-sid.jsonl"
+        already_read = make_jsonl_entry(msg_type="assistant", content="already read")
+        old_file.write_text(json.dumps(already_read) + "\n", encoding="utf-8")
+
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="old-sid",
+                file_path=str(old_file),
+                last_byte_offset=old_file.stat().st_size,
+            )
+        )
+
+        # A trailing line lands after the last read but before the window's
+        # session_id flips (e.g. /clear racing the final write).
+        trailing = make_jsonl_entry(msg_type="assistant", content="trailing unread")
+        with old_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(trailing) + "\n")
+
+        delivered: list[NewMessage] = []
+
+        async def on_message(msg: NewMessage) -> None:
+            delivered.append(msg)
+
+        monitor.set_message_callback(on_message)
+
+        # Poll cycle N: window @1 -> old-sid.
+        session_manager.window_states = {"@1": WindowState(session_id="old-sid")}
+        monitor._last_session_map = await monitor._load_current_session_map()
+
+        # Poll cycle N+1: window @1 -> new-sid (e.g. after /clear).
+        session_manager.window_states = {"@1": WindowState(session_id="new-sid")}
+
+        current_map = await monitor._detect_and_cleanup_changes()
+
+        assert current_map == {"@1": "new-sid"}
+        # The trailing line was delivered...
+        assert [m.text for m in delivered] == ["trailing unread"]
+        # ...strictly before tracking was torn down.
+        assert monitor.state.get_session("old-sid") is None
+
+    @pytest.mark.asyncio
+    async def test_drains_trailing_lines_before_removing_deleted_window_session(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """Same guarantee for the window-deleted path, not just the
+        session-changed path."""
+        old_file = tmp_path / "old-sid.jsonl"
+        old_file.write_text("", encoding="utf-8")
+
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="old-sid",
+                file_path=str(old_file),
+                last_byte_offset=0,
+            )
+        )
+
+        trailing = make_jsonl_entry(msg_type="assistant", content="final words")
+        with old_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(trailing) + "\n")
+
+        delivered: list[NewMessage] = []
+
+        async def on_message(msg: NewMessage) -> None:
+            delivered.append(msg)
+
+        monitor.set_message_callback(on_message)
+
+        # Poll cycle N: window @1 exists, bound to old-sid.
+        session_manager.window_states = {"@1": WindowState(session_id="old-sid")}
+        monitor._last_session_map = await monitor._load_current_session_map()
+
+        # Poll cycle N+1: window @1 is gone entirely (topic/window closed).
+        session_manager.window_states = {}
+
+        current_map = await monitor._detect_and_cleanup_changes()
+
+        assert current_map == {}
+        assert [m.text for m in delivered] == ["final words"]
+        assert monitor.state.get_session("old-sid") is None
+
+
 class TestDrainCallbacks:
-    """Graceful shutdown delivers in-flight dispatch tasks (offsets advance on
-    read, so undelivered reads would otherwise be lost on restart)."""
+    """Graceful shutdown delivers in-flight dispatch tasks. Offsets now
+    advance on delivery ACK rather than on read, so this is no longer
+    required to prevent loss — but draining still avoids needlessly
+    redelivering already-read messages after a restart."""
 
     @pytest.fixture
     def monitor(self, tmp_path):
@@ -401,3 +746,163 @@ class TestDrainCallbacks:
             await monitor.drain_callbacks(timeout=0.05)  # returns despite the hang
         finally:
             task.cancel()
+
+
+class TestDeliveryCommitContract:
+    """Offsets commit only after a batch is durably delivered (f18/RC7).
+
+    `check_for_updates` reverts the in-memory offset for any session that
+    produced messages and hands the advance back via its pending-commits
+    dict; `_dispatch_and_commit` is the only thing that actually persists
+    it, and only once `_dispatch_session_messages` reports every callback
+    succeeded. This is at-least-once delivery: a failure re-reads and
+    re-dispatches the identical batch next cycle instead of losing it.
+    """
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.fixture
+    def session_file(self, tmp_path, monitor):
+        """A tracked session backed by a real (initially empty) JSONL file."""
+        jsonl_file = tmp_path / "s1.jsonl"
+        jsonl_file.write_text("", encoding="utf-8")
+
+        async def fake_scan_projects() -> list[SessionInfo]:
+            return [SessionInfo(session_id="s1", file_path=jsonl_file)]
+
+        monitor.scan_projects = fake_scan_projects  # type: ignore[method-assign]
+        return jsonl_file
+
+    async def _seed_and_append(self, monitor, session_file, make_jsonl_entry, text):
+        """Start tracking (offset seeded to EOF), then append one assistant entry."""
+        # First call just seeds tracking at end-of-file (no pre-existing content).
+        messages, commits = await monitor.check_for_updates({"s1"})
+        assert messages == []
+        assert commits == {}
+
+        entry = make_jsonl_entry(msg_type="assistant", content=text)
+        with session_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    @pytest.mark.asyncio
+    async def test_failed_callback_does_not_persist_offset_and_is_redelivered(
+        self, monitor, session_file, make_jsonl_entry
+    ):
+        await self._seed_and_append(monitor, session_file, make_jsonl_entry, "hello")
+
+        messages, commits = await monitor.check_for_updates({"s1"})
+        assert [m.text for m in messages] == ["hello"]
+        assert "s1" in commits
+
+        async def raising_callback(_msg: NewMessage) -> None:
+            raise RuntimeError("boom")
+
+        monitor.set_message_callback(raising_callback)
+        await monitor._dispatch_and_commit("s1", messages, commits["s1"])
+
+        # Offset was NOT advanced past the undelivered batch.
+        assert monitor.state.get_session("s1").last_byte_offset == 0
+        assert "s1" not in monitor._inflight
+
+        # Next cycle re-reads and re-emits the identical message.
+        messages2, commits2 = await monitor.check_for_updates({"s1"})
+        assert [m.text for m in messages2] == ["hello"]
+        assert "s1" in commits2
+
+    @pytest.mark.asyncio
+    async def test_successful_callback_persists_offset_and_is_not_reread(
+        self, monitor, session_file, make_jsonl_entry
+    ):
+        await self._seed_and_append(monitor, session_file, make_jsonl_entry, "hello")
+
+        messages, commits = await monitor.check_for_updates({"s1"})
+        assert len(messages) == 1
+
+        delivered: list[NewMessage] = []
+
+        async def ok_callback(msg: NewMessage) -> None:
+            delivered.append(msg)
+
+        monitor.set_message_callback(ok_callback)
+        await monitor._dispatch_and_commit("s1", messages, commits["s1"])
+
+        assert [m.text for m in delivered] == ["hello"]
+        expected_offset = session_file.stat().st_size
+        assert monitor.state.get_session("s1").last_byte_offset == expected_offset
+        assert "s1" not in monitor._inflight
+        assert monitor._delivery_failures.get("s1") is None
+
+        # No new content and offset already at EOF: nothing to re-read.
+        messages2, commits2 = await monitor.check_for_updates({"s1"})
+        assert messages2 == []
+        assert commits2 == {}
+
+    @pytest.mark.asyncio
+    async def test_three_failures_drop_batch_and_advance_offset(
+        self, monitor, session_file, make_jsonl_entry, caplog
+    ):
+        await self._seed_and_append(monitor, session_file, make_jsonl_entry, "hello")
+        expected_offset = session_file.stat().st_size
+
+        async def raising_callback(_msg: NewMessage) -> None:
+            raise RuntimeError("boom")
+
+        monitor.set_message_callback(raising_callback)
+
+        for attempt in range(1, 4):
+            messages, commits = await monitor.check_for_updates({"s1"})
+            assert [m.text for m in messages] == ["hello"], f"attempt {attempt}"
+            with caplog.at_level("ERROR"):
+                await monitor._dispatch_and_commit("s1", messages, commits["s1"])
+
+        # After the 3rd failure the batch is dropped: offset committed anyway,
+        # the failure counter reset, and the drop logged.
+        assert monitor.state.get_session("s1").last_byte_offset == expected_offset
+        assert monitor._delivery_failures.get("s1") is None
+        assert any(
+            "Dropping" in record.getMessage() and "s1" in record.getMessage()
+            for record in caplog.records
+        )
+
+        # The dropped batch is gone for good: nothing left to re-read.
+        messages, commits = await monitor.check_for_updates({"s1"})
+        assert messages == []
+        assert commits == {}
+
+    @pytest.mark.asyncio
+    async def test_inflight_session_is_not_reread_until_settled(
+        self, monitor, session_file, make_jsonl_entry
+    ):
+        await self._seed_and_append(monitor, session_file, make_jsonl_entry, "hello")
+
+        messages, commits = await monitor.check_for_updates({"s1"})
+        assert len(messages) == 1
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stalling_callback(_msg: NewMessage) -> None:
+            started.set()
+            await release.wait()
+
+        monitor.set_message_callback(stalling_callback)
+        task = asyncio.create_task(
+            monitor._dispatch_and_commit("s1", messages, commits["s1"])
+        )
+        await started.wait()
+        assert "s1" in monitor._inflight
+
+        # A poll cycle that lands while the batch is still in flight must not
+        # re-read (and re-emit) it — nor race a second dispatch task for it.
+        messages2, commits2 = await monitor.check_for_updates({"s1"})
+        assert messages2 == []
+        assert "s1" not in commits2
+
+        release.set()
+        await task
+        assert "s1" not in monitor._inflight

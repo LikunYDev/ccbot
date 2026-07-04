@@ -68,6 +68,41 @@ class TestThreadBindings:
         assert mgr.get_display_name("@1") == "renamed"
 
 
+class TestFindUsersForSessionConcurrentUnbind:
+    """Regression (f45/RC7): `find_users_for_session` used to iterate
+    `self.iter_thread_bindings()` directly while awaiting inside the loop.
+    A concurrent unbind mutating `thread_bindings` mid-iteration raised
+    RuntimeError ("dictionary changed size during iteration"), which the
+    dispatch path swallowed, silently dropping the message. Materializing
+    the bindings into a list first (as status_polling.py already does)
+    must survive the same race.
+    """
+
+    @pytest.mark.asyncio
+    async def test_survives_unbind_during_iteration(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1")
+        mgr.bind_thread(200, 2, "@2")
+
+        async def fake_resolve_session_for_window(window_id: str):
+            if window_id == "@1":
+                # Simulate a concurrent unbind racing this await — removing
+                # user 200's only binding also deletes their key from the
+                # outer thread_bindings dict (unbind_thread), which is the
+                # exact mutation that crashes a live (non-materialized)
+                # iterator over it.
+                mgr.unbind_thread(200, 2)
+            return None
+
+        mgr.resolve_session_for_window = fake_resolve_session_for_window  # type: ignore[method-assign]
+
+        # Must complete without raising RuntimeError.
+        result = await mgr.find_users_for_session("some-session")
+
+        assert result == []
+        # The race actually happened (sanity check the test reproduces it).
+        assert mgr.get_window_for_thread(200, 2) is None
+
+
 class TestGroupChatId:
     """Tests for group chat_id routing (supergroup forum topic support).
 
@@ -478,6 +513,128 @@ class TestGroupedSessionMapHandling:
         assert mgr.get_window_state("@7").session_id == "sid-peer"
 
 
+class TestLoadSessionMapStartSize:
+    """load_session_map propagates the hook's transcript_size_at_start into
+    WindowState.session_start_size for the monitor to seed offsets from
+    (f17/RC38) — but only when applying a new session_id/cwd to an unpinned
+    window."""
+
+    @pytest.mark.asyncio
+    async def test_new_session_propagates_start_size(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@5": {
+                        "session_id": "sid-1",
+                        "cwd": "/one",
+                        "transcript_size_at_start": 4096,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot"}),
+        )
+
+        await mgr.load_session_map()
+
+        assert mgr.get_window_state("@5").session_start_size == 4096
+
+    @pytest.mark.asyncio
+    async def test_missing_start_size_defaults_to_unknown(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """An older hook (or entry predating this field) has no
+        transcript_size_at_start — session_start_size must fall back to -1
+        (unknown), not some other value that would wrongly seed an offset."""
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps({"ccbot:@5": {"session_id": "sid-1", "cwd": "/one"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot"}),
+        )
+
+        await mgr.load_session_map()
+
+        assert mgr.get_window_state("@5").session_start_size == -1
+
+    @pytest.mark.asyncio
+    async def test_non_int_start_size_defaults_to_unknown(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@5": {
+                        "session_id": "sid-1",
+                        "cwd": "/one",
+                        "transcript_size_at_start": "not-a-number",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot"}),
+        )
+
+        await mgr.load_session_map()
+
+        assert mgr.get_window_state("@5").session_start_size == -1
+
+    @pytest.mark.asyncio
+    async def test_pinned_window_unaffected_by_start_size(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """A pinned window (resume override) skips the hook-sync sid/cwd
+        update entirely, so its session_start_size must stay untouched too —
+        it does not belong to the session the hook is reporting."""
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@5": {
+                        "session_id": "hook-sid",
+                        "cwd": "/hook-cwd",
+                        "transcript_size_at_start": 999,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_group_session_names",
+            AsyncMock(return_value={"ccbot"}),
+        )
+        state = mgr.get_window_state("@5")
+        state.session_id = "resume-sid"
+        state.cwd = "/resume-cwd"
+        state.pinned_over = "hook-sid"
+        state.session_start_size = 42
+
+        await mgr.load_session_map()
+
+        assert mgr.get_window_state("@5").session_start_size == 42
+
+
 class TestResolveStaleIdsAmbiguousNames:
     """resolve_stale_ids must refuse to remap a stale entry when its display
     name matches more than one live window (RC3/RC4/f14/f36/f46) — silently
@@ -826,6 +983,28 @@ class TestWindowStateSerialization:
 
         ws = WindowState.from_dict({"session_id": "sid", "cwd": "/x"})
         assert ws.pinned_over is None
+
+    def test_to_dict_omits_session_start_size_when_unknown(self) -> None:
+        from ccbot.session import WindowState
+
+        ws = WindowState(session_id="sid", cwd="/x")
+        assert "session_start_size" not in ws.to_dict()
+
+    def test_session_start_size_round_trips(self) -> None:
+        from ccbot.session import WindowState
+
+        for value in (0, 4096):
+            ws = WindowState(session_id="sid", cwd="/x", session_start_size=value)
+            d = ws.to_dict()
+            assert d["session_start_size"] == value
+            assert WindowState.from_dict(d).session_start_size == value
+
+    def test_from_dict_missing_session_start_size_defaults_unknown(self) -> None:
+        # Existing on-disk state.json files predate this field.
+        from ccbot.session import WindowState
+
+        ws = WindowState.from_dict({"session_id": "sid", "cwd": "/x"})
+        assert ws.session_start_size == -1
 
 
 class TestSetClaudeLaunchVersion:

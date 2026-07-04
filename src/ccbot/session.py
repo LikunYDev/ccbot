@@ -69,6 +69,13 @@ class WindowState:
             /clear) unpins and is accepted normally. An empty string pins
             over nothing, so any future hook entry with a non-empty
             session_id unpins it.
+        session_start_size: The session's transcript file size at the
+            SessionStart moment the hook recorded it, or -1 if unknown (old
+            session_map entry predating this field, or a non-int value on
+            disk). Lets the monitor seed a newly-noticed session's read
+            offset at start-of-session instead of current EOF, so a reply
+            that landed before the monitor ever polled it is not silently
+            skipped (review f17/RC38).
     """
 
     session_id: str = ""
@@ -78,6 +85,7 @@ class WindowState:
     update_notified_version: str = ""
     failure_notified: bool = False
     pinned_over: str | None = None
+    session_start_size: int = -1
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -94,6 +102,8 @@ class WindowState:
             d["failure_notified"] = self.failure_notified
         if self.pinned_over is not None:
             d["pinned_over"] = self.pinned_over
+        if self.session_start_size >= 0:
+            d["session_start_size"] = self.session_start_size
         return d
 
     @classmethod
@@ -106,6 +116,7 @@ class WindowState:
             update_notified_version=data.get("update_notified_version", ""),
             failure_notified=data.get("failure_notified", False),
             pinned_over=data.get("pinned_over"),
+            session_start_size=data.get("session_start_size", -1),
         )
 
 
@@ -679,6 +690,9 @@ class SessionManager:
         Accepts entries under our tmux_session_name or any grouped peer session.
         Also cleans up window_states entries not in current session_map.
         Updates window_display_names from the "window_name" field in values.
+        When a new session_id is applied to an unpinned window, also records
+        the hook's "transcript_size_at_start" as WindowState.session_start_size
+        for the session monitor to seed its read offset from.
         """
         if not config.session_map_file.exists():
             return
@@ -735,6 +749,13 @@ class SessionManager:
                 )
                 state.session_id = new_sid
                 state.cwd = new_cwd
+                raw_start_size = info.get("transcript_size_at_start", -1)
+                state.session_start_size = (
+                    raw_start_size
+                    if isinstance(raw_start_size, int)
+                    and not isinstance(raw_start_size, bool)
+                    else -1
+                )
                 changed = True
             # Update display name
             if new_wname:
@@ -1066,7 +1087,11 @@ class SessionManager:
         Returns list of (user_id, window_id, thread_id) tuples.
         """
         result: list[tuple[int, str, int]] = []
-        for user_id, thread_id, window_id in self.iter_thread_bindings():
+        # Materialize before awaiting inside the loop: a concurrent unbind
+        # mutating thread_bindings mid-iteration would otherwise raise
+        # RuntimeError (dict changed size during iteration), which the
+        # dispatch path swallows, silently dropping the message (RC7/f45).
+        for user_id, thread_id, window_id in list(self.iter_thread_bindings()):
             resolved = await self.resolve_session_for_window(window_id)
             if resolved and resolved.session_id == session_id:
                 result.append((user_id, window_id, thread_id))

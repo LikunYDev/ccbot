@@ -9,6 +9,27 @@ Provides a queue-based message processing system that ensures:
 
 Rate limiting is handled globally by AIORateLimiter on the Application.
 
+Queue semantics — deliver, or drop loudly:
+  - `content` and `interactive_ui` tasks are retried in place (the same
+    queued item, up to MAX_CONTENT_RETRY_ATTEMPTS attempts) when a send
+    raises RetryAfter, sleeping the required seconds between attempts.
+    Nothing else can run on this per-topic queue meanwhile, so FIFO order
+    is preserved. A long ban (retry_after > FLOOD_CONTROL_MAX_WAIT) still
+    records `_flood_until` so producers skip enqueuing new status updates
+    while banned.
+  - `status_update`/`status_clear` tasks are ephemeral: on RetryAfter they
+    are dropped (after waiting out a short ban) rather than retried, since
+    a fresh status will be enqueued again shortly.
+  - A `content` task that is ultimately dropped — retry attempts exhausted,
+    or a non-RetryAfter Exception — gets a best-effort plain-text failure
+    notice sent to the topic, so silence never means "delivered". Status
+    and interactive_ui tasks never get notices.
+  - `queue.task_done()` for tasks folded into a merged send (see
+    `_merge_content_tasks`) is only called once the merged send has fully
+    resolved (delivered, or finally dropped) — never before the send is
+    attempted — so `drain_queues()`'s `queue.join()` can't be fooled into
+    thinking a folded-in message was delivered when it was actually dropped.
+
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
   - get_or_create_queue: Get or create queue and worker for a user
@@ -84,6 +105,16 @@ _flood_until: dict[_QueueKey, float] = {}
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
+
+# Max in-place retry attempts for a content/interactive_ui task hitting
+# RetryAfter before it is dropped (with a loud log + user-visible notice).
+MAX_CONTENT_RETRY_ATTEMPTS = 5
+
+# Best-effort notice sent to the topic when a content message could not be
+# delivered after exhausting retries (or hit a non-RetryAfter Exception).
+DELIVERY_FAILURE_NOTICE = (
+    "⚠️ A message from Claude failed to deliver — check ccbot logs."
+)
 
 # Per-group-chat processing lock — serializes API calls across topic workers
 # sending to the same Telegram group to prevent rate limit bursts
@@ -231,6 +262,24 @@ async def _merge_content_tasks(
     )
 
 
+async def _notify_delivery_failure(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Best-effort plain-text notice that a content message was dropped.
+
+    Never raises — if even this fails, the error is already on the log from
+    the caller, and there's nothing more useful to do about a total send
+    failure.
+    """
+    try:
+        chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=DELIVERY_FAILURE_NOTICE,
+            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        )
+    except Exception:
+        pass
+
+
 async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
     """Process message tasks for a user+topic sequentially."""
     user_id, _thread_id = key
@@ -249,6 +298,8 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
     while True:
         try:
             task = await queue.get()
+            merge_count = 0
+            dropped = False
             try:
                 # Flood control: drop status, wait for content / interactive UI.
                 # interactive_ui must be waited (not dropped) so that
@@ -273,47 +324,83 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                     _flood_until.pop(key, None)
                     logger.info("Flood control lifted for %s", key)
 
-                async with group_lock:
-                    if task.task_type == "content":
-                        # Try to merge consecutive content tasks
-                        merged_task, merge_count = await _merge_content_tasks(
-                            queue, task, lock
-                        )
-                        if merge_count > 0:
-                            logger.debug("Merged %d tasks for %s", merge_count, key)
-                            # Mark merged tasks as done
-                            for _ in range(merge_count):
-                                queue.task_done()
-                        await _process_content_task(bot, user_id, merged_task)
-                    elif task.task_type == "status_update":
-                        await _process_status_update_task(bot, user_id, task)
-                    elif task.task_type == "status_clear":
-                        await _do_clear_status_message(
-                            bot, user_id, task.thread_id or 0
-                        )
-                    elif task.task_type == "interactive_ui":
-                        await _process_interactive_ui_task(bot, user_id, task)
-            except RetryAfter as e:
-                retry_secs = (
-                    e.retry_after
-                    if isinstance(e.retry_after, int)
-                    else int(e.retry_after.total_seconds())
-                )
-                if retry_secs > FLOOD_CONTROL_MAX_WAIT:
-                    _flood_until[key] = time.monotonic() + retry_secs
-                    logger.warning(
-                        "Flood control for %s: retry_after=%ds, "
-                        "pausing queue until ban expires",
-                        key,
-                        retry_secs,
+                # Merge consecutive content tasks once, up front. Retries
+                # below resend this same merged task in place rather than
+                # re-merging — anything enqueued during a retry sleep just
+                # stays queued for the next pop, preserving FIFO order.
+                work_task = task
+                if task.task_type == "content":
+                    work_task, merge_count = await _merge_content_tasks(
+                        queue, task, lock
                     )
-                else:
-                    logger.warning(
-                        "Flood control for %s: waiting %ds",
-                        key,
-                        retry_secs,
-                    )
-                    await asyncio.sleep(retry_secs)
+                    if merge_count > 0:
+                        logger.debug("Merged %d tasks for %s", merge_count, key)
+
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        async with group_lock:
+                            if task.task_type == "content":
+                                await _process_content_task(bot, user_id, work_task)
+                            elif task.task_type == "status_update":
+                                await _process_status_update_task(
+                                    bot, user_id, work_task
+                                )
+                            elif task.task_type == "status_clear":
+                                await _do_clear_status_message(
+                                    bot, user_id, work_task.thread_id or 0
+                                )
+                            elif task.task_type == "interactive_ui":
+                                await _process_interactive_ui_task(
+                                    bot, user_id, work_task
+                                )
+                        break  # sent successfully
+                    except RetryAfter as e:
+                        retry_secs = (
+                            e.retry_after
+                            if isinstance(e.retry_after, int)
+                            else int(e.retry_after.total_seconds())
+                        )
+                        long_ban = retry_secs > FLOOD_CONTROL_MAX_WAIT
+                        if long_ban:
+                            _flood_until[key] = time.monotonic() + retry_secs
+                            logger.warning(
+                                "Flood control for %s: retry_after=%ds, "
+                                "pausing queue until ban expires",
+                                key,
+                                retry_secs,
+                            )
+                        else:
+                            logger.warning(
+                                "Flood control for %s: waiting %ds",
+                                key,
+                                retry_secs,
+                            )
+
+                        if task.task_type not in ("content", "interactive_ui"):
+                            # Ephemeral: a fresh status will be enqueued again
+                            # shortly, so it's safe to drop instead of retry.
+                            if not long_ban:
+                                await asyncio.sleep(retry_secs)
+                            dropped = True
+                            break
+
+                        if attempt >= MAX_CONTENT_RETRY_ATTEMPTS:
+                            logger.error(
+                                "Giving up on %s task for %s (window %s) after "
+                                "%d attempts — repeated flood control",
+                                task.task_type,
+                                key,
+                                task.window_id,
+                                attempt,
+                            )
+                            dropped = True
+                            break
+
+                        # Retry the same task in place. Nothing else can run
+                        # on this queue meanwhile, so FIFO order holds.
+                        await asyncio.sleep(retry_secs)
             except Exception:
                 logger.exception(
                     "Error processing %s task for %s (window %s)",
@@ -321,8 +408,18 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                     key,
                     task.window_id,
                 )
+                dropped = True
             finally:
                 queue.task_done()
+                # Merged-in tasks are only marked done here — after processing
+                # has actually finished (success or final drop) — never before
+                # the send is attempted, so a mid-batch RetryAfter can't make
+                # drain_queues()'s queue.join() think folded-in messages were
+                # delivered when they were dropped.
+                for _ in range(merge_count):
+                    queue.task_done()
+                if dropped and task.task_type == "content":
+                    await _notify_delivery_failure(bot, user_id, task)
         except asyncio.CancelledError:
             logger.info("Message queue worker cancelled for %s", key)
             break

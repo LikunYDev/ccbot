@@ -385,6 +385,25 @@ class TestParseEntries:
         assert EXPQUOTE_END in result[0].text
         assert "reasoning here" in result[0].text
 
+    def test_sidechain_entry_is_skipped_but_sibling_is_not(
+        self, make_jsonl_entry, make_text_block
+    ):
+        """Task-tool sub-agent (sidechain) entries share the main
+        session's JSONL but are the sub-agent's own internal conversation
+        — they must never be surfaced as if they were the main
+        conversation."""
+        sidechain_entry = make_jsonl_entry(
+            "assistant", [make_text_block("sub-agent internal text")]
+        )
+        sidechain_entry["isSidechain"] = True
+        main_entry = make_jsonl_entry(
+            "assistant", [make_text_block("main conversation text")]
+        )
+
+        result, _pending = TranscriptParser.parse_entries([sidechain_entry, main_entry])
+
+        assert [e.text for e in result] == ["main conversation text"]
+
     def test_local_command_with_stdout(self, make_jsonl_entry, make_text_block):
         xml = (
             "<command-name>/status</command-name>"

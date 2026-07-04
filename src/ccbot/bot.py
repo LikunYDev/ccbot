@@ -2000,8 +2000,10 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Maintenance stopped")
 
     # Order matters: stop producers, flush queues, THEN cancel workers.
-    # 1. The session monitor enqueues already-read-but-unsent messages (offsets
-    #    advance on read, so these would be lost on the next start otherwise).
+    # 1. The session monitor enqueues already-read-but-undelivered messages.
+    #    Offsets now advance only on delivery ACK (see session_monitor's
+    #    delivery contract), so nothing is lost if we skip this — but
+    #    draining first avoids needlessly redelivering them next start.
     if session_monitor:
         await session_monitor.drain_callbacks()
         session_monitor.stop()

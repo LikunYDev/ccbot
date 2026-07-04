@@ -448,6 +448,12 @@ class TranscriptParser:
             pending_tools = dict(pending_tools)  # don't mutate caller's dict
 
         for data in entries:
+            # Task-tool sub-agent (sidechain) entries share the main
+            # session's JSONL but are that sub-agent's own internal
+            # conversation, not the main conversation — never surface them.
+            if data.get("isSidechain") is True:
+                continue
+
             msg_type = cls.get_message_type(data)
             if msg_type not in ("user", "assistant"):
                 continue
