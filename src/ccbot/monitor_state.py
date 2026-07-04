@@ -2,7 +2,10 @@
 
 Persists TrackedSession records (session_id, file_path, last_byte_offset)
 to ~/.ccbot/monitor_state.json so the session monitor can resume
-incremental reading after restarts without re-sending old messages.
+incremental reading after restarts without re-sending old messages. Entries
+with a corrupt or missing session_id/file_path/last_byte_offset are skipped
+on load (with a warning) rather than silently defaulted, so a state-file
+glitch cannot replay a session's entire history into its topic.
 
 Key classes: MonitorState, TrackedSession.
 """
@@ -50,6 +53,32 @@ class MonitorState:
     tracked_sessions: dict[str, TrackedSession] = field(default_factory=dict)
     _dirty: bool = field(default=False, repr=False)
 
+    @staticmethod
+    def _is_valid_entry(entry: Any) -> bool:
+        """Reject a persisted tracked_sessions entry with a corrupt/missing
+        session_id, file_path, or last_byte_offset.
+
+        `TrackedSession.from_dict` uses permissive `.get(..., default)`
+        lookups, so a glitched state file (e.g. a partial write, or a
+        hand-edit gone wrong) silently defaults last_byte_offset to 0 —
+        replaying that session's entire history into its topic on the next
+        poll (f49/RC22). Skipping the entry here instead lets
+        `check_for_updates` re-seed it via the SessionStart-hook-based
+        offset (session_start_size) the next time it is noticed.
+        """
+        if not isinstance(entry, dict):
+            return False
+        session_id = entry.get("session_id")
+        file_path = entry.get("file_path")
+        offset = entry.get("last_byte_offset")
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        if not isinstance(file_path, str) or not file_path:
+            return False
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            return False
+        return True
+
     def load(self) -> None:
         """Load state from file."""
         if not self.state_file.exists():
@@ -59,11 +88,21 @@ class MonitorState:
         try:
             data = json.loads(self.state_file.read_text())
             sessions = data.get("tracked_sessions", {})
-            self.tracked_sessions = {
-                k: TrackedSession.from_dict(v) for k, v in sessions.items()
-            }
+            tracked_sessions: dict[str, TrackedSession] = {}
+            skipped = 0
+            for key, entry in sessions.items():
+                if not self._is_valid_entry(entry):
+                    logger.warning(
+                        "Skipping invalid tracked_sessions entry %r: %r", key, entry
+                    )
+                    skipped += 1
+                    continue
+                tracked_sessions[key] = TrackedSession.from_dict(entry)
+            self.tracked_sessions = tracked_sessions
             logger.info(
-                f"Loaded {len(self.tracked_sessions)} tracked sessions from state"
+                "Loaded %d tracked sessions from state%s",
+                len(self.tracked_sessions),
+                f" ({skipped} skipped as invalid)" if skipped else "",
             )
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning(f"Failed to load state file: {e}")

@@ -22,8 +22,23 @@ class TestParseLine:
             ("not-json", None),
             ("", None),
             ("   \t  ", None),
+            ("[1, 2]", None),
+            ('"str"', None),
+            ("42", None),
+            ("null", None),
+            ("false", None),
         ],
-        ids=["valid_json", "invalid_json", "empty", "whitespace"],
+        ids=[
+            "valid_json",
+            "invalid_json",
+            "empty",
+            "whitespace",
+            "list",
+            "string",
+            "number",
+            "null",
+            "bool",
+        ],
     )
     def test_parse_line(self, line: str, expected: dict | None):
         assert TranscriptParser.parse_line(line) == expected
@@ -116,13 +131,20 @@ class TestFormatToolUseSummary:
             TranscriptParser.format_tool_use_summary("Read", "not a dict") == "**Read**"
         )
 
-    def test_truncation_at_200_chars(self):
-        long_value = "x" * 250
+    def test_truncation_at_200_chars_preserves_full_text_in_quote(self):
+        """The summary line is a compact rendering (200 chars + "…"), but
+        the full command is never dropped — it follows as an expandable
+        quote so nothing is lost."""
+        long_value = "echo " + "x" * 495  # 500 chars total
         result = TranscriptParser.format_tool_use_summary(
             "Bash", {"command": long_value}
         )
-        assert len(long_value) > 200
-        assert result == f"**Bash**({'x' * 200}…)"
+        assert len(long_value) == 500
+        summary_line, _, rest = result.partition("\n")
+        assert summary_line == f"**Bash**({long_value[:200]}…)"
+        assert EXPQUOTE_START in rest
+        assert EXPQUOTE_END in rest
+        assert long_value in result
 
 
 # ── extract_tool_result_text ─────────────────────────────────────────────
@@ -370,6 +392,25 @@ class TestParseEntries:
         assert EXPQUOTE_END in result[0].text
         assert "reasoning here" in result[0].text
 
+    def test_sidechain_entry_is_skipped_but_sibling_is_not(
+        self, make_jsonl_entry, make_text_block
+    ):
+        """Task-tool sub-agent (sidechain) entries share the main
+        session's JSONL but are the sub-agent's own internal conversation
+        — they must never be surfaced as if they were the main
+        conversation."""
+        sidechain_entry = make_jsonl_entry(
+            "assistant", [make_text_block("sub-agent internal text")]
+        )
+        sidechain_entry["isSidechain"] = True
+        main_entry = make_jsonl_entry(
+            "assistant", [make_text_block("main conversation text")]
+        )
+
+        result, _pending = TranscriptParser.parse_entries([sidechain_entry, main_entry])
+
+        assert [e.text for e in result] == ["main conversation text"]
+
     def test_local_command_with_stdout(self, make_jsonl_entry, make_text_block):
         xml = (
             "<command-name>/status</command-name>"
@@ -444,6 +485,36 @@ class TestParseEntries:
         assert len(tool_result_entries) == 1
         assert "Error: Permission denied" in tool_result_entries[0].text
 
+    def test_long_single_line_error_preserved_in_quote(
+        self,
+        make_jsonl_entry,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        """A single-line error longer than the 100-char preview must not
+        lose the rest of the text — it gets the full error as an
+        expandable quote after the summary line."""
+        long_error = "boom: " + "z" * 294  # 300 chars, single line
+        entries = [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t1", "Bash", {"command": "false"})],
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t1", long_error, is_error=True)],
+            ),
+        ]
+        result, pending = TranscriptParser.parse_entries(entries)
+        tool_result_entries = [e for e in result if e.content_type == "tool_result"]
+        assert len(tool_result_entries) == 1
+        text = tool_result_entries[0].text
+        assert len(long_error) > 100
+        assert f"Error: {long_error[:100]}…" in text
+        assert EXPQUOTE_START in text
+        assert EXPQUOTE_END in text
+        assert long_error in text
+
     def test_interrupted_tool_result(
         self,
         make_jsonl_entry,
@@ -482,6 +553,10 @@ class TestParseEntries:
     def test_pending_tools_flushed_without_carry_over(
         self, make_jsonl_entry, make_tool_use_block
     ):
+        """One-shot mode (history): an unresolved tool_use at end-of-input
+        must appear exactly once in the projection — it was already emitted
+        in-place when its block was encountered, so it must NOT be flushed
+        a second time at the end (that duplicated it in history pages)."""
         entries = [
             make_jsonl_entry(
                 "assistant",
@@ -490,9 +565,30 @@ class TestParseEntries:
         ]
         result, pending = TranscriptParser.parse_entries(entries, pending_tools=None)
         tool_entries = [e for e in result if e.tool_use_id == "t1"]
-        assert len(tool_entries) == 2
+        assert len(tool_entries) == 1
         assert tool_entries[0].content_type == "tool_use"
-        assert tool_entries[1].content_type == "tool_use"
+        # One-shot callers (history) discard the returned pending dict; it
+        # still reports "t1" as unresolved, but that's inert here.
+        assert "t1" in pending
+
+    def test_pending_tools_streaming_still_carries_across_cycles(
+        self, make_jsonl_entry, make_tool_use_block
+    ):
+        """Streaming path (monitor, with carry): an unresolved tool_use is
+        emitted in-place once, and also kept in the returned pending_tools
+        dict so the next poll cycle can still pair it with a later
+        tool_result — it must not be flushed/emitted again here either."""
+        entries = [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t1", "Read", {"file_path": "a.py"})],
+            ),
+        ]
+        result, pending = TranscriptParser.parse_entries(entries, pending_tools={})
+        tool_entries = [e for e in result if e.tool_use_id == "t1"]
+        assert len(tool_entries) == 1
+        assert tool_entries[0].content_type == "tool_use"
+        assert "t1" in pending
 
     def test_system_tag_filtered(self, make_jsonl_entry, make_text_block):
         entries = [

@@ -4,15 +4,21 @@ Provides:
   - ccbot_dir(): resolve config directory from CCBOT_DIR env var.
   - atomic_write_json(): crash-safe JSON file writes via temp+rename.
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
+  - supervise_loop(): restart a background loop coroutine if it crashes or
+    exits unexpectedly, instead of silently killing monitoring forever.
 """
 
+import asyncio
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 CCBOT_DIR_ENV = "CCBOT_DIR"
+
+logger = logging.getLogger(__name__)
 
 
 def ccbot_dir() -> Path:
@@ -70,3 +76,40 @@ def read_cwd_from_jsonl(file_path: str | Path) -> str:
     except OSError:
         pass
     return ""
+
+
+async def supervise_loop(
+    name: str,
+    factory: Callable[[], Coroutine[Any, Any, None]],
+    *,
+    should_run: Callable[[], bool] | None = None,
+    restart_delay: float = 5.0,
+) -> None:
+    """Run a background loop coroutine, restarting it if it crashes or exits.
+
+    `factory` is called to produce a fresh coroutine each attempt (the loop
+    coroutine itself is single-use, so it can't just be awaited twice).
+
+    - Normal return: if `should_run` is given and now returns False, this is
+      an intended stop — exit quietly. Otherwise the loop exited on its own,
+      which is unexpected — log and restart after `restart_delay`.
+    - `asyncio.CancelledError`: re-raised immediately, no restart (this is
+      how callers cancel the supervisor task to stop supervision).
+    - Any other exception: logged with traceback and restarted after
+      `restart_delay`.
+    """
+    while True:
+        try:
+            await factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("%s crashed; restarting in %.0fs", name, restart_delay)
+            await asyncio.sleep(restart_delay)
+            continue
+
+        if should_run is not None and not should_run():
+            return
+
+        logger.error("%s exited unexpectedly; restarting in %.0fs", name, restart_delay)
+        await asyncio.sleep(restart_delay)

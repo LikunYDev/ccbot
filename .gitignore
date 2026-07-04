@@ -72,3 +72,4 @@ uv.lock
 
 # Claude Code plan-mode scratch files
 .claude/plans/
+.review/

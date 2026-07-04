@@ -13,20 +13,29 @@ class TestBuildResponseParts:
         assert len(parts) == 1
         assert "\U0001f464" in parts[0]
 
-    def test_user_message_truncated_at_3000_chars(self):
-        long_text = "a" * 4000
+    def test_user_message_not_truncated_multi_part(self):
+        """A user message beyond the old 3000-char cutoff must be
+        paginated in full, never cut with an ellipsis."""
+        long_text = "a" * 5000
         parts = build_response_parts(long_text, is_complete=True, role="user")
-        assert len(parts) == 1
-        short_parts = build_response_parts("b" * 100, is_complete=True, role="user")
-        assert len(parts[0]) < len(long_text)
-        assert len(short_parts[0]) < len(parts[0])
+        assert len(parts) > 1
+        joined = "".join(parts)
+        assert "…" not in joined
+        assert joined.count("a") == 5000
+        # Prefix only appears on the first part
+        assert parts[0].startswith("\U0001f464")
+        assert not parts[1].startswith("\U0001f464")
 
-    def test_thinking_content_truncated_at_500_chars(self):
+    def test_thinking_content_keeps_full_text_beyond_500_chars(self):
+        """A completed thinking block over the old 500-char cutoff must
+        keep its full inner text — the quote stays collapsed by default
+        and length is enforced only at the send layer."""
         inner = "x" * 800
         text = f"{EXP_START}{inner}{EXP_END}"
         parts = build_response_parts(text, is_complete=True, content_type="thinking")
         assert len(parts) == 1
-        assert "truncated" in parts[0].lower()
+        assert inner in parts[0]
+        assert "truncated" not in parts[0].lower()
 
     def test_plain_text_single_part(self):
         parts = build_response_parts("short text", is_complete=True)

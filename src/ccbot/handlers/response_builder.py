@@ -3,7 +3,10 @@
 Builds paginated response messages from Claude Code output:
   - Handles different content types (text, thinking, tool_use, tool_result)
   - Splits long messages into pages within Telegram's 4096 char limit
-  - Truncates thinking content to keep messages compact
+  - No truncation: user and assistant text (including thinking) is always
+    paginated in full via split_message; an expandable quote is kept
+    atomic here and its length budget is enforced only at the send layer
+    (markdown_v2._render_expandable_quote)
 
 Markdown conversion is NOT done here — the send layer (message_sender,
 message_queue) handles convert_markdown() so each message is converted
@@ -32,27 +35,23 @@ def build_response_parts(
     """
     text = text.strip()
 
-    # User messages: add emoji prefix (no newline)
+    # User messages: add emoji prefix (no newline) on the first part only,
+    # then paginate through the same split_message path assistant text
+    # uses — no truncation, the full text is always preserved.
     if role == "user":
         prefix = "👤 "
-        separator = ""
-        # User messages are typically short, no special processing needed
-        if len(text) > 3000:
-            text = text[:3000] + "…"
-        return [f"{prefix}{text}"]
-
-    # Truncate thinking content to keep it compact
-    if content_type == "thinking" and is_complete:
-        start_tag = TranscriptParser.EXPANDABLE_QUOTE_START
-        end_tag = TranscriptParser.EXPANDABLE_QUOTE_END
-        max_thinking = 500
-        if start_tag in text and end_tag in text:
-            inner = text[text.index(start_tag) + len(start_tag) : text.index(end_tag)]
-            if len(inner) > max_thinking:
-                inner = inner[:max_thinking] + "\n\n… (thinking truncated)"
-            text = start_tag + inner + end_tag
-        elif len(text) > max_thinking:
-            text = text[:max_thinking] + "\n\n… (thinking truncated)"
+        max_text = 3000 - len(prefix)
+        text_chunks = split_message(text, max_length=max_text)
+        total = len(text_chunks)
+        if total == 1:
+            return [f"{prefix}{text_chunks[0]}"]
+        parts = []
+        for i, chunk in enumerate(text_chunks, 1):
+            if i == 1:
+                parts.append(f"{prefix}{chunk}\n\n[{i}/{total}]")
+            else:
+                parts.append(f"{chunk}\n\n[{i}/{total}]")
+        return parts
 
     # Format based on content type
     if content_type == "thinking":
@@ -65,8 +64,8 @@ def build_response_parts(
         separator = ""
 
     # If text contains expandable quote sentinels, don't split —
-    # the quote must stay atomic. Truncation is handled by
-    # _render_expandable_quote in markdown_v2.py.
+    # the quote must stay atomic. Its length budget is enforced by
+    # _render_expandable_quote in markdown_v2.py, at the send layer.
     if TranscriptParser.EXPANDABLE_QUOTE_START in text:
         if prefix:
             return [f"{prefix}{separator}{text}"]

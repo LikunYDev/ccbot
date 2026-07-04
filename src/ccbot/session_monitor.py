@@ -1,10 +1,25 @@
 """Session monitoring service — watches JSONL files for new messages.
 
 Runs an async polling loop that:
-  1. Loads the current session_map to know which sessions to watch.
-  2. Detects session_map changes (new/changed/deleted windows) and cleans up.
+  1. Reads session_manager.window_states (the reconciled window->session
+     authority: hook events with manual pins applied) to know which
+     sessions to watch.
+  2. Detects window->session changes (new/changed/deleted windows) and cleans up.
   3. Reads new JSONL lines from each session file using byte-offset tracking.
   4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
+
+Delivery contract: read -> dispatch -> observe success -> THEN commit. A
+session's byte offset is only persisted once every message in its batch has
+been handed to the message callback without raising — never at read time.
+While a batch is awaiting that outcome the session is held in `_inflight`,
+which also backpressures `check_for_updates` (no further reads for that
+session until the batch settles). A callback exception or crash in that
+window no longer loses the batch: the next poll cycle re-reads and
+re-dispatches it from the same offset. This is an at-least-once contract
+(a mid-batch failure can redeliver messages sent before the failure) —
+duplicates are preferred over silent loss. Bounded retries (3) stop a
+poison batch from wedging a session's reads forever; the offset is then
+committed anyway and the drop is logged.
 
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
@@ -14,6 +29,7 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -24,8 +40,8 @@ from .config import config
 from .handlers.interactive_ui import INTERACTIVE_TOOL_NAMES
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
-from .transcript_parser import TranscriptParser
-from .utils import read_cwd_from_jsonl
+from .transcript_parser import ParsedEntry, TranscriptParser
+from .utils import read_cwd_from_jsonl, supervise_loop
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +66,23 @@ class NewMessage:
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+
+
+@dataclass
+class _PendingCommit:
+    """Offset/carry state needed to commit a session's read once its batch
+    of NewMessages has been durably delivered.
+
+    Held in-memory only, between `check_for_updates` returning an
+    undelivered batch and `_dispatch_and_commit` settling it — never
+    persisted.
+    """
+
+    offset_after: int  # Byte offset to persist once delivery succeeds
+    # offset_before: already restored in-memory by check_for_updates; kept
+    # here for reference/debugging.
+    offset_before: int
+    carry_before: dict[str, Any]  # _pending_tools[session_id] snapshot pre-parse
 
 
 class SessionMonitor:
@@ -85,11 +118,23 @@ class SessionMonitor:
         self._callback_tasks: set[asyncio.Task[None]] = set()
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
-        # Track last known session_map for detecting changes
-        # Keys may be window_id (@12) or window_name (old format) during transition
-        self._last_session_map: dict[str, str] = {}  # window_key -> session_id
+        # Track last known window_id -> session_id map (from session_manager
+        # .window_states) for detecting changes
+        self._last_session_map: dict[str, str] = {}  # window_id -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
+        # Sessions whose last-read batch is still awaiting delivery ACK.
+        # check_for_updates skips these (backpressure), so a session never
+        # has two dispatch batches racing each other.
+        self._inflight: set[str] = set()
+        # Consecutive delivery-failure count per session, for the bounded
+        # (3-attempt) poison-batch escape hatch. Reset on any success.
+        self._delivery_failures: dict[str, int] = {}
+        # scan_projects() fallback-glob miss cache for _recover_missing_sessions:
+        # session_id -> monotonic time before which it should NOT be re-globbed.
+        # Bounds the cost of a truly-gone session_id to one glob per 60s
+        # instead of one per ~2s poll cycle.
+        self._glob_miss_until: dict[str, float] = {}
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -203,6 +248,63 @@ class SessionMonitor:
 
         return sessions
 
+    def _recover_missing_sessions(
+        self, sessions: list[SessionInfo], active_session_ids: set[str]
+    ) -> None:
+        """Recover active sessions that scan_projects() silently dropped.
+
+        scan_projects() gates every candidate session on its recorded
+        project path resolving to a CURRENTLY active tmux window cwd. If
+        the project directory is renamed/moved after the session started
+        (or the sessions-index's recorded path just drifts), that gate
+        drops the session from every future scan — forever, with no log
+        (review f59/RC27). Recover it two ways, appending recovered
+        sessions directly into `sessions` (mutated in place) so Phase 1
+        reads them normally:
+
+          (a) Already tracked (in monitor_state) with a file that still
+              exists on disk: the file location is already known, so the
+              cwd gate is irrelevant — synthesize a SessionInfo straight
+              from the tracked record.
+          (b) Not tracked, or its file vanished: fall back to a one-level
+              glob under the projects root for `*/<session_id>.jsonl`. A
+              hit means the transcript file still exists somewhere, just
+              not reachable through the normal (indexed or un-indexed)
+              scan; log a warning since this silent-drop failure mode is
+              otherwise invisible. A miss is cached for 60s (monotonic) so
+              a truly-gone session_id is not re-globbed every ~2s poll.
+        """
+        missing_ids = active_session_ids - {s.session_id for s in sessions}
+        if not missing_ids:
+            return
+
+        now = time.monotonic()
+        for session_id in missing_ids:
+            tracked = self.state.get_session(session_id)
+            if tracked is not None and Path(tracked.file_path).exists():
+                sessions.append(
+                    SessionInfo(
+                        session_id=session_id, file_path=Path(tracked.file_path)
+                    )
+                )
+                continue
+
+            retry_at = self._glob_miss_until.get(session_id)
+            if retry_at is not None and now < retry_at:
+                continue
+
+            match = next(self.projects_path.glob(f"*/{session_id}.jsonl"), None)
+            if match is not None:
+                logger.warning(
+                    "session %s found via fallback glob; project dir no "
+                    "longer matches its window cwd",
+                    session_id,
+                )
+                sessions.append(SessionInfo(session_id=session_id, file_path=match))
+                self._glob_miss_until.pop(session_id, None)
+            else:
+                self._glob_miss_until[session_id] = now + 60.0
+
     async def _read_new_lines(
         self, session: TrackedSession, file_path: Path
     ) -> list[dict]:
@@ -210,6 +312,13 @@ class SessionMonitor:
 
         Detects file truncation (e.g. after /clear) and resets offset.
         Recovers from corrupted offsets (mid-line) by scanning to next line.
+
+        A line that fails to parse is either corrupt (it ends with a newline,
+        so it's a complete-but-malformed record) or partial (no trailing
+        newline — the file tail, likely mid-write). Corrupt lines are logged
+        and skipped with the offset advanced past them, so one bad line can
+        never wedge reads forever; partial lines keep the existing
+        break-and-retry-next-cycle behavior.
         """
         new_entries = []
         try:
@@ -256,19 +365,29 @@ class SessionMonitor:
                 safe_offset = session.last_byte_offset
                 async for line in f:
                     data = TranscriptParser.parse_line(line)
-                    if data:
+                    if data is not None:
                         new_entries.append(data)
                         safe_offset = await f.tell()
-                    elif line.strip():
-                        # Partial JSONL line — don't advance offset past it
+                    elif not line.strip():
+                        # Empty line — safe to skip
+                        safe_offset = await f.tell()
+                    elif line.endswith("\n"):
+                        # Complete line that failed to parse — permanently
+                        # corrupt, not a race with an in-progress write.
+                        # Skip and advance past it so it can't wedge reads.
                         logger.warning(
+                            "Skipping corrupt JSONL line in session %s",
+                            session.session_id,
+                        )
+                        safe_offset = await f.tell()
+                    else:
+                        # No trailing newline — likely the file tail
+                        # mid-write. Don't advance offset; retry next cycle.
+                        logger.debug(
                             "Partial JSONL line in session %s, will retry next cycle",
                             session.session_id,
                         )
                         break
-                    else:
-                        # Empty line — safe to skip
-                        safe_offset = await f.tell()
 
                 session.last_byte_offset = safe_offset
 
@@ -276,44 +395,150 @@ class SessionMonitor:
             logger.error("Error reading session file %s: %s", file_path, e)
         return new_entries
 
-    async def check_for_updates(self, active_session_ids: set[str]) -> list[NewMessage]:
+    def _entries_to_messages(
+        self, session_id: str, parsed_entries: list[ParsedEntry]
+    ) -> list[NewMessage]:
+        """Convert parsed transcript entries into deliverable NewMessages.
+
+        Applies the same show_user_messages/show_thinking/show_tools
+        filtering used for every live poll batch. Shared by the normal
+        `check_for_updates` path and the final-drain path in
+        `_detect_and_cleanup_changes` so both apply identical rules.
+        """
+        session_messages: list[NewMessage] = []
+        for entry in parsed_entries:
+            if not entry.text and not entry.image_data:
+                continue
+            # Skip user messages unless show_user_messages is enabled
+            if entry.role == "user" and not config.show_user_messages:
+                continue
+            # Skip thinking messages unless show_thinking is enabled
+            if entry.content_type == "thinking" and not config.show_thinking:
+                continue
+            # Skip tool messages unless show_tools is enabled
+            # Exception: interactive tools (AskUserQuestion, ExitPlanMode) must pass through
+            if (
+                entry.content_type in ("tool_use", "tool_result")
+                and not config.show_tools
+            ):
+                if not (
+                    entry.content_type == "tool_use"
+                    and entry.tool_name in INTERACTIVE_TOOL_NAMES
+                ):
+                    continue
+            session_messages.append(
+                NewMessage(
+                    session_id=session_id,
+                    text=entry.text,
+                    is_complete=True,
+                    content_type=entry.content_type,
+                    tool_use_id=entry.tool_use_id,
+                    role=entry.role,
+                    tool_name=entry.tool_name,
+                    image_data=entry.image_data,
+                )
+            )
+        return session_messages
+
+    async def check_for_updates(
+        self, active_session_ids: set[str]
+    ) -> tuple[list[NewMessage], dict[str, _PendingCommit]]:
         """Check all sessions for new assistant messages.
 
+        Before collecting, `_recover_missing_sessions` adds back any active
+        session_id that `scan_projects()` failed to surface (its project
+        dir no longer matches a live tmux cwd) so it keeps being read
+        instead of silently going dark.
+
         Uses a collect → read → parse pipeline:
-          1. Collect: identify sessions that need reading (mtime/size changed)
+          1. Collect: identify sessions that need reading (mtime/size changed).
+             A session with a dispatch still in flight (`_inflight`) is
+             skipped — backpressure that also guarantees a session never has
+             two dispatch batches racing each other.
           2. Read: parallel async file reads via asyncio.gather
           3. Parse: sequential per-session parsing (safe — _pending_tools keyed by session)
 
+        A session whose batch contains no NewMessages (filtered content,
+        bookkeeping-only entries) has its offset committed immediately, as
+        before. A session that DID produce messages is not committed here:
+        the in-memory offset is reverted to its pre-read value and the
+        advanced offset is handed back (per session, via the returned dict)
+        so the caller can commit it only once the batch is durably
+        delivered — see the module docstring's delivery contract. Because a
+        failure partway through a batch causes the whole batch to be
+        re-dispatched next cycle, messages already delivered before the
+        failure can be redelivered: at-least-once is the chosen contract,
+        since silent loss is worse than a duplicate.
+
         Args:
             active_session_ids: Set of session IDs currently in session_map
+
+        Returns:
+            Tuple of (new messages, pending-commit info keyed by session_id
+            for every session whose batch is awaiting a delivery ACK).
         """
         new_messages: list[NewMessage] = []
+        pending_commits: dict[str, _PendingCommit] = {}
 
         # Scan projects to get available session files
         sessions = await self.scan_projects()
 
+        # Recover any active session_id the scan above silently dropped
+        # (e.g. its project dir was renamed/moved) — see
+        # _recover_missing_sessions for why this can't just be logged once
+        # and ignored.
+        self._recover_missing_sessions(sessions, active_session_ids)
+
         # Phase 1: Collect — identify sessions needing reads
-        to_read: list[tuple[SessionInfo, TrackedSession, float]] = []
+        to_read: list[tuple[SessionInfo, TrackedSession, float, int]] = []
 
         for session_info in sessions:
             if session_info.session_id not in active_session_ids:
+                continue
+            if session_info.session_id in self._inflight:
+                # A previous batch for this session hasn't been ACKed yet;
+                # never read further ahead of an undelivered batch.
                 continue
             try:
                 tracked = self.state.get_session(session_info.session_id)
 
                 if tracked is None:
-                    # For new sessions, initialize offset to end of file
-                    # to avoid re-processing old messages
+                    # For a newly-noticed session, default the offset to end
+                    # of file (avoids re-processing old messages). But if the
+                    # SessionStart hook recorded the transcript's size at
+                    # session start (WindowState.session_start_size), seed
+                    # there instead: a reply that landed within this poll
+                    # cycle's window — or before the monitor ever noticed the
+                    # session, e.g. after losing monitor_state — would
+                    # otherwise fall inside [session_start_size, file_size)
+                    # and be silently skipped (review f17/RC38). This is a
+                    # deliberate at-least-once tradeoff: it replays from
+                    # session start when monitor state was lost. For a
+                    # resumed session the transcript already contains its
+                    # full history at SessionStart, so start_size ≈ current
+                    # size and nothing replays.
                     try:
                         file_size = session_info.file_path.stat().st_size
                         current_mtime = session_info.file_path.stat().st_mtime
                     except OSError:
                         file_size = 0
                         current_mtime = 0.0
+
+                    from .session import session_manager
+
+                    seed_offset = file_size
+                    for ws in session_manager.window_states.values():
+                        if (
+                            ws.session_id == session_info.session_id
+                            and ws.session_start_size >= 0
+                        ):
+                            seed_offset = min(ws.session_start_size, file_size)
+                            break
+
                     tracked = TrackedSession(
                         session_id=session_info.session_id,
                         file_path=str(session_info.file_path),
-                        last_byte_offset=file_size,
+                        last_byte_offset=seed_offset,
                     )
                     self.state.update_session(tracked)
                     self._file_mtimes[session_info.session_id] = current_mtime
@@ -335,30 +560,32 @@ class SessionMonitor:
                 ):
                     continue
 
-                to_read.append((session_info, tracked, current_mtime))
+                to_read.append(
+                    (session_info, tracked, current_mtime, tracked.last_byte_offset)
+                )
 
             except OSError as e:
                 logger.debug(f"Error collecting session {session_info.session_id}: {e}")
 
         if not to_read:
             self.state.save_if_dirty()
-            return new_messages
+            return new_messages, pending_commits
 
         # Phase 2: Read — parallel file reads
         read_results: list[list[dict[str, Any]] | BaseException] = await asyncio.gather(
             *(
                 self._read_new_lines(tracked, si.file_path)
-                for si, tracked, _mtime in to_read
+                for si, tracked, _mtime, _offset_before in to_read
             ),
             return_exceptions=True,
         )
 
         # Phase 3: Parse — sequential per session
-        for (session_info, tracked, current_mtime), result in zip(
+        for (session_info, tracked, current_mtime, offset_before), result in zip(
             to_read, read_results, strict=True
         ):
             if isinstance(result, BaseException):
-                logger.debug(
+                logger.warning(
                     "Error reading session %s: %s", session_info.session_id, result
                 )
                 continue
@@ -375,6 +602,7 @@ class SessionMonitor:
 
             # Parse new entries using the shared logic, carrying over pending tools
             carry = self._pending_tools.get(session_info.session_id, {})
+            carry_before = dict(carry)
             parsed_entries, remaining = TranscriptParser.parse_entries(
                 new_entries,
                 pending_tools=carry,
@@ -384,106 +612,49 @@ class SessionMonitor:
             else:
                 self._pending_tools.pop(session_info.session_id, None)
 
-            for entry in parsed_entries:
-                if not entry.text and not entry.image_data:
-                    continue
-                # Skip user messages unless show_user_messages is enabled
-                if entry.role == "user" and not config.show_user_messages:
-                    continue
-                # Skip thinking messages unless show_thinking is enabled
-                if entry.content_type == "thinking" and not config.show_thinking:
-                    continue
-                # Skip tool messages unless show_tools is enabled
-                # Exception: interactive tools (AskUserQuestion, ExitPlanMode) must pass through
-                if (
-                    entry.content_type in ("tool_use", "tool_result")
-                    and not config.show_tools
-                ):
-                    if not (
-                        entry.content_type == "tool_use"
-                        and entry.tool_name in INTERACTIVE_TOOL_NAMES
-                    ):
-                        continue
-                new_messages.append(
-                    NewMessage(
-                        session_id=session_info.session_id,
-                        text=entry.text,
-                        is_complete=True,
-                        content_type=entry.content_type,
-                        tool_use_id=entry.tool_use_id,
-                        role=entry.role,
-                        tool_name=entry.tool_name,
-                        image_data=entry.image_data,
-                    )
-                )
+            session_messages = self._entries_to_messages(
+                session_info.session_id, parsed_entries
+            )
 
-            self.state.update_session(tracked)
+            if session_messages:
+                # Undelivered batch: hold the offset commit until the batch
+                # is dispatched and ACKed. Revert the in-memory offset now
+                # so a crash or dropped process before that ACK re-reads
+                # (and re-emits) these same messages next cycle instead of
+                # losing them.
+                offset_after = tracked.last_byte_offset
+                tracked.last_byte_offset = offset_before
+                pending_commits[session_info.session_id] = _PendingCommit(
+                    offset_after=offset_after,
+                    offset_before=offset_before,
+                    carry_before=carry_before,
+                )
+                new_messages.extend(session_messages)
+            else:
+                # Nothing to deliver — safe to commit the read now.
+                self.state.update_session(tracked)
 
         self.state.save_if_dirty()
-        return new_messages
-
-    async def _accepted_session_map_names(self) -> set[str]:
-        """Return the configured tmux session plus any grouped peers."""
-
-        try:
-            names = await tmux_manager.list_group_session_names()
-        except Exception as e:
-            logger.debug("Failed to list grouped tmux sessions: %s", e)
-            names = set()
-        return names or {config.tmux_session_name}
-
-    @staticmethod
-    def _split_session_map_key(key: str) -> tuple[str, str] | None:
-        """Split a session_map key into (session_name, window_key)."""
-
-        session_name, sep, window_key = key.partition(":")
-        if not sep or not session_name or not window_key:
-            return None
-        return session_name, window_key
+        return new_messages, pending_commits
 
     async def _load_current_session_map(self) -> dict[str, str]:
-        """Load current session_map and return window_key -> session_id mapping.
+        """Return window_id -> session_id from the reconciled authority.
 
-        Keys in session_map are formatted as "tmux_session:window_id"
-        (e.g. "ccbot:@12"). Old-format keys ("ccbot:window_name") are also
-        accepted so that sessions running before a code upgrade continue
-        to be monitored until the hook re-fires with new format.
-        Accepts entries under our tmux_session_name or any grouped peer
-        session. When the same window_id appears under multiple grouped
-        peers, the configured tmux_session_name's entry wins (alphabetical
-        fallback otherwise) so the monitor tracks the same session that
-        SessionManager has applied to window_state.
+        session_manager.window_states is the reconciled authority: it is
+        built from hook events (session_map.json) with manual pins
+        (WindowState.pinned_over) applied on top, via
+        session_manager.load_session_map(). The monitor no longer parses
+        session_map.json itself, so a resumed session's pinned session_id
+        (which may differ from what the hook currently reports) is tracked
+        correctly instead of silently filtered out.
         """
-        window_to_session: dict[str, str] = {}
-        if not config.session_map_file.exists():
-            return window_to_session
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            return window_to_session
+        from .session import session_manager
 
-        accepted_names = await self._accepted_session_map_names()
-        candidates: dict[str, dict[str, str]] = {}
-        for key, info in session_map.items():
-            parts = self._split_session_map_key(key)
-            if parts is None:
-                continue
-            session_name, window_key = parts
-            if session_name not in accepted_names:
-                continue
-            session_id = info.get("session_id", "")
-            if session_id:
-                candidates.setdefault(window_key, {})[session_name] = session_id
-
-        primary = config.tmux_session_name
-        for window_key, by_name in candidates.items():
-            if primary in by_name:
-                window_to_session[window_key] = by_name[primary]
-            else:
-                window_to_session[window_key] = by_name[sorted(by_name)[0]]
-        return window_to_session
+        return {
+            wid: ws.session_id
+            for wid, ws in session_manager.window_states.items()
+            if ws.session_id
+        }
 
     async def _cleanup_all_stale_sessions(self) -> None:
         """Clean up all tracked sessions not in current session_map (used on startup)."""
@@ -503,6 +674,65 @@ class SessionMonitor:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
             self.state.save_if_dirty()
+
+    async def _final_drain_session(self, session_id: str) -> None:
+        """Deliver any unread trailing lines before a session's tracking is removed.
+
+        `_detect_and_cleanup_changes` removes a session from tracking the
+        moment it observes the window's session_id change (/clear, resume)
+        or the window's deletion — in the same poll cycle it observes it.
+        Without this, any lines Claude appended to the OLD jsonl since the
+        last read are permanently lost: nothing will ever read that offset
+        range again once tracking is gone.
+
+        Performs one last read + parse + dispatch, inline (awaited, not
+        fire-and-forget) so removal happens strictly after delivery is
+        attempted. A delivery failure here is logged (by
+        `_dispatch_session_messages`) and is not retried — the session is
+        dying either way; one honest attempt is all there is.
+
+        Skips (rather than reads) a session still in `_inflight`: its
+        offset was reverted to a pre-read value pending that batch's
+        delivery ACK (see `check_for_updates`), so reading here now would
+        re-read the same range and race a second concurrent dispatch
+        against the first — exactly the double-dispatch `_inflight`
+        backpressure exists to prevent. That in-flight batch will still be
+        delivered on its own; only lines appended after its read (a
+        narrower window than the bug this drain fixes) could be missed.
+        """
+        if session_id in self._inflight:
+            logger.info(
+                "Final drain skipped for session %s: a previous batch is "
+                "still in flight",
+                session_id,
+            )
+            return
+        tracked = self.state.get_session(session_id)
+        if tracked is None:
+            return
+        file_path = Path(tracked.file_path)
+        if not file_path.exists():
+            return
+
+        new_entries = await self._read_new_lines(tracked, file_path)
+        if not new_entries:
+            return
+
+        carry = self._pending_tools.get(session_id, {})
+        parsed_entries, _remaining = TranscriptParser.parse_entries(
+            new_entries, pending_tools=carry
+        )
+        session_messages = self._entries_to_messages(session_id, parsed_entries)
+        if not session_messages:
+            return
+
+        logger.info(
+            "Final drain: delivering %d trailing message(s) for session %s "
+            "before removing tracking",
+            len(session_messages),
+            session_id,
+        )
+        await self._dispatch_session_messages(session_id, session_messages)
 
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
         """Detect session_map changes and cleanup replaced/removed sessions.
@@ -542,6 +772,7 @@ class SessionMonitor:
         # Perform cleanup
         if sessions_to_remove:
             for session_id in sessions_to_remove:
+                await self._final_drain_session(session_id)
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
             self.state.save_if_dirty()
@@ -553,12 +784,19 @@ class SessionMonitor:
 
     async def _dispatch_session_messages(
         self, session_id: str, messages: list[NewMessage]
-    ) -> None:
-        """Dispatch messages for one session sequentially (fire-and-forget task).
+    ) -> bool:
+        """Dispatch messages for one session sequentially.
 
-        Fires the turn-end callback after all messages in this batch are
-        dispatched, unless the batch ended on an unpaired tool_use — a
-        conservative signal that Claude is mid-tool-call right now.
+        Returns True only if every message callback in this batch completed
+        without raising. On the first callback exception, logs it and stops
+        dispatching the rest of the batch — preserving delivery order,
+        since a later message must never be delivered ahead of one that
+        failed — and returns False so the caller (`_dispatch_and_commit`)
+        knows to retry the whole batch next cycle instead of committing it.
+
+        Fires the turn-end callback after a fully-delivered batch, unless
+        the batch ended on an unpaired tool_use — a conservative signal
+        that Claude is mid-tool-call right now.
 
         (Earlier versions gated on `session_id not in self._pending_tools`,
         but `_pending_tools` accumulates unresolved tools across the whole
@@ -572,6 +810,7 @@ class SessionMonitor:
                     await self._message_callback(msg)
             except Exception as e:
                 logger.error("Message callback error (session %s): %s", session_id, e)
+                return False
             if msg.content_type == "tool_use" and msg.tool_use_id:
                 last_unpaired_tool_use_id = msg.tool_use_id
             elif msg.content_type == "tool_result" and msg.tool_use_id:
@@ -584,6 +823,76 @@ class SessionMonitor:
                 await self._turn_end_callback(session_id)
             except Exception as e:
                 logger.error("Turn-end callback error (session %s): %s", session_id, e)
+        return True
+
+    def _commit_offset(self, session_id: str, offset: int) -> None:
+        """Persist `offset` as the session's last_byte_offset (the ACK commit)."""
+        tracked = self.state.get_session(session_id)
+        if tracked is None:
+            # Session was cleaned up (window closed/changed) while its batch
+            # was in flight — nothing left to persist for it.
+            return
+        tracked.last_byte_offset = offset
+        self.state.update_session(tracked)
+        self.state.save_if_dirty()
+
+    async def _dispatch_and_commit(
+        self,
+        session_id: str,
+        messages: list[NewMessage],
+        commit: _PendingCommit | None,
+    ) -> None:
+        """Deliver one session's undelivered batch, then commit or retry.
+
+        Runs as a fire-and-forget task from `_monitor_loop` (one per session
+        per poll cycle). `session_id` is added to `_inflight` for the
+        duration so `check_for_updates` will not read ahead of this batch
+        (also prevents two dispatch tasks for the same session racing each
+        other).
+
+        On successful delivery: persists `commit.offset_after`, resetting
+        the failure counter. On failure: restores `_pending_tools` to its
+        pre-parse snapshot so the next cycle's re-parse starts from
+        identical pairing state, and increments the failure counter. After
+        3 consecutive failures for a session, the batch is dropped (offset
+        committed anyway, error logged) so a poison batch cannot wedge the
+        session's reads forever.
+        """
+        self._inflight.add(session_id)
+        try:
+            delivered = await self._dispatch_session_messages(session_id, messages)
+
+            if commit is None:
+                logger.error(
+                    "No pending commit info for session %s; offset not persisted",
+                    session_id,
+                )
+                return
+
+            if delivered:
+                self._commit_offset(session_id, commit.offset_after)
+                self._delivery_failures.pop(session_id, None)
+                return
+
+            if commit.carry_before:
+                self._pending_tools[session_id] = commit.carry_before
+            else:
+                self._pending_tools.pop(session_id, None)
+
+            failures = self._delivery_failures.get(session_id, 0) + 1
+            if failures >= 3:
+                logger.error(
+                    "Dropping %d message(s) for session %s after 3 failed "
+                    "delivery attempts",
+                    len(messages),
+                    session_id,
+                )
+                self._commit_offset(session_id, commit.offset_after)
+                self._delivery_failures.pop(session_id, None)
+            else:
+                self._delivery_failures[session_id] = failures
+        finally:
+            self._inflight.discard(session_id)
 
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.
@@ -595,6 +904,11 @@ class SessionMonitor:
         # Deferred import to avoid circular dependency (cached once)
         from .session import session_manager
 
+        # Populate the reconciled authority (window_states) before it is
+        # read below — otherwise startup cleanup and the initial
+        # _last_session_map would see an empty map and wrongly treat every
+        # tracked session as stale.
+        await session_manager.load_session_map()
         # Clean up all stale sessions on startup
         await self._cleanup_all_stale_sessions()
         # Initialize last known session_map
@@ -610,7 +924,9 @@ class SessionMonitor:
                 active_session_ids = set(current_map.values())
 
                 # Check for new messages (all I/O is async)
-                new_messages = await self.check_for_updates(active_session_ids)
+                new_messages, pending_commits = await self.check_for_updates(
+                    active_session_ids
+                )
 
                 if new_messages and self._message_callback:
                     # Group messages by session_id for concurrent dispatch
@@ -625,13 +941,15 @@ class SessionMonitor:
 
                     for session_id, msgs in groups.items():
                         task = asyncio.create_task(
-                            self._dispatch_session_messages(session_id, msgs)
+                            self._dispatch_and_commit(
+                                session_id, msgs, pending_commits.get(session_id)
+                            )
                         )
                         self._callback_tasks.add(task)
                         task.add_done_callback(self._callback_tasks.discard)
 
-            except Exception as e:
-                logger.error(f"Monitor loop error: {e}")
+            except Exception:
+                logger.exception("Monitor loop error")
 
             await asyncio.sleep(self.poll_interval)
 
@@ -642,7 +960,13 @@ class SessionMonitor:
             logger.warning("Monitor already running")
             return
         self._running = True
-        self._task = asyncio.create_task(self._monitor_loop())
+        self._task = asyncio.create_task(
+            supervise_loop(
+                "session monitor",
+                self._monitor_loop,
+                should_run=lambda: self._running,
+            )
+        )
 
     def _stop_poll_loop(self) -> None:
         """Stop the background poll loop task. Idempotent."""
@@ -654,10 +978,15 @@ class SessionMonitor:
     async def drain_callbacks(self, timeout: float = 5.0) -> None:
         """Stop the poll loop and AWAIT in-flight dispatch tasks before shutdown.
 
-        Byte offsets advance on read (before dispatch), so a message that was
-        read but not yet delivered would be skipped on the next start. Awaiting
-        the outstanding dispatch tasks here lets those already-read messages be
-        delivered, making a ccbot restart seamless. Call before stop().
+        Byte offsets now advance on delivery ACK, not on read (see the
+        module docstring's delivery contract), so an in-flight batch that
+        gets interrupted here is no longer at risk of being silently
+        skipped after a restart — the offset was never advanced past it,
+        so the next start simply re-reads and re-dispatches it. Awaiting
+        the outstanding dispatch tasks here instead avoids that redundant
+        replay: already-read messages get their chance to be delivered
+        (and their offset committed) before we shut down, so a ccbot
+        restart doesn't needlessly redeliver them. Call before stop().
         """
         self._stop_poll_loop()
         pending = list(self._callback_tasks)

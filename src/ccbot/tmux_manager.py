@@ -6,7 +6,17 @@ Wraps libtmux to provide async-friendly operations on a single tmux session:
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
 
-All blocking libtmux calls are wrapped in asyncio.to_thread().
+All blocking libtmux calls are wrapped in asyncio.to_thread() and bounded by
+`TmuxManager._bounded()` (timeout `_TMUX_SUBPROCESS_TIMEOUT`), so a wedged
+tmux server can't hang a caller coroutine forever.
+
+`send_keys` treats delivery as an *observed* effect, not an assumed one:
+literal text goes through a raw `tmux send-keys -l --` subprocess (so its
+exit code — swallowed by vendored libtmux — is checked, and a leading '-'
+in the text can't be mis-parsed as an option), the text is polled for in
+`capture-pane` before Enter is sent (so a slow-redrawing TUI can't turn
+Enter into a stray newline), and the whole per-window sequence runs under
+a lock (`_get_send_lock`) so concurrent sends to one window can't interleave.
 
 Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
@@ -14,12 +24,15 @@ Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import pwd
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 import libtmux
 
@@ -35,6 +48,15 @@ _FALLBACK_PATH = "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 # Upper bound for blocking raw `tmux` subprocess calls, so a wedged tmux server
 # can't pin a thread-pool thread (and hang /restart) indefinitely.
 _TMUX_SUBPROCESS_TIMEOUT = 10.0
+
+# Verify-before-Enter: number of capture-pane polls used to confirm literal
+# text actually landed in the pane before submitting Enter, and the spacing
+# between them. A wedged/slow-redrawing TUI would otherwise turn a
+# fixed-delay Enter into a stray newline inside the input box.
+_SEND_VERIFY_ATTEMPTS = 3
+_SEND_VERIFY_POLL_INTERVAL = 0.3
+
+_T = TypeVar("_T")
 
 
 def _user_shell() -> str:
@@ -120,6 +142,25 @@ def _parse_group_session_names(
     return grouped_names or {configured_session_name}
 
 
+def _text_visible_in_pane(pane_text: str, sent_text: str) -> bool:
+    """Whitespace-insensitive tail check: did `sent_text` reach the pane?
+
+    TUIs re-wrap/re-flow text as it's typed (word-wrap, prompt padding), so
+    an exact substring match on raw captured text would false-negative on
+    legitimately-landed input, and a needle that lands split across two
+    wrapped pane lines would false-negative too. Comparing only the trailing
+    slice of what was sent, with all whitespace stripped from both the
+    needle and the last ~15 lines of the pane, tolerates wrapping while
+    still confirming the text actually reached the pane rather than being
+    swallowed by a slow-redrawing TUI.
+    """
+    needle = "".join(sent_text[-40:].split())
+    if not needle:
+        return True
+    haystack = "".join("".join(pane_text.splitlines()[-15:]).split())
+    return needle in haystack
+
+
 @dataclass
 class TmuxWindow:
     """Information about a tmux window."""
@@ -142,6 +183,11 @@ class TmuxManager:
         self.session_name = session_name or config.tmux_session_name
         self.socket_name = config.tmux_socket_name
         self._server: libtmux.Server | None = None
+        # One lock per window, serializing send_keys sequences so concurrent
+        # sends to the same window (e.g. a queued message racing an
+        # interactive-UI button press) can't interleave their keystrokes and
+        # Enter presses (RC11 / f37).
+        self._send_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def server(self) -> libtmux.Server:
@@ -158,6 +204,36 @@ class TmuxManager:
         would default to the shared socket. Every raw call must go through here.
         """
         return ["tmux", "-L", self.socket_name, *args]
+
+    def _get_send_lock(self, window_id: str) -> asyncio.Lock:
+        """Return (creating if needed) the lock serializing send_keys for one
+        window. See `_send_locks` for why this exists."""
+        lock = self._send_locks.get(window_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._send_locks[window_id] = lock
+        return lock
+
+    async def _bounded(self, label: str, fn: Callable[[], _T], default: _T) -> _T:
+        """Run a blocking libtmux/tmux call in a thread, bounded by
+        `_TMUX_SUBPROCESS_TIMEOUT`.
+
+        A wedged tmux server can leave `fn` blocked in libtmux's untimed
+        `Popen.communicate()` forever. `asyncio.wait_for` can't cancel that
+        thread — the pool thread is abandoned running `fn` — but that's
+        deliberate: leaking one thread-pool thread is far cheaper than
+        permanently freezing the caller coroutine (this backs the
+        session-monitor and status-polling loops).
+        """
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(fn), timeout=_TMUX_SUBPROCESS_TIMEOUT
+            )
+        except TimeoutError:
+            logger.error(
+                "tmux call %s timed out after %.0fs", label, _TMUX_SUBPROCESS_TIMEOUT
+            )
+            return default
 
     def get_session(self) -> libtmux.Session | None:
         """Get the tmux session if it exists."""
@@ -250,7 +326,7 @@ class TmuxManager:
 
             return windows
 
-        return await asyncio.to_thread(_sync_list_windows)
+        return await self._bounded("list_windows", _sync_list_windows, [])
 
     async def list_all_window_ids(self) -> set[str] | None:
         """Window IDs of every window on ccbot's tmux server, across all
@@ -337,7 +413,9 @@ class TmuxManager:
                 logger.debug(f"get_pane_current_command({window_id}) failed: {e}")
                 return None
 
-        return await asyncio.to_thread(_sync_get)
+        return await self._bounded(
+            f"get_pane_current_command({window_id})", _sync_get, None
+        )
 
     async def get_pane_pid(self, window_id: str) -> int | None:
         """Return the PID of the window's active pane.
@@ -371,7 +449,7 @@ class TmuxManager:
                 logger.debug(f"get_pane_pid({window_id}) failed: {e}")
                 return None
 
-        return await asyncio.to_thread(_sync_get)
+        return await self._bounded(f"get_pane_pid({window_id})", _sync_get, None)
 
     async def list_group_session_names(self) -> set[str]:
         """Return the configured tmux session plus any grouped peers."""
@@ -386,7 +464,14 @@ class TmuxManager:
                     ),
                     capture_output=True,
                     text=True,
+                    timeout=_TMUX_SUBPROCESS_TIMEOUT,
                 )
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "list_group_session_names: tmux timed out after %.0fs",
+                    _TMUX_SUBPROCESS_TIMEOUT,
+                )
+                return {self.session_name}
             except OSError as e:
                 logger.debug("list_group_session_names failed to exec tmux: %s", e)
                 return {self.session_name}
@@ -400,7 +485,9 @@ class TmuxManager:
 
             return _parse_group_session_names(result.stdout, self.session_name)
 
-        return await asyncio.to_thread(_sync_list)
+        return await self._bounded(
+            "list_group_session_names", _sync_list, {self.session_name}
+        )
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a window's active pane.
@@ -420,7 +507,20 @@ class TmuxManager:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, stderr = await proc.communicate()
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=_TMUX_SUBPROCESS_TIMEOUT
+                    )
+                except TimeoutError:
+                    logger.error(
+                        "capture_pane(%s): tmux timed out after %.0fs",
+                        window_id,
+                        _TMUX_SUBPROCESS_TIMEOUT,
+                    )
+                    proc.kill()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
+                    return None
                 if proc.returncode == 0:
                     return stdout.decode("utf-8")
                 logger.error(
@@ -449,12 +549,17 @@ class TmuxManager:
                 logger.error(f"Failed to capture pane {window_id}: {e}")
                 return None
 
-        return await asyncio.to_thread(_sync_capture)
+        return await self._bounded(f"capture_pane({window_id})", _sync_capture, None)
 
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
         """Send keys to a specific window.
+
+        Runs the whole sequence (literal text + verify + Enter, or a
+        special-key send) under the window's send lock, so two concurrent
+        send_keys calls to the same window can never interleave their
+        keystrokes/Enter presses.
 
         Args:
             window_id: The window ID to send to
@@ -466,66 +571,136 @@ class TmuxManager:
         Returns:
             True if successful, False otherwise
         """
-        if literal and enter:
-            # Split into text + delay + Enter via libtmux.
-            # Claude Code's TUI sometimes interprets a rapid-fire Enter
-            # (arriving in the same input batch as the text) as a newline
-            # rather than submit.  A 500ms gap lets the TUI process the
-            # text before receiving Enter.
-            def _send_literal(chars: str) -> bool:
-                session = self.get_session()
-                if not session:
-                    logger.error("No tmux session found")
-                    return False
-                try:
-                    window = session.windows.get(window_id=window_id)
-                    if not window:
-                        logger.error(f"Window {window_id} not found")
-                        return False
-                    pane = window.active_pane
-                    if not pane:
-                        logger.error(f"No active pane in window {window_id}")
-                        return False
-                    pane.send_keys(chars, enter=False, literal=True)
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to send keys to window {window_id}: {e}")
-                    return False
+        async with self._get_send_lock(window_id):
+            if literal and enter:
+                return await self._send_literal_with_enter(window_id, text)
+            return await self._send_special_or_no_enter(window_id, text, enter, literal)
 
-            def _send_enter() -> bool:
-                session = self.get_session()
-                if not session:
-                    return False
-                try:
-                    window = session.windows.get(window_id=window_id)
-                    if not window:
-                        return False
-                    pane = window.active_pane
-                    if not pane:
-                        return False
-                    pane.send_keys("", enter=True, literal=False)
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to send Enter to window {window_id}: {e}")
-                    return False
+    async def _send_literal_with_enter(self, window_id: str, text: str) -> bool:
+        """Send literal text, verify it actually landed, then send Enter.
 
-            # Claude Code's ! command mode: send "!" first so the TUI
-            # switches to bash mode, wait 1s, then send the rest.
-            if text.startswith("!"):
-                if not await asyncio.to_thread(_send_literal, "!"):
+        Claude Code's TUI sometimes interprets a rapid-fire Enter (arriving
+        before the TUI has redrawn the text) as a newline inside the input
+        box rather than submit — a silent stall for the user. Polling
+        capture-pane for the sent text before sending Enter turns "assume it
+        landed" into "observe that it landed".
+        """
+        # Claude Code's ! command mode: send "!" first so the TUI switches
+        # to bash mode, wait 1s, then send the rest — same two-step
+        # semantics as before, just via the raw/verified send.
+        if text.startswith("!"):
+            if not await self._send_literal_raw(window_id, "!"):
+                return False
+            rest = text[1:]
+            sent_text = "!"
+            if rest:
+                await asyncio.sleep(1.0)
+                if not await self._send_literal_raw(window_id, rest):
                     return False
-                rest = text[1:]
-                if rest:
-                    await asyncio.sleep(1.0)
-                    if not await asyncio.to_thread(_send_literal, rest):
-                        return False
-            else:
-                if not await asyncio.to_thread(_send_literal, text):
-                    return False
-            await asyncio.sleep(0.5)
-            return await asyncio.to_thread(_send_enter)
+                sent_text = rest
+        else:
+            if not await self._send_literal_raw(window_id, text):
+                return False
+            sent_text = text
 
-        # Other cases: special keys (literal=False) or no-enter
+        return await self._verify_and_send_enter(window_id, sent_text)
+
+    async def _verify_and_send_enter(self, window_id: str, sent_text: str) -> bool:
+        """Poll capture-pane until `sent_text` is visible, then send Enter.
+
+        Returns False without sending Enter if the text never becomes
+        visible — a silent half-typed submit is worse than the honest
+        '❌ Failed to send keys' the caller (session.send_to_window)
+        already surfaces to the user.
+        """
+        visible = False
+        for attempt in range(_SEND_VERIFY_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_SEND_VERIFY_POLL_INTERVAL)
+            pane_text = await self.capture_pane(window_id)
+            if pane_text is not None and _text_visible_in_pane(pane_text, sent_text):
+                visible = True
+                break
+
+        if not visible:
+            logger.warning(
+                "send_keys(%s): text not visible in pane after %d attempts, "
+                "not sending Enter (prefix=%r)",
+                window_id,
+                _SEND_VERIFY_ATTEMPTS,
+                sent_text[:40],
+            )
+            return False
+
+        return await self._send_enter_raw(window_id)
+
+    async def _send_literal_raw(self, window_id: str, chars: str) -> bool:
+        """Send literal text via a raw `tmux send-keys -l --` subprocess.
+
+        The vendored libtmux `Pane.send_keys` discards the tmux subprocess's
+        exit code, so a send tmux rejects (e.g. text starting with '-'
+        mis-parsed as an option when no `--` separator is used) silently
+        reported success. `--` ends option parsing, making leading-'-' text
+        safe, and checking `returncode` surfaces what libtmux swallowed.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._tmux_argv("send-keys", "-t", window_id, "-l", "--", chars),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_TMUX_SUBPROCESS_TIMEOUT
+            )
+        except Exception as e:
+            logger.error("send_keys:literal(%s) failed to exec tmux: %s", window_id, e)
+            return False
+        if proc.returncode != 0:
+            logger.error(
+                "send_keys:literal(%s) rejected (rc=%s): %s",
+                window_id,
+                proc.returncode,
+                stderr.decode("utf-8", "replace").strip(),
+            )
+            return False
+        return True
+
+    async def _send_enter_raw(self, window_id: str) -> bool:
+        """Send Enter via a raw `tmux send-keys` subprocess (same
+        returncode handling as `_send_literal_raw`)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._tmux_argv("send-keys", "-t", window_id, "Enter"),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_TMUX_SUBPROCESS_TIMEOUT
+            )
+        except Exception as e:
+            logger.error("send_keys:enter(%s) failed to exec tmux: %s", window_id, e)
+            return False
+        if proc.returncode != 0:
+            logger.error(
+                "send_keys:enter(%s) rejected (rc=%s): %s",
+                window_id,
+                proc.returncode,
+                stderr.decode("utf-8", "replace").strip(),
+            )
+            return False
+        return True
+
+    async def _send_special_or_no_enter(
+        self, window_id: str, text: str, enter: bool, literal: bool
+    ) -> bool:
+        """Special keys (arrows/Escape/Enter from UI buttons) or a literal
+        send with no trailing Enter.
+
+        Stays on libtmux via `_bounded` — these are single fire-and-forget
+        key sends, not the text-then-Enter sequence the verify-before-Enter
+        path guards.
+        """
+
         def _sync_send_keys() -> bool:
             session = self.get_session()
             if not session:
@@ -550,7 +725,7 @@ class TmuxManager:
                 logger.error(f"Failed to send keys to window {window_id}: {e}")
                 return False
 
-        return await asyncio.to_thread(_sync_send_keys)
+        return await self._bounded(f"send_keys({window_id})", _sync_send_keys, False)
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a tmux window by its ID."""
@@ -570,7 +745,7 @@ class TmuxManager:
                 logger.error(f"Failed to rename window {window_id}: {e}")
                 return False
 
-        return await asyncio.to_thread(_sync_rename)
+        return await self._bounded(f"rename_window({window_id})", _sync_rename, False)
 
     async def kill_window(self, window_id: str) -> bool:
         """Kill a tmux window by its ID."""
@@ -590,7 +765,7 @@ class TmuxManager:
                 logger.error(f"Failed to kill window {window_id}: {e}")
                 return False
 
-        return await asyncio.to_thread(_sync_kill)
+        return await self._bounded(f"kill_window({window_id})", _sync_kill, False)
 
     async def respawn_pane(
         self,
@@ -659,7 +834,7 @@ class TmuxManager:
             )
             return True
 
-        return await asyncio.to_thread(_sync_respawn)
+        return await self._bounded(f"respawn_pane({window_id})", _sync_respawn, False)
 
     async def create_window(
         self,
@@ -743,7 +918,11 @@ class TmuxManager:
                 logger.error(f"Failed to create window: {e}")
                 return False, f"Failed to create window: {e}", "", ""
 
-        return await asyncio.to_thread(_create)
+        return await self._bounded(
+            f"create_window({final_window_name})",
+            _create,
+            (False, "tmux timed out", "", ""),
+        )
 
 
 # Global instance with default session name

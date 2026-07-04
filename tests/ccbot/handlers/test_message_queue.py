@@ -70,6 +70,16 @@ def _clear_queue_state():
 
 
 @pytest.fixture
+def _clear_status_msg_info():
+    """Reset _status_msg_info between tests so tracking doesn't leak."""
+    from ccbot.handlers import message_queue as mq
+
+    mq._status_msg_info.clear()
+    yield
+    mq._status_msg_info.clear()
+
+
+@pytest.fixture
 def _clear_enqueued_flag():
     """Reset _interactive_enqueued between tests."""
     from ccbot.handlers.interactive_ui import _interactive_enqueued
@@ -363,3 +373,441 @@ class TestDrainQueues:
             finally:
                 for w in list(mq._queue_workers.values()):
                     w.cancel()
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestContentRetryAndFailureNotice:
+    """Deliver-or-loudly-drop: RetryAfter retries a content/interactive_ui
+    task in place (bounded), and a content task that is ultimately dropped
+    gets a best-effort user-visible notice instead of vanishing silently."""
+
+    @pytest.mark.asyncio
+    async def test_retries_retryafter_in_place_then_succeeds_fifo_preserved(self):
+        """A single RetryAfter is retried in place and delivers exactly one
+        message. A second task enqueued only after the retry has begun must
+        still be processed strictly after the first — FIFO is preserved."""
+        import asyncio
+
+        from telegram.error import RetryAfter
+
+        from ccbot.handlers.message_queue import (
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        sent: list[str] = []
+        call_count = 0
+        first_attempt_started = asyncio.Event()
+
+        async def fake_send(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                first_attempt_started.set()
+                raise RetryAfter(retry_after=0)
+            text = args[2]
+            sent.append(text)
+            m = MagicMock()
+            m.message_id = 1
+            return m
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=fake_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["hello1"],
+                content_type="text",
+                thread_id=42,
+            )
+            # Wait until the first send attempt has actually happened (and
+            # raised) before enqueuing the second task, so the two are never
+            # merged and the second genuinely arrives "after".
+            await asyncio.wait_for(first_attempt_started.wait(), timeout=5.0)
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["hello2"],
+                content_type="text",
+                thread_id=42,
+            )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert sent == ["hello1", "hello2"]
+        assert call_count == 3  # hello1 fails once then succeeds, then hello2
+        bot.send_message.assert_not_called()  # no failure notice — it delivered
+
+    @pytest.mark.asyncio
+    async def test_drops_content_after_max_retries_with_error_log_and_notice(
+        self, caplog
+    ):
+        """A send that always raises RetryAfter is retried up to the cap,
+        then dropped with an error log and a best-effort failure notice."""
+        import asyncio
+        import logging
+
+        from telegram.error import RetryAfter
+
+        from ccbot.handlers.message_queue import (
+            DELIVERY_FAILURE_NOTICE,
+            MAX_CONTENT_RETRY_ATTEMPTS,
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        call_count = 0
+
+        async def always_fail(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise RetryAfter(retry_after=0)
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=always_fail),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            with caplog.at_level(logging.ERROR, logger="ccbot.handlers.message_queue"):
+                await enqueue_content_message(
+                    bot,
+                    user_id=7,
+                    window_id="@5",
+                    parts=["hello"],
+                    content_type="text",
+                    thread_id=42,
+                )
+                await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert call_count == MAX_CONTENT_RETRY_ATTEMPTS
+        assert any(
+            "Giving up on content task" in record.message for record in caplog.records
+        )
+        bot.send_message.assert_awaited_once_with(
+            chat_id=100,
+            text=DELIVERY_FAILURE_NOTICE,
+            message_thread_id=42,
+        )
+
+    @pytest.mark.asyncio
+    async def test_merged_batch_survives_transient_retryafter(self):
+        """Three mergeable content tasks folded into one send: a RetryAfter
+        on the first attempt must not discard the merged batch — join()
+        completes and every part is actually delivered."""
+        import asyncio
+
+        from telegram.error import RetryAfter
+
+        from ccbot.handlers.message_queue import (
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        sent: list[str] = []
+        call_count = 0
+
+        async def fake_send(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RetryAfter(retry_after=0)
+            text = args[2]
+            sent.append(text)
+            m = MagicMock()
+            m.message_id = 1
+            return m
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=fake_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            for i in range(3):
+                await enqueue_content_message(
+                    bot,
+                    user_id=7,
+                    window_id="@5",
+                    parts=[f"part{i}"],
+                    content_type="text",
+                    thread_id=42,
+                )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert sent == ["part0", "part1", "part2"]
+        assert queue.qsize() == 0
+        bot.send_message.assert_not_called()  # delivered — no failure notice
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_on_content_notifies_and_worker_continues(self):
+        """A non-RetryAfter Exception on a content send is dropped with a
+        failure notice, and the worker keeps processing the next task."""
+        import asyncio
+
+        from ccbot.handlers.message_queue import (
+            DELIVERY_FAILURE_NOTICE,
+            enqueue_content_message,
+            get_or_create_queue,
+        )
+
+        bot = AsyncMock()
+        attempted: list[str] = []
+
+        async def flaky_send(*args, **kwargs):
+            text = args[2]
+            attempted.append(text)
+            if text == "boom":
+                raise ValueError("kaboom")
+            m = MagicMock()
+            m.message_id = 1
+            return m
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.send_with_fallback", new=flaky_send),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            # Different window_ids so the two tasks are never merged — this
+            # pins "worker continues with the next task" as a separate task.
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@5",
+                parts=["boom"],
+                content_type="text",
+                thread_id=42,
+            )
+            await enqueue_content_message(
+                bot,
+                user_id=7,
+                window_id="@6",
+                parts=["ok"],
+                content_type="text",
+                thread_id=42,
+            )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        assert attempted == ["boom", "ok"]
+        bot.send_message.assert_awaited_once_with(
+            chat_id=100,
+            text=DELIVERY_FAILURE_NOTICE,
+            message_thread_id=42,
+        )
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestTeardownTopic:
+    """f41/RC12: a dead topic's queue, lock, worker task, and flood/typing
+    timers must be fully released — Telegram never reuses thread_ids, so
+    anything left behind leaks forever."""
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancels_worker_and_clears_all_keys(self):
+        from ccbot.handlers import message_queue as mq
+        from ccbot.handlers.message_queue import get_or_create_queue, teardown_topic
+
+        bot = AsyncMock()
+        key = (7, 42)
+
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            assert key in mq._message_queues
+            assert key in mq._queue_locks
+            assert key in mq._queue_workers
+            worker = mq._queue_workers[key]
+
+            # Populate the flood-control / typing-throttle entries too, so
+            # teardown's cleanup of them is actually exercised.
+            mq._flood_until[key] = 123.0
+            mq._last_typing[key] = 456.0
+
+            await teardown_topic(7, 42)
+
+        assert worker.cancelled() or worker.done()
+        assert key not in mq._message_queues
+        assert key not in mq._queue_locks
+        assert key not in mq._queue_workers
+        assert key not in mq._flood_until
+        assert key not in mq._last_typing
+
+    @pytest.mark.asyncio
+    async def test_teardown_does_not_touch_group_process_locks(self):
+        """_group_process_locks is keyed by chat_id and shared across every
+        topic's worker in the same group chat — teardown must leave it be."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+        from ccbot.handlers.message_queue import get_or_create_queue, teardown_topic
+
+        bot = AsyncMock()
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+            # Let the worker task actually start running (it sets up
+            # _group_process_locks[chat_id] before its first await).
+            await asyncio.sleep(0)
+            assert 100 in mq._group_process_locks
+
+            await teardown_topic(7, 42)
+
+        assert 100 in mq._group_process_locks
+
+    @pytest.mark.asyncio
+    async def test_teardown_of_nonexistent_key_is_noop(self):
+        from ccbot.handlers.message_queue import teardown_topic
+
+        # Must not raise even though (7, 42) was never created.
+        await teardown_topic(7, 42)
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_queue_works_again_after_teardown(self):
+        """After teardown, the same key must be usable again: a fresh queue
+        and worker are created and can actually process a task."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+        from ccbot.handlers.message_queue import (
+            enqueue_status_update,
+            get_or_create_queue,
+            teardown_topic,
+        )
+
+        bot = AsyncMock()
+        key = (7, 42)
+
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+            await teardown_topic(7, 42)
+
+            assert key not in mq._message_queues
+            assert key not in mq._queue_workers
+
+            # Fresh queue + worker for the same key.
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+            assert key in mq._message_queues
+            assert key in mq._queue_workers
+            new_worker = mq._queue_workers[key]
+            assert not new_worker.done()
+
+            # status_clear with nothing tracked is a minimal no-op task the
+            # fresh worker should process cleanly.
+            await enqueue_status_update(
+                bot, user_id=7, window_id="@5", status_text=None, thread_id=42
+            )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        bot.delete_message.assert_not_called()
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info")
+class TestConvertStatusToContentRace:
+    """f53: `_convert_status_to_content` must not pop `_status_msg_info`
+    until the outstanding edit has actually resolved. Popping it up front
+    (before awaiting the edit) lets a concurrent `enqueue_status_update`
+    dedup read see nothing mid-flight, skip the dedup, and resurrect a
+    duplicate status message that never gets cleared."""
+
+    @pytest.mark.asyncio
+    async def test_entry_stays_visible_until_edit_resolves(self):
+        """Simulate a slow in-flight edit with an asyncio.Event and assert
+        the tracking entry is still readable by a concurrent caller while
+        the edit is outstanding, then confirmed popped once it succeeds."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_edit(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return True
+
+        skey = (7, 42)
+        mq._status_msg_info[skey] = (11, "@5", "Thinking…")
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.edit_with_fallback", new=slow_edit),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            task = asyncio.create_task(
+                mq._convert_status_to_content(bot, 7, 42, "@5", "new content")
+            )
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+            # Mid-flight: a concurrent enqueue_status_update dedup read must
+            # still see the entry (this IS that read, since it uses .get()).
+            assert mq._status_msg_info.get(skey) == (11, "@5", "Thinking…")
+
+            release.set()
+            result = await asyncio.wait_for(task, timeout=5.0)
+
+        assert result == 11
+        # Consumed: popped only after the edit actually resolved.
+        assert skey not in mq._status_msg_info
+
+    @pytest.mark.asyncio
+    async def test_pops_entry_on_total_edit_failure(self):
+        """When both edit attempts fail (edit_with_fallback returns False),
+        the tracked message is dead either way, so the entry must still be
+        popped — the caller sends a fresh message."""
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        skey = (7, 42)
+        mq._status_msg_info[skey] = (11, "@5", "Thinking…")
+
+        async def failing_edit(*args, **kwargs):
+            return False
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.edit_with_fallback", new=failing_edit),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            result = await mq._convert_status_to_content(
+                bot, 7, 42, "@5", "new content"
+            )
+
+        assert result is None
+        assert skey not in mq._status_msg_info
+
+    @pytest.mark.asyncio
+    async def test_pops_entry_on_different_window_delete(self):
+        """Stored status belongs to a different window: the old status is
+        deleted (not converted) and the entry must still be popped."""
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        skey = (7, 42)
+        mq._status_msg_info[skey] = (11, "@5", "Thinking…")
+
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            result = await mq._convert_status_to_content(
+                bot, 7, 42, "@6", "new content"
+            )
+
+        assert result is None
+        assert skey not in mq._status_msg_info
+        bot.delete_message.assert_awaited_once_with(chat_id=100, message_id=11)

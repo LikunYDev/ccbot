@@ -95,6 +95,18 @@ class TestExtractInteractiveContent:
         assert "❯" in result.content
         assert "Yes" in result.content
 
+    def test_exit_plan_mode_numbered_selector_excludes_trailing_chrome(
+        self, sample_pane_exit_plan_numbered: str
+    ):
+        """The bare-numbered ExitPlanMode fallback has no bottom marker, so
+        it used to extend to the last non-empty line of the WHOLE pane —
+        swallowing the standing chrome (prompt box, status bar) below the
+        dialog. It must stop at the dialog itself instead."""
+        result = extract_interactive_content(sample_pane_exit_plan_numbered)
+        assert result is not None
+        assert "Context:" not in result.content
+        assert "─" not in result.content
+
     def test_exit_plan_mode_old_format_still_works(self, sample_pane_exit_plan: str):
         """Backward compat: old ExitPlanMode format still detected."""
         result = extract_interactive_content(sample_pane_exit_plan)
@@ -107,6 +119,21 @@ class TestExtractInteractiveContent:
         assert result is not None
         assert result.name == "AskUserQuestion"
         assert "←" in result.content
+
+    def test_ask_user_multi_tab_excludes_trailing_chrome(
+        self, sample_pane_ask_user_multi_tab: str, chrome: str
+    ):
+        """The multi-tab AskUserQuestion pattern has no bottom marker either
+        (the footer varies per tab), so it must stop at its own "Enter to
+        select" footer rather than at the last non-empty line of the pane,
+        which would otherwise pull in the standing chrome below it."""
+        pane = sample_pane_ask_user_multi_tab + chrome
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        assert "Enter to select" in result.content
+        assert "Context:" not in result.content
+        assert "─" not in result.content
 
     def test_ask_user_single_tab(self, sample_pane_ask_user_single_tab: str):
         result = extract_interactive_content(sample_pane_ask_user_single_tab)

@@ -9,9 +9,32 @@ Provides a queue-based message processing system that ensures:
 
 Rate limiting is handled globally by AIORateLimiter on the Application.
 
+Queue semantics — deliver, or drop loudly:
+  - `content` and `interactive_ui` tasks are retried in place (the same
+    queued item, up to MAX_CONTENT_RETRY_ATTEMPTS attempts) when a send
+    raises RetryAfter, sleeping the required seconds between attempts.
+    Nothing else can run on this per-topic queue meanwhile, so FIFO order
+    is preserved. A long ban (retry_after > FLOOD_CONTROL_MAX_WAIT) still
+    records `_flood_until` so producers skip enqueuing new status updates
+    while banned.
+  - `status_update`/`status_clear` tasks are ephemeral: on RetryAfter they
+    are dropped (after waiting out a short ban) rather than retried, since
+    a fresh status will be enqueued again shortly.
+  - A `content` task that is ultimately dropped — retry attempts exhausted,
+    or a non-RetryAfter Exception — gets a best-effort plain-text failure
+    notice sent to the topic, so silence never means "delivered". Status
+    and interactive_ui tasks never get notices.
+  - `queue.task_done()` for tasks folded into a merged send (see
+    `_merge_content_tasks`) is only called once the merged send has fully
+    resolved (delivered, or finally dropped) — never before the send is
+    attempted — so `drain_queues()`'s `queue.join()` can't be fooled into
+    thinking a folded-in message was delivered when it was actually dropped.
+
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
   - get_or_create_queue: Get or create queue and worker for a user
+  - teardown_topic: Tear down a dead topic's queue/worker/lock/timers so
+    they don't leak once the topic can never be revisited
   - Message queue worker: Background task processing user's queue
   - Content task processing with tool_use/tool_result handling
   - Status message tracking and conversion (keyed by (user_id, thread_id))
@@ -28,23 +51,11 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
-from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from .interactive_ui import clear_interactive_enqueued, handle_interactive_ui
-from .message_sender import (
-    NO_LINK_PREVIEW,
-    PARSE_MODE,
-    send_photo,
-    send_with_fallback,
-    strip_sentinels,
-)
+from .message_sender import edit_with_fallback, send_photo, send_with_fallback
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_formatted(text: str) -> str:
-    """Convert markdown to MarkdownV2."""
-    return convert_markdown(text)
 
 
 # Merge limit for content messages
@@ -84,6 +95,16 @@ _flood_until: dict[_QueueKey, float] = {}
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
+
+# Max in-place retry attempts for a content/interactive_ui task hitting
+# RetryAfter before it is dropped (with a loud log + user-visible notice).
+MAX_CONTENT_RETRY_ATTEMPTS = 5
+
+# Best-effort notice sent to the topic when a content message could not be
+# delivered after exhausting retries (or hit a non-RetryAfter Exception).
+DELIVERY_FAILURE_NOTICE = (
+    "⚠️ A message from Claude failed to deliver — check ccbot logs."
+)
 
 # Per-group-chat processing lock — serializes API calls across topic workers
 # sending to the same Telegram group to prevent rate limit bursts
@@ -134,6 +155,43 @@ def get_or_create_queue(
         # Start worker task for this topic
         _queue_workers[key] = asyncio.create_task(_message_queue_worker(bot, key))
     return _message_queues[key]
+
+
+async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
+    """Tear down all per-topic queue machinery when a topic dies.
+
+    Call this when a topic is closed or deleted — Telegram never reuses
+    thread_ids, so anything left behind under this key (queue, lock, worker
+    task, flood-control/typing-throttle timestamps) would otherwise leak
+    forever. This is a hard stop, not a drain: any tasks still sitting in
+    the queue are deliberately discarded along with the queue itself —
+    `drain_queues()` is the place to flush a live topic before shutdown;
+    this function is for a topic that no longer exists to flush *to*.
+
+    Pops (and cancels, for the worker) the (user_id, thread_id or 0) entry
+    from `_message_queues`, `_queue_locks`, `_flood_until`, `_last_typing`,
+    and `_queue_workers`. Deliberately does NOT touch `_group_process_locks`
+    — that lock is keyed by chat_id and shared across every topic's worker
+    in the same group chat.
+
+    Safe to call for a key that was never created (no-op), and safe to
+    call again afterward: `get_or_create_queue` only checks `key not in
+    _message_queues`, so a fresh queue + worker are created cleanly on the
+    next call for the same key.
+    """
+    key: _QueueKey = (user_id, thread_id or 0)
+    _message_queues.pop(key, None)
+    _queue_locks.pop(key, None)
+    _flood_until.pop(key, None)
+    _last_typing.pop(key, None)
+
+    worker = _queue_workers.pop(key, None)
+    if worker is not None:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
@@ -231,6 +289,24 @@ async def _merge_content_tasks(
     )
 
 
+async def _notify_delivery_failure(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Best-effort plain-text notice that a content message was dropped.
+
+    Never raises — if even this fails, the error is already on the log from
+    the caller, and there's nothing more useful to do about a total send
+    failure.
+    """
+    try:
+        chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=DELIVERY_FAILURE_NOTICE,
+            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        )
+    except Exception:
+        pass
+
+
 async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
     """Process message tasks for a user+topic sequentially."""
     user_id, _thread_id = key
@@ -249,6 +325,8 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
     while True:
         try:
             task = await queue.get()
+            merge_count = 0
+            dropped = False
             try:
                 # Flood control: drop status, wait for content / interactive UI.
                 # interactive_ui must be waited (not dropped) so that
@@ -262,7 +340,7 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                         if task.task_type not in ("content", "interactive_ui"):
                             # Status is ephemeral — safe to drop
                             continue
-                        logger.debug(
+                        logger.info(
                             "Flood controlled: waiting %.0fs for %s (%s)",
                             remaining,
                             task.task_type,
@@ -273,51 +351,102 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                     _flood_until.pop(key, None)
                     logger.info("Flood control lifted for %s", key)
 
-                async with group_lock:
-                    if task.task_type == "content":
-                        # Try to merge consecutive content tasks
-                        merged_task, merge_count = await _merge_content_tasks(
-                            queue, task, lock
+                # Merge consecutive content tasks once, up front. Retries
+                # below resend this same merged task in place rather than
+                # re-merging — anything enqueued during a retry sleep just
+                # stays queued for the next pop, preserving FIFO order.
+                work_task = task
+                if task.task_type == "content":
+                    work_task, merge_count = await _merge_content_tasks(
+                        queue, task, lock
+                    )
+                    if merge_count > 0:
+                        logger.debug("Merged %d tasks for %s", merge_count, key)
+
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        async with group_lock:
+                            if task.task_type == "content":
+                                await _process_content_task(bot, user_id, work_task)
+                            elif task.task_type == "status_update":
+                                await _process_status_update_task(
+                                    bot, user_id, work_task
+                                )
+                            elif task.task_type == "status_clear":
+                                await _do_clear_status_message(
+                                    bot, user_id, work_task.thread_id or 0
+                                )
+                            elif task.task_type == "interactive_ui":
+                                await _process_interactive_ui_task(
+                                    bot, user_id, work_task
+                                )
+                        break  # sent successfully
+                    except RetryAfter as e:
+                        retry_secs = (
+                            e.retry_after
+                            if isinstance(e.retry_after, int)
+                            else int(e.retry_after.total_seconds())
                         )
-                        if merge_count > 0:
-                            logger.debug("Merged %d tasks for %s", merge_count, key)
-                            # Mark merged tasks as done
-                            for _ in range(merge_count):
-                                queue.task_done()
-                        await _process_content_task(bot, user_id, merged_task)
-                    elif task.task_type == "status_update":
-                        await _process_status_update_task(bot, user_id, task)
-                    elif task.task_type == "status_clear":
-                        await _do_clear_status_message(
-                            bot, user_id, task.thread_id or 0
-                        )
-                    elif task.task_type == "interactive_ui":
-                        await _process_interactive_ui_task(bot, user_id, task)
-            except RetryAfter as e:
-                retry_secs = (
-                    e.retry_after
-                    if isinstance(e.retry_after, int)
-                    else int(e.retry_after.total_seconds())
+                        long_ban = retry_secs > FLOOD_CONTROL_MAX_WAIT
+                        if long_ban:
+                            _flood_until[key] = time.monotonic() + retry_secs
+                            logger.warning(
+                                "Flood control for %s: retry_after=%ds, "
+                                "pausing queue until ban expires",
+                                key,
+                                retry_secs,
+                            )
+                        else:
+                            logger.warning(
+                                "Flood control for %s: waiting %ds",
+                                key,
+                                retry_secs,
+                            )
+
+                        if task.task_type not in ("content", "interactive_ui"):
+                            # Ephemeral: a fresh status will be enqueued again
+                            # shortly, so it's safe to drop instead of retry.
+                            if not long_ban:
+                                await asyncio.sleep(retry_secs)
+                            dropped = True
+                            break
+
+                        if attempt >= MAX_CONTENT_RETRY_ATTEMPTS:
+                            logger.error(
+                                "Giving up on %s task for %s (window %s) after "
+                                "%d attempts — repeated flood control",
+                                task.task_type,
+                                key,
+                                task.window_id,
+                                attempt,
+                            )
+                            dropped = True
+                            break
+
+                        # Retry the same task in place. Nothing else can run
+                        # on this queue meanwhile, so FIFO order holds.
+                        await asyncio.sleep(retry_secs)
+            except Exception:
+                logger.exception(
+                    "Error processing %s task for %s (window %s)",
+                    task.task_type,
+                    key,
+                    task.window_id,
                 )
-                if retry_secs > FLOOD_CONTROL_MAX_WAIT:
-                    _flood_until[key] = time.monotonic() + retry_secs
-                    logger.warning(
-                        "Flood control for %s: retry_after=%ds, "
-                        "pausing queue until ban expires",
-                        key,
-                        retry_secs,
-                    )
-                else:
-                    logger.warning(
-                        "Flood control for %s: waiting %ds",
-                        key,
-                        retry_secs,
-                    )
-                    await asyncio.sleep(retry_secs)
-            except Exception as e:
-                logger.error("Error processing message task for %s: %s", key, e)
+                dropped = True
             finally:
                 queue.task_done()
+                # Merged-in tasks are only marked done here — after processing
+                # has actually finished (success or final drop) — never before
+                # the send is attempted, so a mid-batch RetryAfter can't make
+                # drain_queues()'s queue.join() think folded-in messages were
+                # delivered when they were dropped.
+                for _ in range(merge_count):
+                    queue.task_done()
+                if dropped and task.task_type == "content":
+                    await _notify_delivery_failure(bot, user_id, task)
         except asyncio.CancelledError:
             logger.info("Message queue worker cancelled for %s", key)
             break
@@ -364,35 +493,11 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             await _do_clear_status_message(bot, user_id, tid)
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=edit_msg_id,
-                    text=_ensure_formatted(full_text),
-                    parse_mode=PARSE_MODE,
-                    link_preview_options=NO_LINK_PREVIEW,
-                )
+            if await edit_with_fallback(bot, chat_id, edit_msg_id, full_text):
                 await _send_task_images(bot, chat_id, task)
                 return
-            except RetryAfter:
-                raise
-            except Exception:
-                try:
-                    # Fallback: plain text with sentinels stripped
-                    plain_text = strip_sentinels(task.text or full_text)
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=edit_msg_id,
-                        text=plain_text,
-                        link_preview_options=NO_LINK_PREVIEW,
-                    )
-                    await _send_task_images(bot, chat_id, task)
-                    return
-                except RetryAfter:
-                    raise
-                except Exception:
-                    logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
-                    # Fall through to send as new message
+            logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
+            # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
     first_part = True
@@ -442,9 +547,23 @@ async def _convert_status_to_content(
     """Convert status message to content message by editing it.
 
     Returns the message_id if converted successfully, None otherwise.
+
+    Invariant: the `_status_msg_info` entry is left in place for the full
+    duration of the outstanding edit and is popped only once the tracked
+    message's fate is actually decided (converted to content below, deleted
+    because the window changed, or confirmed dead after both edit attempts
+    fail). `enqueue_status_update` reads this same entry — without an
+    `await` in between — to decide whether a fresh status update dedups
+    against the one already on screen. Popping it up front (before the
+    `await` on the edit) would make that concurrent read see nothing
+    mid-flight, skip the dedup, and let a duplicate status message be sent
+    and tracked behind our back while this edit is still in flight — a
+    duplicate that never gets cleared since this function's own bookkeeping
+    would then stomp back over it. Keeping the entry visible until the
+    outcome is known avoids that window entirely.
     """
     skey = (user_id, thread_id_or_0)
-    info = _status_msg_info.pop(skey, None)
+    info = _status_msg_info.get(skey)
     if not info:
         return None
 
@@ -456,37 +575,18 @@ async def _convert_status_to_content(
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception:
             pass
+        _status_msg_info.pop(skey, None)
         return None
 
     # Edit status message to show content
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
-            text=_ensure_formatted(content_text),
-            parse_mode=PARSE_MODE,
-            link_preview_options=NO_LINK_PREVIEW,
-        )
+    if await edit_with_fallback(bot, chat_id, msg_id, content_text):
+        _status_msg_info.pop(skey, None)
         return msg_id
-    except RetryAfter:
-        raise
-    except Exception:
-        try:
-            # Fallback to plain text with sentinels stripped
-            plain = strip_sentinels(content_text)
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=plain,
-                link_preview_options=NO_LINK_PREVIEW,
-            )
-            return msg_id
-        except RetryAfter:
-            raise
-        except Exception as e:
-            logger.debug(f"Failed to convert status to content: {e}")
-            # Message might be deleted or too old, caller will send new message
-            return None
+
+    # Both attempts failed — message might be deleted or too old. The
+    # tracked message is dead either way; caller will send a new message.
+    _status_msg_info.pop(skey, None)
+    return None
 
 
 async def _process_status_update_task(
@@ -531,32 +631,11 @@ async def _process_status_update_task(
                         raise
                     except Exception:
                         pass
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=_ensure_formatted(status_text),
-                    parse_mode=PARSE_MODE,
-                    link_preview_options=NO_LINK_PREVIEW,
-                )
+            if await edit_with_fallback(bot, chat_id, msg_id, status_text):
                 _status_msg_info[skey] = (msg_id, wid, status_text)
-            except RetryAfter:
-                raise
-            except Exception:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=status_text,
-                        link_preview_options=NO_LINK_PREVIEW,
-                    )
-                    _status_msg_info[skey] = (msg_id, wid, status_text)
-                except RetryAfter:
-                    raise
-                except Exception as e:
-                    logger.debug(f"Failed to edit status message: {e}")
-                    _status_msg_info.pop(skey, None)
-                    await _do_send_status_message(bot, user_id, tid, wid, status_text)
+            else:
+                _status_msg_info.pop(skey, None)
+                await _do_send_status_message(bot, user_id, tid, wid, status_text)
     else:
         # No existing status message, send new
         await _do_send_status_message(bot, user_id, tid, wid, status_text)

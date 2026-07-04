@@ -419,6 +419,7 @@ class TestHookMainWritePath:
                 "session_id": "33333333-3333-3333-3333-333333333333",
                 "cwd": "/proj",
                 "window_name": "job",
+                "transcript_size_at_start": 0,
             },
             "ccbot:@49": {
                 "session_id": "22222222-2222-2222-2222-222222222222",
@@ -470,6 +471,7 @@ class TestHookMainWritePath:
                 "session_id": "33333333-3333-3333-3333-333333333333",
                 "cwd": "/proj",
                 "window_name": "job",
+                "transcript_size_at_start": 0,
             },
             "ccbot:@49": {
                 "session_id": "22222222-2222-2222-2222-222222222222",
@@ -477,3 +479,74 @@ class TestHookMainWritePath:
                 "window_name": "other",
             },
         }
+
+
+class TestHookMainTranscriptSizeAtStart:
+    """The SessionStart stdin payload carries transcript_path; the hook
+    records the transcript's size at that exact moment as
+    transcript_size_at_start, since only the hook can observe it. The
+    session monitor later seeds a newly-noticed session's read offset there
+    instead of at current EOF (review f17/RC38) — otherwise a reply that
+    landed before the monitor's first poll is silently skipped."""
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        *,
+        transcript_path: str,
+    ) -> dict:
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="ccbot:@41:job\n", stderr=""
+            )
+
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr("ccbot.hook.subprocess.run", fake_run)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        payload = {
+            "session_id": "33333333-3333-3333-3333-333333333333",
+            "cwd": "/proj",
+            "hook_event_name": "SessionStart",
+            "transcript_path": transcript_path,
+        }
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        monkeypatch.setenv("TMUX_PANE", "%9")
+        hook_main()
+        map_file = tmp_path / "session_map.json"
+        return json.loads(map_file.read_text())
+
+    def test_existing_transcript_records_its_size(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_bytes(b"x" * 123)
+
+        result = self._run(monkeypatch, tmp_path, transcript_path=str(transcript))
+
+        assert result["ccbot:@41"]["transcript_size_at_start"] == 123
+
+    def test_missing_transcript_records_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            transcript_path=str(tmp_path / "does-not-exist.jsonl"),
+        )
+
+        assert result["ccbot:@41"]["transcript_size_at_start"] == 0
+
+    def test_relative_transcript_path_records_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(monkeypatch, tmp_path, transcript_path="relative.jsonl")
+
+        assert result["ccbot:@41"]["transcript_size_at_start"] == 0
+
+    def test_no_transcript_path_records_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(monkeypatch, tmp_path, transcript_path="")
+
+        assert result["ccbot:@41"]["transcript_size_at_start"] == 0

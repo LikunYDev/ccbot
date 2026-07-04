@@ -96,8 +96,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `OPENAI_API_KEY` | _(无)_ | OpenAI API 密钥，用于语音消息转录 |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API 基础 URL（用于代理或兼容 API） |
 
-消息格式化目前固定为 HTML，使用 `chatgpt-md-converter`（`chatgpt_md_converter` 包）。
-不再提供运行时切换到 MarkdownV2 的开关。
+消息格式化为 MarkdownV2（`src/ccbot/markdown_v2.py`，基于 `telegramify-markdown`），通过 `safe_reply`/`safe_edit`/`safe_send` 辅助函数以 `parse_mode=MarkdownV2` 发送。若 MarkdownV2 解析失败，这些辅助函数会自动降级为纯文本重试 —— 格式化错误不会阻塞消息送达。
 
 > 如果在 VPS 上运行且没有交互终端来批准权限，建议使用 **auto 模式** —— Claude Code 会自动执行动作，同时后台分类器会拦截危险操作（数据外泄、强推 main、任意下载等）：
 >
@@ -213,8 +212,9 @@ uv run ccbot
 通知发送到绑定了该会话窗口的话题中。
 
 格式说明：
-- Telegram 消息使用 `HTML` parse mode
-- 通过 `chatgpt-md-converter` 做 Markdown→HTML 转换与 HTML 标签感知拆分，保证长代码块拆分稳定
+- Telegram 消息使用 `MarkdownV2` parse mode，通过 `telegramify-markdown`（`src/ccbot/markdown_v2.py`）转换，思考/工具输出使用可展开引用块
+- MarkdownV2 解析失败时，发送层会自动降级为纯文本重试
+- 长消息通过 `split_message`（`telegram_sender.py`）按 Telegram 4096 字符限制拆分
 
 ## 在 tmux 中运行 Claude Code
 
@@ -251,7 +251,7 @@ claude
 - **窗口 ID 为中心** — 所有内部状态以 tmux 窗口 ID（如 `@0`、`@12`）为键，而非窗口名称。窗口名称仅作为显示名称保留。同一目录可有多个窗口
 - **基于 Hook 的会话追踪** — Claude Code 的 `SessionStart` Hook 写入 `session_map.json`；监控器每次轮询读取它以自动检测会话变化
 - **工具调用配对** — `tool_use_id` 跨轮询周期追踪；工具结果直接编辑原始的工具调用 Telegram 消息
-- **HTML + 降级** — 所有消息通过 `chatgpt-md-converter` 转换为 Telegram HTML，解析失败时降级为纯文本
+- **MarkdownV2 + 降级** — 所有消息通过 `telegramify-markdown` 转换为 Telegram MarkdownV2，解析失败时降级为纯文本
 - **解析层不截断** — 完整保留内容；发送层按 Telegram 4096 字符限制拆分
 
 ## 数据存储
@@ -277,7 +277,7 @@ src/ccbot/
 ├── monitor_state.py       # 监控状态持久化（字节偏移量）
 ├── transcript_parser.py   # Claude Code JSONL 对话记录解析
 ├── terminal_parser.py     # 终端面板解析（交互式 UI + 状态行）
-├── html_converter.py      # Markdown → Telegram HTML 转换 + HTML 感知拆分
+├── markdown_v2.py         # Markdown → Telegram MarkdownV2 转换 + 可展开引用
 ├── screenshot.py          # 终端文字 → PNG 图片（支持 ANSI 颜色）
 ├── transcribe.py          # 通过 OpenAI API 进行语音转文字
 ├── utils.py               # 通用工具（原子 JSON 写入、JSONL 辅助函数）

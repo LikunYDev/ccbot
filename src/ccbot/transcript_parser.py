@@ -84,16 +84,25 @@ class TranscriptParser:
             line: A single line from the JSONL file
 
         Returns:
-            Parsed dict or None if line is empty/invalid
+            Parsed dict, or None if the line is empty/invalid or if it is
+            valid JSON that doesn't decode to an object (e.g. a bare
+            string/number/list/null) — those can never carry a "type" field
+            and would otherwise crash downstream `.get()` calls.
         """
         line = line.strip()
         if not line:
             return None
 
         try:
-            return json.loads(line)
+            value = json.loads(line)
         except json.JSONDecodeError:
             return None
+
+        if not isinstance(value, dict):
+            logger.debug("Ignoring non-dict JSONL line: %r", line[:200])
+            return None
+
+        return value
 
     @staticmethod
     def get_message_type(data: dict) -> str | None:
@@ -223,7 +232,13 @@ class TranscriptParser:
 
         if summary:
             if len(summary) > cls._MAX_SUMMARY_LENGTH:
-                summary = summary[: cls._MAX_SUMMARY_LENGTH] + "…"
+                # The summary line is a compact rendering, not the data —
+                # keep it short, but never drop the full text: it follows
+                # immediately as an expandable quote.
+                shortened = summary[: cls._MAX_SUMMARY_LENGTH] + "…"
+                return f"**{name}**({shortened})\n" + cls._format_expandable_quote(
+                    summary
+                )
             return f"**{name}**({summary})"
         return f"**{name}**"
 
@@ -349,8 +364,14 @@ class TranscriptParser:
 
         Shows relevant statistics for each tool type, with expandable quote for full content.
 
-        No truncation here — per project principles, truncation is handled
-        only at the send layer (split_message / _render_expandable_quote).
+        No content is dropped here: any compact preview line built in this
+        class (this method's stats line, the 200-char tool_use summary, the
+        100-char error preview) is a *rendering*, never the only copy of the
+        data — whenever the full text is longer than that rendering, the
+        full text is appended right after as an expandable quote
+        (_format_expandable_quote), so nothing is permanently lost. Length
+        limits are enforced only at the send layer (split_message /
+        _render_expandable_quote).
         """
         if not text:
             return ""
@@ -432,13 +453,18 @@ class TranscriptParser:
         result: list[ParsedEntry] = []
         last_cmd_name: str | None = None
         # Pending tool_use blocks keyed by id
-        _carry_over = pending_tools is not None
         if pending_tools is None:
             pending_tools = {}
         else:
             pending_tools = dict(pending_tools)  # don't mutate caller's dict
 
         for data in entries:
+            # Task-tool sub-agent (sidechain) entries share the main
+            # session's JSONL but are that sub-agent's own internal
+            # conversation, not the main conversation — never surface them.
+            if data.get("isSidechain") is True:
+                continue
+
             msg_type = cls.get_message_type(data)
             if msg_type not in ("user", "assistant"):
                 continue
@@ -636,12 +662,17 @@ class TranscriptParser:
                             # Add error message in stats format
                             if result_text:
                                 # Take first line of error as summary
-                                error_summary = result_text.split("\n")[0]
+                                first_line = result_text.split("\n")[0]
+                                error_summary = first_line
                                 if len(error_summary) > 100:
                                     error_summary = error_summary[:100] + "…"
                                 entry_text += f"\n  ⎿  Error: {error_summary}"
-                                # If multi-line error, add expandable quote
-                                if "\n" in result_text:
+                                # Whenever the summary line above dropped
+                                # something (multi-line error, or a single
+                                # line longer than the 100-char preview),
+                                # append the full error as an expandable
+                                # quote so nothing is lost.
+                                if "\n" in result_text or len(first_line) > 100:
                                     entry_text += "\n" + cls._format_expandable_quote(
                                         result_text
                                     )
@@ -740,20 +771,12 @@ class TranscriptParser:
                             )
                         )
 
-        # Flush remaining pending tools at end.
-        # In carry-over mode (monitor), keep them pending for the next call
-        # without emitting entries. In one-shot mode (history), emit them.
+        # Remaining pending tools at end.
+        # In carry-over mode (monitor), keep them pending for the next call.
+        # In one-shot mode (history), each tool_use was already emitted
+        # in-place above when its block was encountered — do NOT emit it
+        # again here, or it would be duplicated in the projection.
         remaining_pending = dict(pending_tools)
-        if not _carry_over:
-            for tool_id, tool_info in pending_tools.items():
-                result.append(
-                    ParsedEntry(
-                        role="assistant",
-                        text=tool_info.summary,
-                        content_type="tool_use",
-                        tool_use_id=tool_id,
-                    )
-                )
 
         # Strip whitespace
         for entry in result:

@@ -7,6 +7,10 @@
 │  - /history: Paginated message history (default: latest page)      │
 │  - /screenshot: Capture tmux pane as PNG                           │
 │  - /esc: Send Escape to interrupt Claude                           │
+│  - /restart: Restart session in place (respawn-pane + --resume)    │
+│  - /kill: Kill session and delete topic                            │
+│  - /unbind: Detach topic from session, tmux window kept running    │
+│  - /usage: Show Claude Code usage/cost stats from the TUI          │
 │  - Send text → Claude Code via tmux keystrokes                     │
 │  - Forward /commands to Claude Code                                │
 │  - Create sessions via directory browser in unbound topics         │
@@ -70,6 +74,7 @@
 Additional modules:
   screenshot.py       ─ Terminal text → PNG rendering (ANSI color, font fallback)
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
+  update_watcher.py   ─ Notifies on Claude Code version drift / a stuck session; drives in-place /restart (respawn-pane + --resume)
   main.py             ─ CLI entry point
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
 
@@ -80,6 +85,8 @@ Handler modules (handlers/):
   response_builder.py ─ Response pagination and formatting
   interactive_ui.py   ─ AskUserQuestion / ExitPlanMode / Permission UI
   directory_browser.py─ Directory selection + session picker UI for new topics
+  history.py          ─ Message history pagination (/history rendering)
+  maintenance.py      ─ Periodic session_map sweep, hook-failure notices, and session-divergence detection
   cleanup.py          ─ Topic state cleanup on close/delete
   callback_data.py    ─ Callback data constants
 
@@ -93,10 +100,10 @@ State files (~/.ccbot/ or $CCBOT_DIR/):
 
 - **Topic-centric** — Each Telegram topic binds to one tmux window. No centralized session list; topics *are* the session list.
 - **Window ID-centric** — All internal state keyed by tmux window ID (e.g. `@0`, `@12`), not window names. Window IDs are guaranteed unique within a tmux server session. Window names are kept as display names via `window_display_names` map. Same directory can have multiple windows.
-- **Hook-based session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; monitor reads it each poll cycle to auto-detect session changes.
+- **Hook-based session tracking** — Claude Code `SessionStart` hook writes `session_map.json` (plus `transcript_size_at_start`, used to seed a newly-noticed session's read offset). The monitor does not read that file directly: `session_manager.load_session_map()` reconciles it into `window_states`, applying any manual pin (`WindowState.pinned_over`, e.g. from a `--resume`) on top, and the monitor watches that reconciled map.
 - **Tool use ↔ tool result pairing** — `tool_use_id` tracked across poll cycles; tool result edits the original tool_use Telegram message in-place.
 - **MarkdownV2 with fallback** — All messages go through `safe_reply`/`safe_edit`/`safe_send` which convert via `telegramify-markdown` and fall back to plain text on parse failure.
 - **No truncation at parse layer** — Full content preserved; splitting at send layer respects Telegram's 4096 char limit with expandable quote atomicity.
-- Only sessions registered in `session_map.json` (via hook) are monitored.
+- Only sessions present in `session_manager.window_states` (session_map.json reconciled with pins) are monitored.
 - Notifications delivered to users via thread bindings (topic → window_id → session).
 - **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.

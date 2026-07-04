@@ -5,6 +5,8 @@
     <key>Label</key>
     <string>com.ccbot</string>
 
+    <!-- Set this to the output of `which uv` — /opt/homebrew/bin/uv on Apple
+         Silicon, /usr/local/bin/uv on Intel Homebrew. -->
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/uv</string>
@@ -47,6 +49,11 @@
              ccbot (e.g. `claude --version` in update_watcher). -->
         <key>PATH</key>
         <string>/Users/USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Without a locale, tmux capture-pane decodes non-ASCII pane output
+             (emoji, CJK) lossily, breaking interactive-UI detection and
+             screenshots. -->
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
         <!-- ccbot runs on a dedicated tmux socket (default "ccbot"); uncomment
              to override. Attach over SSH with: tmux -L ccbot attach -t ccbot
         <key>TMUX_SOCKET_NAME</key>

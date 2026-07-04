@@ -35,18 +35,22 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import re
 import time
 from pathlib import Path
 
+from aiolimiter import AsyncLimiter
 from telegram import (
     Bot,
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    Message,
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import RetryAfter
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -89,6 +93,8 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    PENDING_TEXT_KEY,
+    SELECTED_PATH_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
@@ -99,8 +105,8 @@ from .handlers.directory_browser import (
     build_session_picker,
     build_window_picker,
     clear_browse_state,
-    clear_session_picker_state,
-    clear_window_picker_state,
+    get_browse_state,
+    set_browse_state,
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
@@ -110,6 +116,7 @@ from .handlers.interactive_ui import (
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    send_ui_key,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -120,13 +127,12 @@ from .handlers.message_queue import (
     shutdown_workers,
 )
 from .handlers.message_sender import (
-    NO_LINK_PREVIEW,
+    edit_with_fallback,
     safe_edit,
     safe_reply,
     safe_send,
     send_with_fallback,
 )
-from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.maintenance import maintenance_loop
 from .handlers.status_polling import status_poll_loop
@@ -137,7 +143,7 @@ from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
-from .utils import ccbot_dir
+from .utils import ccbot_dir, supervise_loop
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +216,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await safe_reply(update.message, "You are not authorized to use this bot.")
         return
 
-    clear_browse_state(context.user_data)
+    thread_id = _get_thread_id(update)
+    if thread_id is not None:
+        clear_browse_state(context.user_data, thread_id)
 
     if update.message:
         await safe_reply(
@@ -301,6 +309,71 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "The Claude session is still running in tmux.\n"
         "Send a message to bind to a new session.",
     )
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kill this topic's Claude session and delete the Telegram topic.
+
+    Unlike /unbind (which detaches the topic but leaves tmux running),
+    this actually kills the tmux window, then deletes the forum topic
+    itself. Mirrors the teardown sequence in topic_closed_handler, plus
+    the topic deletion that a native Telegram "close+delete" would do.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    display = session_manager.get_display_name(wid)
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if w:
+        await tmux_manager.kill_window(w.window_id)
+        logger.info(
+            "Killed window %s via /kill (user=%d, thread=%d)",
+            display,
+            user.id,
+            thread_id,
+        )
+    else:
+        logger.info(
+            "/kill: window %s already gone (user=%d, thread=%d)",
+            display,
+            user.id,
+            thread_id,
+        )
+
+    session_manager.unbind_thread(user.id, thread_id)
+    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+
+    resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
+    try:
+        await context.bot.delete_forum_topic(
+            chat_id=resolved_chat, message_thread_id=thread_id
+        )
+    except Exception as e:
+        # Bots need "Manage Topics" rights to delete a forum topic; without
+        # them the teardown above already happened, so just tell the user
+        # to finish the job manually instead of leaving them guessing.
+        logger.warning("Failed to delete forum topic (thread=%d): %s", thread_id, e)
+        await safe_reply(
+            update.message,
+            f"✅ Killed session '{display}'.\n"
+            "⚠️ Could not delete this topic automatically "
+            "(bot may lack the 'Manage Topics' right) — "
+            "please delete it manually.",
+        )
 
 
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -530,6 +603,43 @@ async def topic_edited_handler(
         )
         return
 
+    # Reject renames that would corrupt display-name-based lookups (RC3/f36):
+    # the reserved main-window sentinel is skipped by list_windows, so this
+    # window would vanish from resolve_stale_ids/find_window_by_id forever;
+    # a name collision with another live window makes resolve_stale_ids'
+    # name-keyed remap ambiguous after the next tmux server restart.
+    if new_name == config.tmux_main_window_name:
+        logger.warning(
+            "Topic edited: rejecting rename to reserved name '%s' "
+            "(window=%s, user=%d, thread=%d)",
+            new_name,
+            wid,
+            user.id,
+            thread_id,
+        )
+        await safe_reply(
+            msg,
+            f"❌ '{new_name}' is a reserved name and can't be used here.",
+        )
+        return
+
+    collision = await tmux_manager.find_window_by_name(new_name)
+    if collision and collision.window_id != wid:
+        logger.warning(
+            "Topic edited: rejecting rename to '%s' (already used by window %s) "
+            "(window=%s, user=%d, thread=%d)",
+            new_name,
+            collision.window_id,
+            wid,
+            user.id,
+            thread_id,
+        )
+        await safe_reply(
+            msg,
+            f"❌ Another window is already named '{new_name}'. Pick a different name.",
+        )
+        return
+
     old_name = session_manager.get_display_name(wid)
     await tmux_manager.rename_window(wid, new_name)
     session_manager.update_display_name(wid, new_name)
@@ -541,6 +651,25 @@ async def topic_edited_handler(
         user.id,
         thread_id,
     )
+
+
+def _strip_bot_mention(cmd_text: str) -> str:
+    """Strip a trailing "@botname" mention from the command token only.
+
+    Telegram appends "@botname" to the command TOKEN itself in group chats
+    (e.g. "/clear@my_bot"), never to its arguments. Splitting the whole
+    string on "@" would also truncate arguments that legitimately contain
+    "@" (emails, "@decorators", etc.), so only the first whitespace-
+    delimited token is desentineled and the remainder is passed through
+    untouched.
+    """
+    parts = cmd_text.split(maxsplit=1)
+    if not parts:
+        return cmd_text
+    token = re.sub(r"@\w+$", "", parts[0])
+    if len(parts) == 1:
+        return token
+    return f"{token} {parts[1]}"
 
 
 async def forward_command_handler(
@@ -563,8 +692,8 @@ async def forward_command_handler(
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     cmd_text = update.message.text or ""
-    # The full text is already a slash command like "/clear" or "/compact foo"
-    cc_slash = cmd_text.split("@")[0]  # strip bot mention
+    # The full text is already a slash command like "/clear" or "/compact foo".
+    cc_slash = _strip_bot_mention(cmd_text)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
@@ -620,6 +749,33 @@ _IMAGES_DIR = ccbot_dir() / "images"
 _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+async def _media_blocked_by_ui(
+    bot: Bot,
+    message: Message,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+) -> bool:
+    """Refuse to forward media into a window with a pending interactive UI.
+
+    text_handler deliberately still sends text when a UI is on screen — a
+    short reply may legitimately BE the menu answer (e.g. "1", "yes"). Photo
+    captions and voice transcripts can never be a menu answer — they're a
+    file path / free-form transcript — so unlike text, blocking here is
+    unambiguously correct rather than a design trade-off.
+    """
+    pane_text = await tmux_manager.capture_pane(window_id)
+    if not pane_text or not is_interactive_ui(pane_text):
+        return False
+    await handle_interactive_ui(bot, user_id, window_id, thread_id)
+    await safe_reply(
+        message,
+        "⚠️ Claude is waiting on an interactive prompt in this topic — "
+        "answer it first (dialog above), then resend.",
+    )
+    return True
+
+
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle photos sent by the user: download and forward path to Claude Code."""
     user = update.effective_user
@@ -661,6 +817,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
             "Send a message to start a new session.",
         )
+        return
+
+    if await _media_blocked_by_ui(context.bot, update.message, user.id, wid, thread_id):
         return
 
     # Download the highest-resolution photo
@@ -741,6 +900,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    if await _media_blocked_by_ui(context.bot, update.message, user.id, wid, thread_id):
+        return
+
     # Download voice as in-memory bytes
     voice_file = await update.message.voice.get_file()
     ogg_data = bytes(await voice_file.download_as_bytearray())
@@ -817,7 +979,9 @@ async def _capture_bash_output(
 
             last_output = output
 
-            # Truncate to fit Telegram's 4096-char limit
+            # Truncate to fit Telegram's 4096-char limit. This is a live
+            # terminal window (only the tail is ever meaningful while the
+            # command keeps running), not stored-content truncation.
             if len(output) > 3800:
                 output = "… " + output[-3800:]
 
@@ -832,25 +996,32 @@ async def _capture_bash_output(
                 if sent:
                     msg_id = sent.message_id
             else:
-                # Subsequent captures — edit in place
+                # Subsequent captures — edit in place, MarkdownV2 falling
+                # back to plain text.
                 try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=convert_markdown(output),
-                        parse_mode="MarkdownV2",
-                        link_preview_options=NO_LINK_PREVIEW,
+                    await edit_with_fallback(bot, chat_id, msg_id, output)
+                except RetryAfter as e:
+                    retry_secs = (
+                        e.retry_after
+                        if isinstance(e.retry_after, (int, float))
+                        else e.retry_after.total_seconds()
                     )
-                except Exception:
+                    await asyncio.sleep(retry_secs)
                     try:
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            text=output,
-                            link_preview_options=NO_LINK_PREVIEW,
+                        await edit_with_fallback(bot, chat_id, msg_id, output)
+                    except RetryAfter as e2:
+                        logger.warning(
+                            "Bash-output edit rate-limited twice for chat "
+                            "%s; skipping this tick: %s",
+                            chat_id,
+                            e2,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        logger.warning(
+                            "Bash-output edit failed after retry for chat %s: %s",
+                            chat_id,
+                            e2,
+                        )
 
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
@@ -880,54 +1051,34 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = update.message.text
 
-    # Ignore text in window picker mode (only for the same thread)
-    if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
-            await safe_reply(
-                update.message,
-                "Please use the window picker above, or tap Cancel.",
-            )
-            return
-        # Stale picker state from a different thread — clear it
-        clear_window_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
+    # Directory-browser/window-picker/session-picker state is per-thread
+    # (RC13 / f31 / f33): a flow in progress in another topic is stored
+    # under its own thread_id and can never be seen or clobbered here.
+    browse_state = (
+        get_browse_state(context.user_data, thread_id) if thread_id is not None else {}
+    )
+    current_state = browse_state.get(STATE_KEY)
 
-    # Ignore text in directory browsing mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
-            await safe_reply(
-                update.message,
-                "Please use the directory browser above, or tap Cancel.",
-            )
-            return
-        # Stale browsing state from a different thread — clear it
-        clear_browse_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
+    if current_state == STATE_SELECTING_WINDOW:
+        await safe_reply(
+            update.message,
+            "Please use the window picker above, or tap Cancel.",
+        )
+        return
 
-    # Ignore text in session picker mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_SELECTING_SESSION
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
-            await safe_reply(
-                update.message,
-                "Please use the session picker above, or tap Cancel.",
-            )
-            return
-        # Stale picker state from a different thread — clear it
-        clear_session_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
-        context.user_data.pop("_selected_path", None)
+    if current_state == STATE_BROWSING_DIRECTORY:
+        await safe_reply(
+            update.message,
+            "Please use the directory browser above, or tap Cancel.",
+        )
+        return
+
+    if current_state == STATE_SELECTING_SESSION:
+        await safe_reply(
+            update.message,
+            "Please use the session picker above, or tap Cancel.",
+        )
+        return
 
     # Must be in a named topic
     if thread_id is None:
@@ -963,11 +1114,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 thread_id,
             )
             msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
+            set_browse_state(
+                context.user_data,
+                thread_id,
+                {
+                    STATE_KEY: STATE_SELECTING_WINDOW,
+                    UNBOUND_WINDOWS_KEY: win_ids,
+                    PENDING_TEXT_KEY: text,
+                },
+            )
             await safe_reply(update.message, msg_text, reply_markup=keyboard)
             return
 
@@ -979,13 +1134,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         start_path = _resolve_browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data["_pending_thread_text"] = text
+        set_browse_state(
+            context.user_data,
+            thread_id,
+            {
+                STATE_KEY: STATE_BROWSING_DIRECTORY,
+                BROWSE_PATH_KEY: start_path,
+                BROWSE_PAGE_KEY: 0,
+                BROWSE_DIRS_KEY: subdirs,
+                PENDING_TEXT_KEY: text,
+            },
+        )
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
         return
 
@@ -1050,6 +1209,34 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Window creation helper ---
 
 
+def _bind_outcome_message(message: str, hook_ok: bool, resumed: bool) -> str:
+    """Build the user-facing text for a just-created, topic-bound window.
+
+    ``message`` is the tmux window-creation confirmation (e.g. "Created
+    window 'foo' at /path"). ``hook_ok`` reports whether Claude Code's
+    SessionStart hook registered the window in session_map within the
+    timeout. ``resumed`` distinguishes a `--resume` window from a fresh one.
+
+    Resume windows get their WindowState.session_id manually pinned by the
+    caller even when the hook times out, so routing works either way and the
+    normal "Resumed" text stays truthful regardless of ``hook_ok``. Fresh
+    windows have no such fallback: if the hook never registers,
+    WindowState.session_id stays empty forever and every Claude reply is
+    silently dropped at routing, so that path gets an honest warning instead
+    of a false "success" message (f65 / RC29).
+    """
+    if not hook_ok and not resumed:
+        return (
+            f"⚠️ {message}\n\n"
+            "Window created, but Claude session tracking did not register "
+            "(SessionStart hook missing or failed). You can send messages, "
+            "but replies may not reach this topic. Fix: run `ccbot hook "
+            "--install`, then use /restart here."
+        )
+    status = "Resumed" if resumed else "Created"
+    return f"✅ {message}\n\n{status}. Send messages here."
+
+
 async def _create_and_bind_window(
     query: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1066,6 +1253,16 @@ async def _create_and_bind_window(
 
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
+
+    # Capture this topic's pending first message (if any) before dropping
+    # its browse/picker state — this is the only remaining use of it.
+    pending_text = (
+        get_browse_state(context.user_data, pending_thread_id).get(PENDING_TEXT_KEY)
+        if pending_thread_id is not None
+        else None
+    )
+    if pending_thread_id is not None:
+        clear_browse_state(context.user_data, pending_thread_id)
 
     success, message, created_wname, created_wid = await tmux_manager.create_window(
         selected_path, resume_session_id=resume_session_id
@@ -1087,6 +1284,19 @@ async def _create_and_bind_window(
         hook_ok = await session_manager.wait_for_session_map_entry(
             created_wid, timeout=hook_timeout
         )
+        if not hook_ok and not resume_session_id:
+            # No resume-override fallback exists for fresh windows: if the
+            # hook never registers, WindowState.session_id stays empty
+            # forever and every Claude reply is silently dropped at
+            # routing (outbound sends still work). Surface it loudly.
+            logger.warning(
+                "SessionStart hook did not register fresh window %s "
+                "(cwd=%s) within %.1fs; Claude replies will not route to "
+                "its topic until 'ccbot hook --install' + /restart fix it",
+                created_wid,
+                selected_path,
+                hook_timeout,
+            )
 
         # --resume creates a new session_id in the hook, but messages continue
         # writing to the resumed session's JSONL file. Override window_state to
@@ -1095,7 +1305,9 @@ async def _create_and_bind_window(
             ws = session_manager.get_window_state(created_wid)
             if not hook_ok:
                 # Hook timed out — manually populate window_state so the
-                # monitor can still route messages back to this topic.
+                # monitor can still route messages back to this topic. Pin
+                # over "" so ANY future hook entry with a non-empty, different
+                # session_id unpins (the hook-sync loop must not revert this).
                 logger.warning(
                     "Hook timed out for resume window %s, "
                     "manually setting session_id=%s cwd=%s",
@@ -1106,6 +1318,7 @@ async def _create_and_bind_window(
                 ws.session_id = resume_session_id
                 ws.cwd = str(selected_path)
                 ws.window_name = created_wname
+                ws.pinned_over = ""
                 session_manager._save_state()
             elif ws.session_id != resume_session_id:
                 logger.info(
@@ -1114,6 +1327,9 @@ async def _create_and_bind_window(
                     ws.session_id,
                     resume_session_id,
                 )
+                # Pin over the hook-reported sid being outranked so the
+                # hook-sync loop doesn't revert this override on its next poll.
+                ws.pinned_over = ws.session_id
                 ws.session_id = resume_session_id
                 session_manager._save_state()
 
@@ -1128,9 +1344,19 @@ async def _create_and_bind_window(
 
         if pending_thread_id is not None:
             # Thread bind flow: bind thread to newly created window
-            session_manager.bind_thread(
+            bound = session_manager.bind_thread(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
+            if not bound:
+                # Freshly created window already bound to another topic
+                # (should not happen in practice, but the owner refuses to
+                # guess — see RC3/RC4).
+                await safe_edit(
+                    query,
+                    "❌ That window is already bound to another topic.",
+                )
+                await query.answer("Already bound")
+                return
 
             # Rename the topic to match the window name
             resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
@@ -1143,27 +1369,20 @@ async def _create_and_bind_window(
             except Exception as e:
                 logger.debug(f"Failed to rename topic: {e}")
 
-            status = "Resumed" if resume_session_id else "Created"
             await safe_edit(
                 query,
-                f"✅ {message}\n\n{status}. Send messages here.",
+                _bind_outcome_message(
+                    message, hook_ok=hook_ok, resumed=bool(resume_session_id)
+                ),
             )
 
             # Send pending text if any
-            pending_text = (
-                context.user_data.get("_pending_thread_text")
-                if context.user_data
-                else None
-            )
             if pending_text:
                 logger.debug(
                     "Forwarding pending text to window %s (len=%d)",
                     created_wname,
                     len(pending_text),
                 )
-                if context.user_data is not None:
-                    context.user_data.pop("_pending_thread_text", None)
-                    context.user_data.pop("_pending_thread_id", None)
                 send_ok, send_msg = await session_manager.send_to_window(
                     created_wid,
                     pending_text,
@@ -1176,16 +1395,11 @@ async def _create_and_bind_window(
                         f"❌ Failed to send pending message: {send_msg}",
                         message_thread_id=pending_thread_id,
                     )
-            elif context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
         else:
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
     else:
         await safe_edit(query, f"❌ {message}")
-        if pending_thread_id is not None and context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
     await query.answer("Created" if success else "Failed")
 
 
@@ -1252,13 +1466,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Directory browser handlers
     elif data.startswith(CB_DIR_SELECT):
-        # Validate: callback must come from the same topic that started browsing
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
-            return
+        # State is resolved from this callback's own topic — a stale button
+        # from a superseded browse in another topic can't read/clobber it.
+        dir_thread_id = _get_thread_id(update)
         # callback_data contains index, not dir name (to avoid 64-byte limit)
         try:
             idx = int(data[len(CB_DIR_SELECT) :])
@@ -1266,10 +1476,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Invalid data")
             return
 
-        # Look up dir name from cached subdirs
-        cached_dirs: list[str] = (
-            context.user_data.get(BROWSE_DIRS_KEY, []) if context.user_data else []
-        )
+        # Look up dir name from this topic's cached subdirs
+        browse_state = get_browse_state(context.user_data, dir_thread_id)
+        cached_dirs: list[str] = browse_state.get(BROWSE_DIRS_KEY, [])
         if idx < 0 or idx >= len(cached_dirs):
             await query.answer(
                 "Directory list changed, please refresh", show_alert=True
@@ -1278,11 +1487,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         subdir_name = cached_dirs[idx]
 
         default_path = str(Path.cwd())
-        current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
-        )
+        current_path = browse_state.get(BROWSE_PATH_KEY, default_path)
         new_path = (Path(current_path) / subdir_name).resolve()
 
         if not new_path.exists() or not new_path.is_dir():
@@ -1290,103 +1495,84 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         new_path_str = str(new_path)
-        if context.user_data is not None:
-            context.user_data[BROWSE_PATH_KEY] = new_path_str
-            context.user_data[BROWSE_PAGE_KEY] = 0
-
         msg_text, keyboard, subdirs = build_directory_browser(new_path_str)
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        set_browse_state(
+            context.user_data,
+            dir_thread_id,
+            {
+                BROWSE_PATH_KEY: new_path_str,
+                BROWSE_PAGE_KEY: 0,
+                BROWSE_DIRS_KEY: subdirs,
+            },
+        )
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data == CB_DIR_UP:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
-            return
+        dir_thread_id = _get_thread_id(update)
+        browse_state = get_browse_state(context.user_data, dir_thread_id)
         default_path = str(Path.cwd())
-        current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
-        )
+        current_path = browse_state.get(BROWSE_PATH_KEY, default_path)
         current = Path(current_path).resolve()
         parent = current.parent
         # No restriction - allow navigating anywhere
 
         parent_path = str(parent)
-        if context.user_data is not None:
-            context.user_data[BROWSE_PATH_KEY] = parent_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-
         msg_text, keyboard, subdirs = build_directory_browser(parent_path)
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        set_browse_state(
+            context.user_data,
+            dir_thread_id,
+            {
+                BROWSE_PATH_KEY: parent_path,
+                BROWSE_PAGE_KEY: 0,
+                BROWSE_DIRS_KEY: subdirs,
+            },
+        )
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data.startswith(CB_DIR_PAGE):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
-            return
+        dir_thread_id = _get_thread_id(update)
         try:
             pg = int(data[len(CB_DIR_PAGE) :])
         except ValueError:
             await query.answer("Invalid data")
             return
+        browse_state = get_browse_state(context.user_data, dir_thread_id)
         default_path = str(Path.cwd())
-        current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
-        )
-        if context.user_data is not None:
-            context.user_data[BROWSE_PAGE_KEY] = pg
+        current_path = browse_state.get(BROWSE_PATH_KEY, default_path)
 
         msg_text, keyboard, subdirs = build_directory_browser(current_path, pg)
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        set_browse_state(
+            context.user_data,
+            dir_thread_id,
+            {BROWSE_PAGE_KEY: pg, BROWSE_DIRS_KEY: subdirs},
+        )
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data == CB_DIR_CONFIRM:
+        # This topic's own thread_id doubles as the thread-bind flow's
+        # pending_thread_id — the browse state lives under this same key.
+        pending_thread_id = _get_thread_id(update)
+        browse_state = get_browse_state(context.user_data, pending_thread_id)
         default_path = str(Path.cwd())
-        selected_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
-        )
-        # Check if this was initiated from a thread bind flow
-        pending_thread_id: int | None = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-
-        # Validate: confirm button must come from the same topic that started browsing
-        confirm_thread_id = _get_thread_id(update)
-        if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
-            clear_browse_state(context.user_data)
-            if context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
-                context.user_data.pop("_pending_thread_text", None)
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
-            return
-
-        clear_browse_state(context.user_data)
+        selected_path = browse_state.get(BROWSE_PATH_KEY, default_path)
 
         # Check for existing sessions in this directory
         sessions = await session_manager.list_sessions_for_directory(selected_path)
         if sessions:
-            # Show session picker — store state for later
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
-                context.user_data[SESSIONS_KEY] = sessions
-                context.user_data["_selected_path"] = selected_path
+            # Show session picker — store state for later. Any pending first
+            # message for this topic stays untouched in its own entry.
+            set_browse_state(
+                context.user_data,
+                pending_thread_id,
+                {
+                    STATE_KEY: STATE_SELECTING_SESSION,
+                    SESSIONS_KEY: sessions,
+                    SELECTED_PATH_KEY: selected_path,
+                },
+            )
             text, keyboard = build_session_picker(sessions)
             await safe_edit(query, text, reply_markup=keyboard)
             await query.answer()
@@ -1398,53 +1584,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     elif data == CB_DIR_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
-            return
-        clear_browse_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+        clear_browse_state(context.user_data, _get_thread_id(update))
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
     # Session picker: resume existing session
     elif data.startswith(CB_SESSION_SELECT):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        # Fallback: if _pending_thread_id was cleared (e.g. by a message in
-        # another topic), recover it from the callback query's message context
-        if pending_tid is None:
-            pending_tid = _get_thread_id(update)
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
-            return
+        pending_tid = _get_thread_id(update)
         try:
             idx = int(data[len(CB_SESSION_SELECT) :])
         except ValueError:
             await query.answer("Invalid data")
             return
 
-        cached_sessions = (
-            context.user_data.get(SESSIONS_KEY, []) if context.user_data else []
-        )
+        browse_state = get_browse_state(context.user_data, pending_tid)
+        cached_sessions = browse_state.get(SESSIONS_KEY, [])
         if idx < 0 or idx >= len(cached_sessions):
             await query.answer("Session not found")
             return
 
         session = cached_sessions[idx]
-        selected_path = (
-            context.user_data.get("_selected_path", str(Path.cwd()))
-            if context.user_data
-            else str(Path.cwd())
-        )
-        clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_selected_path", None)
+        selected_path = browse_state.get(SELECTED_PATH_KEY, str(Path.cwd()))
 
         await _create_and_bind_window(
             query,
@@ -1456,57 +1616,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     elif data == CB_SESSION_NEW:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is None:
-            pending_tid = _get_thread_id(update)
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
-            return
-        selected_path = (
-            context.user_data.get("_selected_path", str(Path.cwd()))
-            if context.user_data
-            else str(Path.cwd())
-        )
-        clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_selected_path", None)
+        pending_tid = _get_thread_id(update)
+        browse_state = get_browse_state(context.user_data, pending_tid)
+        selected_path = browse_state.get(SELECTED_PATH_KEY, str(Path.cwd()))
 
         await _create_and_bind_window(query, context, user, selected_path, pending_tid)
 
     elif data == CB_SESSION_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
-            return
-        clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop("_selected_path", None)
+        clear_browse_state(context.user_data, _get_thread_id(update))
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
     # Window picker: bind existing window
     elif data.startswith(CB_WIN_BIND):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+        thread_id = _get_thread_id(update)
+        if thread_id is None:
+            await query.answer("Not in a topic", show_alert=True)
             return
+
         try:
             idx = int(data[len(CB_WIN_BIND) :])
         except ValueError:
             await query.answer("Invalid data")
             return
 
-        cached_windows: list[str] = (
-            context.user_data.get(UNBOUND_WINDOWS_KEY, []) if context.user_data else []
-        )
+        browse_state = get_browse_state(context.user_data, thread_id)
+        cached_windows: list[str] = browse_state.get(UNBOUND_WINDOWS_KEY, [])
         if idx < 0 or idx >= len(cached_windows):
             await query.answer("Window list changed, please retry", show_alert=True)
             return
@@ -1519,16 +1654,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer(f"Window '{display}' no longer exists", show_alert=True)
             return
 
-        thread_id = _get_thread_id(update)
-        if thread_id is None:
-            await query.answer("Not in a topic", show_alert=True)
-            return
-
         display = w.window_name
-        clear_window_picker_state(context.user_data)
-        session_manager.bind_thread(
+        pending_text = browse_state.get(PENDING_TEXT_KEY)
+        clear_browse_state(context.user_data, thread_id)
+        bound = session_manager.bind_thread(
             user.id, thread_id, selected_wid, window_name=display
         )
+        if not bound:
+            # Someone else bound this window between the picker snapshot and
+            # this confirmation (or a concurrent picker did) — refuse the
+            # double-bind rather than cross-wire two topics onto one window
+            # (RC4/f46).
+            await safe_edit(
+                query,
+                "❌ That window is already bound to another topic.",
+            )
+            await query.answer("Already bound", show_alert=True)
+            return
 
         # Rename the topic to match the window name
         resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
@@ -1547,12 +1689,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
         # Forward pending text if any
-        pending_text = (
-            context.user_data.get("_pending_thread_text") if context.user_data else None
-        )
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop("_pending_thread_id", None)
         if pending_text:
             send_ok, send_msg = await session_manager.send_to_window(
                 selected_wid, pending_text
@@ -1569,36 +1705,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Window picker: new session → transition to directory browser
     elif data == CB_WIN_NEW:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
-            return
-        # Preserve pending thread info, clear only picker state
-        clear_window_picker_state(context.user_data)
+        thread_id = _get_thread_id(update)
+        # Transition to the directory browser; any pending first message for
+        # this topic stays untouched in its own entry.
         start_path = _resolve_browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        set_browse_state(
+            context.user_data,
+            thread_id,
+            {
+                STATE_KEY: STATE_BROWSING_DIRECTORY,
+                BROWSE_PATH_KEY: start_path,
+                BROWSE_PAGE_KEY: 0,
+                BROWSE_DIRS_KEY: subdirs,
+            },
+        )
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     # Window picker: cancel
     elif data == CB_WIN_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
-            return
-        clear_window_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+        clear_browse_state(context.user_data, _get_thread_id(update))
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
@@ -1636,100 +1763,59 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Up", thread_id)
+        await query.answer(None if status == "Up" else status)
 
     # Interactive UI: Down arrow
     elif data.startswith(CB_ASK_DOWN):
         window_id = data[len(CB_ASK_DOWN) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Down", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Down", thread_id)
+        await query.answer(None if status == "Down" else status)
 
     # Interactive UI: Left arrow
     elif data.startswith(CB_ASK_LEFT):
         window_id = data[len(CB_ASK_LEFT) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Left", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Left", thread_id)
+        await query.answer(None if status == "Left" else status)
 
     # Interactive UI: Right arrow
     elif data.startswith(CB_ASK_RIGHT):
         window_id = data[len(CB_ASK_RIGHT) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Right", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer()
+        status = await send_ui_key(context.bot, user.id, window_id, "Right", thread_id)
+        await query.answer(None if status == "Right" else status)
 
     # Interactive UI: Escape
     elif data.startswith(CB_ASK_ESC):
         window_id = data[len(CB_ASK_ESC) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Escape", enter=False, literal=False
-            )
-            await clear_interactive_msg(user.id, context.bot, thread_id)
-        await query.answer("⎋ Esc")
+        status = await send_ui_key(
+            context.bot, user.id, window_id, "Escape", thread_id, clear_on_send=True
+        )
+        await query.answer("⎋ Esc" if status == "Escape" else status)
 
     # Interactive UI: Enter
     elif data.startswith(CB_ASK_ENTER):
         window_id = data[len(CB_ASK_ENTER) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Enter", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("⏎ Enter")
+        status = await send_ui_key(context.bot, user.id, window_id, "Enter", thread_id)
+        await query.answer("⏎ Enter" if status == "Enter" else status)
 
     # Interactive UI: Space
     elif data.startswith(CB_ASK_SPACE):
         window_id = data[len(CB_ASK_SPACE) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Space", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("␣ Space")
+        status = await send_ui_key(context.bot, user.id, window_id, "Space", thread_id)
+        await query.answer("␣ Space" if status == "Space" else status)
 
     # Interactive UI: Tab
     elif data.startswith(CB_ASK_TAB):
         window_id = data[len(CB_ASK_TAB) :]
         thread_id = _get_thread_id(update)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
-        await query.answer("⇥ Tab")
+        status = await send_ui_key(context.bot, user.id, window_id, "Tab", thread_id)
+        await query.answer("⇥ Tab" if status == "Tab" else status)
 
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):
@@ -1889,6 +1975,41 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 # --- App lifecycle ---
 
 
+def _prefill_limiter(limiter: AsyncLimiter) -> None:
+    """Make an aiolimiter bucket start "full" immediately, surviving a restart.
+
+    Telegram's server-side flood counters persist across bot restarts, so a
+    freshly-constructed (empty) local bucket would let ccbot burst back up
+    to ``max_rate`` requests the moment it reconnects -- against a
+    server-side counter that never reset. Setting ``_level`` to ``max_rate``
+    alone is not enough: aiolimiter's ``_leak()`` drains the bucket based on
+    elapsed *loop* time since ``_last_check``, which defaults to ``0.0`` at
+    construction. The very first capacity check after pre-fill would then
+    see an "elapsed" of (current loop time - 0.0) -- an enormous number --
+    and instantly zero the level back out, silently undoing the pre-fill
+    regardless of how soon the first request actually arrives. Stamping
+    ``_last_check`` with the current loop time (the same clock ``_leak()``
+    reads via ``self._loop.time()``) closes that gap.
+    """
+    if not (hasattr(limiter, "_level") and hasattr(limiter, "_last_check")):
+        logger.warning(
+            "aiolimiter.AsyncLimiter is missing expected _level/_last_check "
+            "attributes (library version mismatch?); skipping rate limiter "
+            "pre-fill"
+        )
+        return
+    try:
+        now = limiter._loop.time()
+    except AttributeError:
+        logger.warning(
+            "aiolimiter.AsyncLimiter is missing the expected _loop clock "
+            "(library version mismatch?); skipping rate limiter pre-fill"
+        )
+        return
+    limiter._level = limiter.max_rate
+    limiter._last_check = now
+
+
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task
 
@@ -1914,20 +2035,20 @@ async def post_init(application: Application) -> None:
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
-    # server-side counter persists across bot restarts.  Setting _level=max_rate
-    # forces the bucket to start "full" so capacity drains in naturally (~1s).
+    # server-side counter persists across bot restarts. _prefill_limiter()
+    # forces the bucket to start "full" so capacity drains in naturally (~1s)
+    # instead of being immediately reset by aiolimiter's leak calculation --
+    # see its docstring for why the clock reference must be stamped too.
     # AIORateLimiter has no per-private-chat limiter, so max_retries is the
     # primary protection (retry + pause all concurrent requests on 429).
     rate_limiter = application.bot.rate_limiter
     if rate_limiter and rate_limiter._base_limiter:
-        rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
+        _prefill_limiter(rate_limiter._base_limiter)
         logger.info("Pre-filled global rate limiter bucket")
         # Also pre-fill per-group limiters for known chat IDs.
         # Without this, the group limiter allows a burst of 20 requests on restart,
         # which can exceed Telegram's persisted server-side per-group counter.
         if hasattr(rate_limiter, "_group_limiters"):
-            from aiolimiter import AsyncLimiter
-
             group_rate = getattr(rate_limiter, "_group_max_rate", 20)
             group_period = getattr(rate_limiter, "_group_time_period", 60)
             seen_chat_ids: set[int] = set()
@@ -1935,7 +2056,7 @@ async def post_init(application: Application) -> None:
                 if chat_id < 0 and chat_id not in seen_chat_ids:
                     seen_chat_ids.add(chat_id)
                     limiter = AsyncLimiter(group_rate, group_period)
-                    limiter._level = limiter.max_rate
+                    _prefill_limiter(limiter)
                     rate_limiter._group_limiters[chat_id] = limiter
             if seen_chat_ids:
                 logger.info(
@@ -1965,13 +2086,17 @@ async def post_init(application: Application) -> None:
     session_monitor = monitor
     logger.info("Session monitor started")
 
-    # Start status polling task
-    _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
+    # Start status polling task (supervised: restarts on crash/unexpected exit)
+    _status_poll_task = asyncio.create_task(
+        supervise_loop("status polling", lambda: status_poll_loop(application.bot))
+    )
     logger.info("Status polling task started")
 
-    # Start local-state maintenance task (session_map hygiene)
+    # Start local-state maintenance task (session_map hygiene), supervised
     global _maintenance_task
-    _maintenance_task = asyncio.create_task(maintenance_loop(application.bot))
+    _maintenance_task = asyncio.create_task(
+        supervise_loop("maintenance", lambda: maintenance_loop(application.bot))
+    )
     logger.info("Maintenance task started")
 
 
@@ -1999,8 +2124,10 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Maintenance stopped")
 
     # Order matters: stop producers, flush queues, THEN cancel workers.
-    # 1. The session monitor enqueues already-read-but-unsent messages (offsets
-    #    advance on read, so these would be lost on the next start otherwise).
+    # 1. The session monitor enqueues already-read-but-undelivered messages.
+    #    Offsets now advance only on delivery ACK (see session_monitor's
+    #    delivery contract), so nothing is lost if we skip this — but
+    #    draining first avoids needlessly redelivering them next start.
     if session_monitor:
         await session_monitor.drain_callbacks()
         session_monitor.stop()
@@ -2032,6 +2159,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

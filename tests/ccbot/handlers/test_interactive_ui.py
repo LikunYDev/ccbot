@@ -7,6 +7,7 @@ import pytest
 from ccbot.handlers.interactive_ui import (
     _build_interactive_keyboard,
     handle_interactive_ui,
+    send_ui_key,
 )
 from ccbot.handlers.callback_data import (
     CB_ASK_DOWN,
@@ -380,6 +381,108 @@ class TestEditNotModified:
         assert result is True
         mock_bot.send_message.assert_called_once()
         assert _interactive_msgs[(1, 42)] == 999  # replaced by the new message
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestSendUiKey:
+    """`send_ui_key` re-verifies the dialog is still live in the pane before
+    sending a keystroke (review finding f69, root cause RC30): a still-visible
+    Telegram button tap must not fire a bare arrow/Enter/Space into whatever
+    now occupies the pane after the user answered directly in the terminal."""
+
+    def _patches(self):
+        mock_window = MagicMock()
+        mock_window.window_id = "@5"
+        p_tmux = patch("ccbot.handlers.interactive_ui.tmux_manager")
+        p_sm = patch("ccbot.handlers.interactive_ui.session_manager")
+        p_sleep = patch("ccbot.handlers.interactive_ui.asyncio.sleep", new=AsyncMock())
+        return mock_window, p_tmux, p_sm, p_sleep
+
+    @pytest.mark.asyncio
+    async def test_window_gone_sends_no_keystroke_and_clears(self, mock_bot: AsyncMock):
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        _, p_tmux, p_sm, p_sleep = self._patches()
+        _interactive_msgs[(1, 42)] = 555
+
+        with p_tmux as mock_tmux, p_sm as mock_sm, p_sleep:
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await send_ui_key(mock_bot, 1, "@5", "Up", 42)
+
+        assert result == "Window no longer exists"
+        mock_tmux.send_keys.assert_not_called()
+        assert (1, 42) not in _interactive_msgs
+
+    @pytest.mark.asyncio
+    async def test_dialog_no_longer_active_sends_no_keystroke_and_clears(
+        self, mock_bot: AsyncMock
+    ):
+        """Pane has moved on (e.g. answered directly in the terminal) — the
+        keystroke must be withheld and the stale tracked message cleared."""
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        mock_window, p_tmux, p_sm, p_sleep = self._patches()
+        _interactive_msgs[(1, 42)] = 555
+
+        with p_tmux as mock_tmux, p_sm as mock_sm, p_sleep:
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value="$ echo hello\nhello\n$\n")
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await send_ui_key(mock_bot, 1, "@5", "Up", 42)
+
+        assert result == "Dialog no longer active"
+        mock_tmux.send_keys.assert_not_called()
+        assert (1, 42) not in _interactive_msgs
+
+    @pytest.mark.asyncio
+    async def test_ui_present_sends_keystroke_and_rerenders(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        mock_window, p_tmux, p_sm, p_sleep = self._patches()
+
+        with p_tmux as mock_tmux, p_sm as mock_sm, p_sleep:
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_tmux.send_keys = AsyncMock(return_value=True)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await send_ui_key(mock_bot, 1, "@5", "Up", 42)
+
+        assert result == "Up"
+        mock_tmux.send_keys.assert_called_once_with(
+            "@5", "Up", enter=False, literal=False
+        )
+        # Re-render happened via handle_interactive_ui.
+        mock_bot.send_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_clear_on_send_clears_without_rerender(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        mock_window, p_tmux, p_sm, p_sleep = self._patches()
+        _interactive_msgs[(1, 42)] = 555
+
+        with p_tmux as mock_tmux, p_sm as mock_sm, p_sleep:
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_tmux.send_keys = AsyncMock(return_value=True)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await send_ui_key(
+                mock_bot, 1, "@5", "Escape", 42, clear_on_send=True
+            )
+
+        assert result == "Escape"
+        mock_tmux.send_keys.assert_called_once_with(
+            "@5", "Escape", enter=False, literal=False
+        )
+        mock_bot.send_message.assert_not_called()
+        assert (1, 42) not in _interactive_msgs
 
 
 class TestKeyboardLayoutForSettings:

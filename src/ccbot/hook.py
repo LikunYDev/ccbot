@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +356,7 @@ def hook_main() -> None:
     session_id = payload.get("session_id", "")
     cwd = payload.get("cwd", "")
     event = payload.get("hook_event_name", "")
+    transcript_path = payload.get("transcript_path", "")
 
     if not session_id or not event:
         logger.debug("Empty session_id or event, ignoring")
@@ -413,6 +415,22 @@ def hook_main() -> None:
     # Key uses window_id for uniqueness
     session_window_key = f"{tmux_session_name}:{window_id}"
 
+    # The transcript's size at this exact SessionStart moment — only the hook
+    # can observe this. The monitor seeds a newly-noticed session's read
+    # offset here instead of at current EOF, so a reply that lands before
+    # the monitor's first poll (or before it ever notices the session) is
+    # not silently skipped (review f17/RC38).
+    transcript_size_at_start = 0
+    if (
+        transcript_path
+        and os.path.isabs(transcript_path)
+        and os.path.exists(transcript_path)
+    ):
+        try:
+            transcript_size_at_start = os.path.getsize(transcript_path)
+        except OSError:
+            transcript_size_at_start = 0
+
     logger.debug(
         "tmux key=%s, window_name=%s, session_id=%s, cwd=%s",
         session_window_key,
@@ -433,7 +451,7 @@ def hook_main() -> None:
             fcntl.flock(lock_f, fcntl.LOCK_EX)
             logger.debug("Acquired lock on %s", lock_path)
             try:
-                session_map: dict[str, dict[str, str]] = {}
+                session_map: dict[str, dict[str, Any]] = {}
                 if map_file.exists():
                     try:
                         session_map = json.loads(map_file.read_text())
@@ -471,6 +489,7 @@ def hook_main() -> None:
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
+                    "transcript_size_at_start": transcript_size_at_start,
                 }
 
                 # Clean up old-format key ("session:window_name") if it exists.

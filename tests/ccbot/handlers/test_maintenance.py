@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from telegram.error import RetryAfter
 
 import ccbot.handlers.maintenance as maintenance
 from ccbot.config import config
@@ -52,9 +53,14 @@ class TestHookFailureNotices:
             },
         )
 
-        with patch("ccbot.handlers.maintenance.session_manager", sm):
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
             await maintenance._check_hook_failures(bot)  # first run: seek EOF
-            bot.send_message.assert_not_called()
+            mock_safe_send.assert_not_called()
 
             with open(failures, "a") as f:
                 f.write(
@@ -70,11 +76,13 @@ class TestHookFailureNotices:
                 )
             await maintenance._check_hook_failures(bot)
 
-        bot.send_message.assert_called_once()
-        kwargs = bot.send_message.call_args.kwargs
+        mock_safe_send.assert_called_once()
+        args, kwargs = mock_safe_send.call_args
+        assert args[1] == 100  # chat_id from resolve_chat_id
+        text = args[2]
         assert kwargs["message_thread_id"] == 42  # /proj topic only
-        assert "no unique claude window" in kwargs["text"]
-        assert "44444444" in kwargs["text"]
+        assert "no unique claude window" in text
+        assert "44444444" in text
 
     @pytest.mark.asyncio
     async def test_processed_lines_are_not_resent(self, tmp_path, monkeypatch):
@@ -87,14 +95,91 @@ class TestHookFailureNotices:
             window_states={"@41": SimpleNamespace(session_id="s", cwd="/proj")},
         )
 
-        with patch("ccbot.handlers.maintenance.session_manager", sm):
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
             await maintenance._check_hook_failures(bot)
             with open(failures, "a") as f:
                 f.write(json.dumps({"cwd": "/proj", "reason": "r"}) + "\n")
             await maintenance._check_hook_failures(bot)
             await maintenance._check_hook_failures(bot)
 
-        assert bot.send_message.call_count == 1
+        assert mock_safe_send.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_notice_falls_back_to_plain_text_on_markdown_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Exercises the real safe_send wiring (not mocked): MarkdownV2 first,
+        plain text fallback on failure — proving the notice is no longer a
+        bare bot.send_message call with no fallback."""
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        failures = tmp_path / "hook_failures.jsonl"
+        failures.write_text("")
+        bot = AsyncMock()
+        calls: list[dict] = []
+
+        async def fake_send(*_args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise ValueError("bad markdown entities")
+            return SimpleNamespace(message_id=1)
+
+        bot.send_message = AsyncMock(side_effect=fake_send)
+        sm = _fake_session_manager(
+            bindings=[(1, 42, "@41")],
+            window_states={"@41": SimpleNamespace(session_id="s", cwd="/proj")},
+        )
+
+        with patch("ccbot.handlers.maintenance.session_manager", sm):
+            await maintenance._check_hook_failures(bot)
+            with open(failures, "a") as f:
+                f.write(json.dumps({"cwd": "/proj", "reason": "r"}) + "\n")
+            await maintenance._check_hook_failures(bot)
+
+        assert len(calls) == 2
+        assert calls[0]["parse_mode"] == "MarkdownV2"
+        assert "parse_mode" not in calls[1]
+        assert calls[1]["message_thread_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_retryafter_on_one_topic_does_not_block_another(
+        self, tmp_path, monkeypatch
+    ):
+        """A RetryAfter delivering to one topic must be logged and skipped,
+        not crash the sweep or block delivery to a second bound topic."""
+        monkeypatch.setattr(config, "session_map_file", tmp_path / "session_map.json")
+        failures = tmp_path / "hook_failures.jsonl"
+        failures.write_text("")
+        bot = AsyncMock()
+        sm = _fake_session_manager(
+            bindings=[(1, 42, "@41"), (1, 43, "@42")],
+            window_states={
+                "@41": SimpleNamespace(session_id="s1", cwd="/proj"),
+                "@42": SimpleNamespace(session_id="s2", cwd="/proj"),
+            },
+        )
+        delivered: list[int | None] = []
+
+        async def fake_safe_send(_bot, _chat_id, _text, **kwargs):
+            thread_id = kwargs.get("message_thread_id")
+            delivered.append(thread_id)
+            if thread_id == 42:
+                raise RetryAfter(retry_after=1)
+
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch("ccbot.handlers.maintenance.safe_send", side_effect=fake_safe_send),
+        ):
+            await maintenance._check_hook_failures(bot)  # first run: seek EOF
+            with open(failures, "a") as f:
+                f.write(json.dumps({"cwd": "/proj", "reason": "r"}) + "\n")
+            await maintenance._check_hook_failures(bot)
+
+        assert delivered == [42, 43]
 
 
 class TestDivergenceDetection:
@@ -142,20 +227,25 @@ class TestDivergenceDetection:
         candidate, sm = self._setup(tmp_path, monkeypatch)
         bot = AsyncMock()
 
-        with patch("ccbot.handlers.maintenance.session_manager", sm):
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
             await maintenance._check_divergence(bot)  # tick 1: observe
-            bot.send_message.assert_not_called()
+            mock_safe_send.assert_not_called()
 
             self._grow(candidate)
             await maintenance._check_divergence(bot)  # tick 2: growth -> notice
-            bot.send_message.assert_called_once()
+            mock_safe_send.assert_called_once()
 
             self._grow(candidate)
             await maintenance._check_divergence(bot)  # tick 3: no duplicate
-            bot.send_message.assert_called_once()
+            mock_safe_send.assert_called_once()
 
-        kwargs = bot.send_message.call_args.kwargs
-        assert "sid-b" in kwargs["text"]
+        args, kwargs = mock_safe_send.call_args
+        assert "sid-b" in args[2]
         assert kwargs["message_thread_id"] == 42
         button = kwargs["reply_markup"].inline_keyboard[0][0]
         assert button.callback_data == "rp:@41:sid-b"
@@ -166,12 +256,17 @@ class TestDivergenceDetection:
         _candidate, sm = self._setup(tmp_path, monkeypatch)
         bot = AsyncMock()
 
-        with patch("ccbot.handlers.maintenance.session_manager", sm):
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
             await maintenance._check_divergence(bot)
             await maintenance._check_divergence(bot)
             await maintenance._check_divergence(bot)
 
-        bot.send_message.assert_not_called()
+        mock_safe_send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_ambiguous_directory_suppresses_notice(self, tmp_path, monkeypatch):
@@ -187,14 +282,19 @@ class TestDivergenceDetection:
         )
         bot = AsyncMock()
 
-        with patch("ccbot.handlers.maintenance.session_manager", sm):
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
             await maintenance._check_divergence(bot)
             self._grow(candidate)
             await maintenance._check_divergence(bot)
             self._grow(candidate)
             await maintenance._check_divergence(bot)
 
-        bot.send_message.assert_not_called()
+        mock_safe_send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_recently_active_tracked_file_clears_episode(
@@ -209,10 +309,34 @@ class TestDivergenceDetection:
         os.utime(tracked, (now, now))
         bot = AsyncMock()
 
-        with patch("ccbot.handlers.maintenance.session_manager", sm):
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send", new_callable=AsyncMock
+            ) as mock_safe_send,
+        ):
             await maintenance._check_divergence(bot)
             self._grow(candidate)
             await maintenance._check_divergence(bot)
 
-        bot.send_message.assert_not_called()
+        mock_safe_send.assert_not_called()
         assert maintenance._divergence == {}
+
+    @pytest.mark.asyncio
+    async def test_retryafter_is_logged_and_swallowed(self, tmp_path, monkeypatch):
+        """A RetryAfter delivering a divergence notice must not propagate out
+        of _check_divergence (run_maintenance_once relies on each step being
+        isolated)."""
+        candidate, sm = self._setup(tmp_path, monkeypatch)
+        bot = AsyncMock()
+
+        with (
+            patch("ccbot.handlers.maintenance.session_manager", sm),
+            patch(
+                "ccbot.handlers.maintenance.safe_send",
+                side_effect=RetryAfter(retry_after=1),
+            ),
+        ):
+            await maintenance._check_divergence(bot)
+            self._grow(candidate)
+            await maintenance._check_divergence(bot)  # must not raise

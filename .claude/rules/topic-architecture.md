@@ -32,15 +32,15 @@ window_display_names: dict[str, str]        # window_id → window_name (for dis
 ```python
 # session_map.json (key format: "tmux_session:window_id")
 {
-  "ccbot:@0": {"session_id": "uuid-xxx", "cwd": "/path/to/project", "window_name": "project"},
-  "ccbot:@5": {"session_id": "uuid-yyy", "cwd": "/path/to/project", "window_name": "project-2"}
+  "ccbot:@0": {"session_id": "uuid-xxx", "cwd": "/path/to/project", "window_name": "project", "transcript_size_at_start": 4821},
+  "ccbot:@5": {"session_id": "uuid-yyy", "cwd": "/path/to/project", "window_name": "project-2", "transcript_size_at_start": 0}
 }
 ```
 
 - Storage: `session_map.json`
-- Written when: Claude Code's `SessionStart` hook fires
+- Written when: Claude Code's `SessionStart` hook fires. Also records `transcript_size_at_start` — the transcript's byte size at that exact moment — which seeds a newly-noticed session's read offset so a reply already on disk before the monitor's first poll of it isn't silently skipped.
 - Property: one window maps to one session; session_id changes after `/clear`
-- Purpose: SessionMonitor uses this mapping to decide which sessions to watch
+- Purpose: the monitor does not read this file directly. `session_manager.load_session_map()` reconciles it into `window_states` (a hook entry is skipped while it still reports a manually-pinned `session_id`, see `WindowState.pinned_over`), and SessionMonitor watches `window_states` — the reconciled authority — to decide which sessions to watch.
 
 ## Message Flows
 
@@ -60,14 +60,14 @@ SessionMonitor reads new message (session_id = "uuid-xxx")
 
 **New topic flow**: First message in an unbound topic → directory browser → select directory → session picker (if existing sessions found) or create window → bind topic → forward pending message.
 
-**Resume session flow**: When selecting a directory with existing Claude sessions, a session picker UI is shown. Choosing a session runs `claude --resume <session_id>`. Note: `--resume` makes the hook report a new session_id but messages continue writing to the original JSONL file; the bot overrides window_state to track the original session_id.
+**Resume session flow**: When selecting a directory with existing Claude sessions, a session picker UI is shown. Choosing a session runs `claude --resume <session_id>`. Note: `--resume` makes the hook report a new session_id but messages continue writing to the original JSONL file, so the bot pins `WindowState.pinned_over` to the original session_id. `load_session_map()` keeps honoring that pin — ignoring hook entries that still report the pinned-over id — until the hook itself reports a genuinely different session_id (e.g. a later `/clear`), at which point the pin is cleared automatically.
 
 **Topic lifecycle**: Closing/deleting a topic auto-kills the associated tmux window and unbinds the thread. Stale bindings (window deleted externally) are cleaned up by the status polling loop.
 
 ## Session Lifecycle
 
-**Startup cleanup**: On bot startup, all tracked sessions not present in session_map are cleaned up, preventing monitoring of closed sessions.
+**Startup cleanup**: On bot startup, all tracked sessions not present in the reconciled `window_states` map are cleaned up, preventing monitoring of closed sessions.
 
-**Runtime change detection**: Each polling cycle checks for session_map changes:
+**Runtime change detection**: Each polling cycle reloads `session_map.json` into `window_states` (via `load_session_map()`) and checks the reconciled map for changes:
 - Window's session_id changed (e.g., after `/clear`) → clean up old session
 - Window deleted → clean up corresponding session

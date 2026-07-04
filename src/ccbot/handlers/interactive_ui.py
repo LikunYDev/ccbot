@@ -14,6 +14,7 @@ Provides:
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
+import asyncio
 import logging
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -325,3 +326,50 @@ async def clear_interactive_msg(
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception:
             pass  # Message may already be deleted or too old
+
+
+async def send_ui_key(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    key: str,
+    thread_id: int | None,
+    *,
+    clear_on_send: bool = False,
+) -> str:
+    """Send one keystroke to a live interactive UI, re-verifying it first.
+
+    Button taps travel from Telegram, so the pane may have moved on by the
+    time they arrive — most notably, the user may have answered the dialog
+    directly in the terminal while the Telegram message with its keyboard
+    was still visible. Sending a bare arrow/Enter/Space in that case would
+    land on whatever now occupies the pane and corrupt unrelated terminal
+    input (review finding f69, root cause RC30). This re-checks the window
+    and the pane content immediately before sending, and withholds the
+    keystroke (clearing the stale tracked message instead) if either check
+    fails.
+
+    Returns a short human status suitable for ``query.answer()``. On the
+    success path the returned value is ``key`` itself — callers translate it
+    into their button's usual display label. Any other returned value is a
+    failure message meant to be shown verbatim.
+    """
+    w = await tmux_manager.find_window_by_id(window_id)
+    if not w:
+        await clear_interactive_msg(user_id, bot, thread_id)
+        return "Window no longer exists"
+
+    pane_text = await tmux_manager.capture_pane(w.window_id) or ""
+    if not (is_interactive_ui(pane_text) or has_interactive_footer(pane_text)):
+        await clear_interactive_msg(user_id, bot, thread_id)
+        return "Dialog no longer active"
+
+    await tmux_manager.send_keys(window_id, key, enter=False, literal=False)
+
+    if clear_on_send:
+        await clear_interactive_msg(user_id, bot, thread_id)
+        return key
+
+    await asyncio.sleep(0.5)
+    await handle_interactive_ui(bot, user_id, window_id, thread_id)
+    return key

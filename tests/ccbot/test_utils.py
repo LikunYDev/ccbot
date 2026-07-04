@@ -1,11 +1,19 @@
-"""Tests for ccbot.utils: ccbot_dir, atomic_write_json, read_cwd_from_jsonl."""
+"""Tests for ccbot.utils: ccbot_dir, atomic_write_json, read_cwd_from_jsonl,
+supervise_loop.
+"""
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
-from ccbot.utils import atomic_write_json, ccbot_dir, read_cwd_from_jsonl
+from ccbot.utils import (
+    atomic_write_json,
+    ccbot_dir,
+    read_cwd_from_jsonl,
+    supervise_loop,
+)
 
 
 class TestCcbotDir:
@@ -70,3 +78,70 @@ class TestReadCwdFromJsonl:
 
     def test_missing_file_returns_empty(self, tmp_path: Path):
         assert read_cwd_from_jsonl(tmp_path / "nonexistent.jsonl") == ""
+
+
+class TestSuperviseLoop:
+    @pytest.mark.asyncio
+    async def test_restarts_factory_that_raises(self):
+        calls = 0
+
+        async def factory():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("boom")
+
+        task = asyncio.create_task(
+            supervise_loop("test loop", factory, restart_delay=0.01)
+        )
+        # Give it time to crash and restart at least twice.
+        while calls < 2:
+            await asyncio.sleep(0.01)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert calls >= 2
+
+    @pytest.mark.asyncio
+    async def test_exits_quietly_when_should_run_false(self):
+        calls = 0
+
+        async def factory():
+            nonlocal calls
+            calls += 1
+            # Simulate the loop noticing the stop flag and returning normally.
+
+        result_holder: list[bool] = [False]
+
+        def should_run() -> bool:
+            return result_holder[0]
+
+        await asyncio.wait_for(
+            supervise_loop(
+                "test loop",
+                factory,
+                should_run=should_run,
+                restart_delay=0.01,
+            ),
+            timeout=1.0,
+        )
+
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_propagates_cancelled_error_promptly(self):
+        started = asyncio.Event()
+
+        async def factory():
+            started.set()
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(
+            supervise_loop("test loop", factory, restart_delay=5.0)
+        )
+        await started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)

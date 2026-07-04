@@ -21,6 +21,9 @@ RestartSec=10
 # old (default) socket do NOT carry over. Make this first switch at a clean
 # checkpoint. Every restart after that is non-destructive.
 KillMode=process
+#
+# Requires: loginctl enable-linger <user> — without lingering, a logout stops
+# this user service.
 
 # Give post_shutdown time to flush state and deliver in-flight messages before
 # systemd escalates to SIGKILL.
@@ -29,6 +32,8 @@ TimeoutStopSec=30
 # Include ~/.local/bin so the Claude Code native installer binary
 # (~/.local/bin/claude) is resolvable by subprocess calls (e.g. update checks).
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Without a locale, tmux capture-pane decodes non-ASCII pane output (emoji, CJK) lossily, breaking interactive-UI detection and screenshots.
+Environment=LANG=C.UTF-8
 # Uncomment to override the tmux socket name (default: ccbot):
 # Environment=TMUX_SOCKET_NAME=ccbot
 

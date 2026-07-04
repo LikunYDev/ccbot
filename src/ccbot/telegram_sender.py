@@ -16,7 +16,11 @@ def split_message(
     Tries to split on newlines when possible to preserve formatting.
     When a split occurs inside a fenced code block (```), the block is
     closed at the end of the current chunk and re-opened at the start
-    of the next chunk so each chunk remains valid markdown.
+    of the next chunk so each chunk remains valid markdown. This also
+    holds for a forced split of a single line that is itself longer than
+    max_length: each forced piece is individually wrapped in its own
+    fence open/close, sized so the wrapped chunk still respects
+    max_length.
     """
     if len(text) <= max_length:
         return [text]
@@ -46,9 +50,20 @@ def split_message(
                     chunk_text += "\n```"
                 chunks.append(chunk_text)
                 current_chunk = (code_fence + "\n") if in_code_block else ""
-            # Split long line into fixed-size pieces
-            for i in range(0, len(line), max_length):
-                chunks.append(line[i : i + max_length])
+            # Split long line into fixed-size pieces. Inside a code block,
+            # each forced piece must carry its own fence open/close so it
+            # stays valid markdown on its own — that adds overhead, so the
+            # piece size is reduced to keep the wrapped chunk within
+            # max_length.
+            if in_code_block:
+                fence_overhead = len(code_fence) + len("\n") + len("\n```")
+                piece_size = max(max_length - fence_overhead, 1)
+                for i in range(0, len(line), piece_size):
+                    piece = line[i : i + piece_size]
+                    chunks.append(f"{code_fence}\n{piece}\n```")
+            else:
+                for i in range(0, len(line), max_length):
+                    chunks.append(line[i : i + max_length])
         elif len(current_chunk) + len(line) + 1 > max_length:
             # Current chunk is full, start a new one
             chunk_text = current_chunk.rstrip("\n")

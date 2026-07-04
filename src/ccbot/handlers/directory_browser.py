@@ -3,14 +3,25 @@
 Provides UIs in Telegram for:
   - Window picker: list unbound tmux windows for quick binding
   - Directory browser: navigate directory hierarchies to create new sessions
+  - Session picker: resume an existing Claude session found in a directory
+
+These three share one mutually-exclusive state machine (only one is active
+at a time per topic). That state is keyed by Telegram thread_id, not
+user_id: browsing/picking in one topic can never clobber another topic's
+in-progress flow or silently discard its pending first message (see
+RC13 / f31 / f33 — the old per-user keys let a second topic's browse
+overwrite the first topic's state and drop its queued message).
 
 Key components:
   - DIRS_PER_PAGE: Number of directories shown per page
-  - User state keys for tracking browse/picker session
+  - Field-name constants (STATE_KEY, BROWSE_PATH_KEY, ...) for the keys
+    inside each thread's per-thread state dict
+  - get_browse_state / set_browse_state / clear_browse_state: the only
+    sanctioned way to read/write/drop a thread's state — callers (bot.py)
+    should never touch the underlying ``browse_by_thread`` dict directly
   - build_window_picker: Build unbound window picker UI
   - build_directory_browser: Build directory browser UI
-  - clear_window_picker_state: Clear picker state from user_data
-  - clear_browse_state: Clear browsing state from user_data
+  - build_session_picker: Build session picker UI
 """
 
 import os
@@ -39,39 +50,62 @@ from .callback_data import (
 # Directories per page in directory browser
 DIRS_PER_PAGE = 6
 
-# User state keys
+# user_data key holding the per-thread state dict: dict[thread_id, dict]
+BROWSE_BY_THREAD_KEY = "browse_by_thread"
+
+# Field names inside each thread's entry in browse_by_thread (see
+# get_browse_state / set_browse_state / clear_browse_state below).
 STATE_KEY = "state"
 STATE_BROWSING_DIRECTORY = "browsing_directory"
 STATE_SELECTING_WINDOW = "selecting_window"
+STATE_SELECTING_SESSION = "selecting_session"
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
 BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
-UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
-STATE_SELECTING_SESSION = "selecting_session"
+UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of window_ids for window picker
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
+SELECTED_PATH_KEY = "selected_path"  # Directory chosen before the session picker
+PENDING_TEXT_KEY = "pending_text"  # First message text queued for this topic
 
 
-def clear_browse_state(user_data: dict | None) -> None:
-    """Clear directory browsing state keys from user_data."""
-    if user_data is not None:
-        user_data.pop(STATE_KEY, None)
-        user_data.pop(BROWSE_PATH_KEY, None)
-        user_data.pop(BROWSE_PAGE_KEY, None)
-        user_data.pop(BROWSE_DIRS_KEY, None)
+def get_browse_state(user_data: dict | None, thread_id: int | None) -> dict:
+    """Return thread_id's browse/picker state dict (``{}`` if none is set).
+
+    Every field for a topic's in-progress directory-browser/window-picker/
+    session-picker flow — state, path, page, cached dirs/windows/sessions,
+    and any pending first message — lives in one dict keyed by thread_id,
+    so a flow in one topic can never see or clobber another topic's flow.
+    """
+    if user_data is None:
+        return {}
+    return user_data.get(BROWSE_BY_THREAD_KEY, {}).get(thread_id, {})
 
 
-def clear_window_picker_state(user_data: dict | None) -> None:
-    """Clear window picker state keys from user_data."""
-    if user_data is not None:
-        user_data.pop(STATE_KEY, None)
-        user_data.pop(UNBOUND_WINDOWS_KEY, None)
+def set_browse_state(
+    user_data: dict | None, thread_id: int | None, fields: dict
+) -> None:
+    """Merge ``fields`` into thread_id's browse/picker state dict.
+
+    Only thread_id's entry is created/updated; other threads' entries (and
+    any fields not named in ``fields``, e.g. a pending message queued by an
+    earlier step) are left untouched.
+    """
+    if user_data is None:
+        return
+    by_thread = user_data.setdefault(BROWSE_BY_THREAD_KEY, {})
+    by_thread.setdefault(thread_id, {}).update(fields)
 
 
-def clear_session_picker_state(user_data: dict | None) -> None:
-    """Clear session picker state keys from user_data."""
-    if user_data is not None:
-        user_data.pop(STATE_KEY, None)
-        user_data.pop(SESSIONS_KEY, None)
+def clear_browse_state(user_data: dict | None, thread_id: int | None) -> None:
+    """Drop thread_id's entire browse/picker state, all fields at once.
+
+    Other threads' entries are left untouched.
+    """
+    if user_data is None:
+        return
+    by_thread = user_data.get(BROWSE_BY_THREAD_KEY)
+    if by_thread is not None:
+        by_thread.pop(thread_id, None)
 
 
 def build_window_picker(
