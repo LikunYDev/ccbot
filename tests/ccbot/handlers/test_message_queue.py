@@ -609,6 +609,113 @@ class TestContentRetryAndFailureNotice:
         )
 
 
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestTeardownTopic:
+    """f41/RC12: a dead topic's queue, lock, worker task, and flood/typing
+    timers must be fully released — Telegram never reuses thread_ids, so
+    anything left behind leaks forever."""
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancels_worker_and_clears_all_keys(self):
+        from ccbot.handlers import message_queue as mq
+        from ccbot.handlers.message_queue import get_or_create_queue, teardown_topic
+
+        bot = AsyncMock()
+        key = (7, 42)
+
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+
+            assert key in mq._message_queues
+            assert key in mq._queue_locks
+            assert key in mq._queue_workers
+            worker = mq._queue_workers[key]
+
+            # Populate the flood-control / typing-throttle entries too, so
+            # teardown's cleanup of them is actually exercised.
+            mq._flood_until[key] = 123.0
+            mq._last_typing[key] = 456.0
+
+            await teardown_topic(7, 42)
+
+        assert worker.cancelled() or worker.done()
+        assert key not in mq._message_queues
+        assert key not in mq._queue_locks
+        assert key not in mq._queue_workers
+        assert key not in mq._flood_until
+        assert key not in mq._last_typing
+
+    @pytest.mark.asyncio
+    async def test_teardown_does_not_touch_group_process_locks(self):
+        """_group_process_locks is keyed by chat_id and shared across every
+        topic's worker in the same group chat — teardown must leave it be."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+        from ccbot.handlers.message_queue import get_or_create_queue, teardown_topic
+
+        bot = AsyncMock()
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+            # Let the worker task actually start running (it sets up
+            # _group_process_locks[chat_id] before its first await).
+            await asyncio.sleep(0)
+            assert 100 in mq._group_process_locks
+
+            await teardown_topic(7, 42)
+
+        assert 100 in mq._group_process_locks
+
+    @pytest.mark.asyncio
+    async def test_teardown_of_nonexistent_key_is_noop(self):
+        from ccbot.handlers.message_queue import teardown_topic
+
+        # Must not raise even though (7, 42) was never created.
+        await teardown_topic(7, 42)
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_queue_works_again_after_teardown(self):
+        """After teardown, the same key must be usable again: a fresh queue
+        and worker are created and can actually process a task."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+        from ccbot.handlers.message_queue import (
+            enqueue_status_update,
+            get_or_create_queue,
+            teardown_topic,
+        )
+
+        bot = AsyncMock()
+        key = (7, 42)
+
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            get_or_create_queue(bot, user_id=7, thread_id=42)
+            await teardown_topic(7, 42)
+
+            assert key not in mq._message_queues
+            assert key not in mq._queue_workers
+
+            # Fresh queue + worker for the same key.
+            queue = get_or_create_queue(bot, user_id=7, thread_id=42)
+            assert key in mq._message_queues
+            assert key in mq._queue_workers
+            new_worker = mq._queue_workers[key]
+            assert not new_worker.done()
+
+            # status_clear with nothing tracked is a minimal no-op task the
+            # fresh worker should process cleanly.
+            await enqueue_status_update(
+                bot, user_id=7, window_id="@5", status_text=None, thread_id=42
+            )
+            await asyncio.wait_for(queue.join(), timeout=5.0)
+
+        bot.delete_message.assert_not_called()
+
+
 @pytest.mark.usefixtures("_clear_status_msg_info")
 class TestConvertStatusToContentRace:
     """f53: `_convert_status_to_content` must not pop `_status_msg_info`

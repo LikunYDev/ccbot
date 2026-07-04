@@ -181,8 +181,13 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     """Try to extract content matching a single UI pattern.
 
     When ``pattern.bottom`` is empty, the region extends from the top marker
-    to the last non-empty line (used for multi-tab AskUserQuestion where the
-    bottom delimiter varies by tab).
+    to the dialog's own footer (used for multi-tab AskUserQuestion and the
+    bare-numbered ExitPlanMode fallback, where the closing marker varies or
+    is absent). The footer is either one of ``_FOOTER_MARKERS`` (the same
+    set ``has_interactive_footer`` looks for) or, failing that, the chrome
+    separator that opens the standing terminal chrome below the dialog —
+    never the last non-empty line of the whole pane, which would swallow
+    that chrome (status bars, stray output) into the extracted content.
     """
     top_idx: int | None = None
     bottom_idx: int | None = None
@@ -198,12 +203,24 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     if top_idx is None:
         return None
 
-    # No bottom patterns → use last non-empty line as boundary
+    # No bottom patterns → find the dialog's own footer to stop at.
     if not pattern.bottom:
-        for i in range(len(lines) - 1, top_idx, -1):
-            if lines[i].strip():
+        for i in range(top_idx + 1, len(lines)):
+            if any(p.search(lines[i]) for p in _FOOTER_MARKERS):
                 bottom_idx = i
                 break
+            if _RE_SEPARATOR.match(lines[i].strip()):
+                # Standing chrome starts here — stop just above it.
+                bottom_idx = i - 1
+                break
+        if bottom_idx is None:
+            # No footer or chrome found (e.g. a bare pane truncated right
+            # after the dialog in tests) — fall back to the last non-empty
+            # line, same as before this fix existed.
+            for i in range(len(lines) - 1, top_idx, -1):
+                if lines[i].strip():
+                    bottom_idx = i
+                    break
 
     if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
         return None

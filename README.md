@@ -160,10 +160,12 @@ Linux/systemd users can use the existing restart helpers:
 ./scripts/restart.sh
 ```
 
+The unit is a user service (`WantedBy=default.target`); run `loginctl enable-linger <user>` or it will stop when you log out.
+
 macOS users should use `launchd` instead of `systemd`:
 
 1. Copy [deploy/macos/com.ccbot.plist](/Users/lkyao/dev/ccbot/deploy/macos/com.ccbot.plist) to `~/Library/LaunchAgents/com.ccbot.plist`
-2. Replace the placeholder repo path and username values
+2. Replace the placeholder repo path and username values, and set `ProgramArguments`'s `uv` path to the output of `which uv` (`/opt/homebrew/bin/uv` on Apple Silicon, `/usr/local/bin/uv` on Intel Homebrew)
 3. Load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ccbot.plist`
 4. Restart with:
 

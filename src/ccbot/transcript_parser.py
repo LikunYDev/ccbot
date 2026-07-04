@@ -453,7 +453,6 @@ class TranscriptParser:
         result: list[ParsedEntry] = []
         last_cmd_name: str | None = None
         # Pending tool_use blocks keyed by id
-        _carry_over = pending_tools is not None
         if pending_tools is None:
             pending_tools = {}
         else:
@@ -772,20 +771,12 @@ class TranscriptParser:
                             )
                         )
 
-        # Flush remaining pending tools at end.
-        # In carry-over mode (monitor), keep them pending for the next call
-        # without emitting entries. In one-shot mode (history), emit them.
+        # Remaining pending tools at end.
+        # In carry-over mode (monitor), keep them pending for the next call.
+        # In one-shot mode (history), each tool_use was already emitted
+        # in-place above when its block was encountered — do NOT emit it
+        # again here, or it would be duplicated in the projection.
         remaining_pending = dict(pending_tools)
-        if not _carry_over:
-            for tool_id, tool_info in pending_tools.items():
-                result.append(
-                    ParsedEntry(
-                        role="assistant",
-                        text=tool_info.summary,
-                        content_type="tool_use",
-                        tool_use_id=tool_id,
-                    )
-                )
 
         # Strip whitespace
         for entry in result:

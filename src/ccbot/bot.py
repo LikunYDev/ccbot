@@ -39,6 +39,7 @@ import re
 import time
 from pathlib import Path
 
+from aiolimiter import AsyncLimiter
 from telegram import (
     Bot,
     BotCommand,
@@ -1974,6 +1975,41 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 # --- App lifecycle ---
 
 
+def _prefill_limiter(limiter: AsyncLimiter) -> None:
+    """Make an aiolimiter bucket start "full" immediately, surviving a restart.
+
+    Telegram's server-side flood counters persist across bot restarts, so a
+    freshly-constructed (empty) local bucket would let ccbot burst back up
+    to ``max_rate`` requests the moment it reconnects -- against a
+    server-side counter that never reset. Setting ``_level`` to ``max_rate``
+    alone is not enough: aiolimiter's ``_leak()`` drains the bucket based on
+    elapsed *loop* time since ``_last_check``, which defaults to ``0.0`` at
+    construction. The very first capacity check after pre-fill would then
+    see an "elapsed" of (current loop time - 0.0) -- an enormous number --
+    and instantly zero the level back out, silently undoing the pre-fill
+    regardless of how soon the first request actually arrives. Stamping
+    ``_last_check`` with the current loop time (the same clock ``_leak()``
+    reads via ``self._loop.time()``) closes that gap.
+    """
+    if not (hasattr(limiter, "_level") and hasattr(limiter, "_last_check")):
+        logger.warning(
+            "aiolimiter.AsyncLimiter is missing expected _level/_last_check "
+            "attributes (library version mismatch?); skipping rate limiter "
+            "pre-fill"
+        )
+        return
+    try:
+        now = limiter._loop.time()
+    except AttributeError:
+        logger.warning(
+            "aiolimiter.AsyncLimiter is missing the expected _loop clock "
+            "(library version mismatch?); skipping rate limiter pre-fill"
+        )
+        return
+    limiter._level = limiter.max_rate
+    limiter._last_check = now
+
+
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task
 
@@ -1999,20 +2035,20 @@ async def post_init(application: Application) -> None:
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
-    # server-side counter persists across bot restarts.  Setting _level=max_rate
-    # forces the bucket to start "full" so capacity drains in naturally (~1s).
+    # server-side counter persists across bot restarts. _prefill_limiter()
+    # forces the bucket to start "full" so capacity drains in naturally (~1s)
+    # instead of being immediately reset by aiolimiter's leak calculation --
+    # see its docstring for why the clock reference must be stamped too.
     # AIORateLimiter has no per-private-chat limiter, so max_retries is the
     # primary protection (retry + pause all concurrent requests on 429).
     rate_limiter = application.bot.rate_limiter
     if rate_limiter and rate_limiter._base_limiter:
-        rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
+        _prefill_limiter(rate_limiter._base_limiter)
         logger.info("Pre-filled global rate limiter bucket")
         # Also pre-fill per-group limiters for known chat IDs.
         # Without this, the group limiter allows a burst of 20 requests on restart,
         # which can exceed Telegram's persisted server-side per-group counter.
         if hasattr(rate_limiter, "_group_limiters"):
-            from aiolimiter import AsyncLimiter
-
             group_rate = getattr(rate_limiter, "_group_max_rate", 20)
             group_period = getattr(rate_limiter, "_group_time_period", 60)
             seen_chat_ids: set[int] = set()
@@ -2020,7 +2056,7 @@ async def post_init(application: Application) -> None:
                 if chat_id < 0 and chat_id not in seen_chat_ids:
                     seen_chat_ids.add(chat_id)
                     limiter = AsyncLimiter(group_rate, group_period)
-                    limiter._level = limiter.max_rate
+                    _prefill_limiter(limiter)
                     rate_limiter._group_limiters[chat_id] = limiter
             if seen_chat_ids:
                 logger.info(

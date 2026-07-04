@@ -553,6 +553,10 @@ class TestParseEntries:
     def test_pending_tools_flushed_without_carry_over(
         self, make_jsonl_entry, make_tool_use_block
     ):
+        """One-shot mode (history): an unresolved tool_use at end-of-input
+        must appear exactly once in the projection — it was already emitted
+        in-place when its block was encountered, so it must NOT be flushed
+        a second time at the end (that duplicated it in history pages)."""
         entries = [
             make_jsonl_entry(
                 "assistant",
@@ -561,9 +565,30 @@ class TestParseEntries:
         ]
         result, pending = TranscriptParser.parse_entries(entries, pending_tools=None)
         tool_entries = [e for e in result if e.tool_use_id == "t1"]
-        assert len(tool_entries) == 2
+        assert len(tool_entries) == 1
         assert tool_entries[0].content_type == "tool_use"
-        assert tool_entries[1].content_type == "tool_use"
+        # One-shot callers (history) discard the returned pending dict; it
+        # still reports "t1" as unresolved, but that's inert here.
+        assert "t1" in pending
+
+    def test_pending_tools_streaming_still_carries_across_cycles(
+        self, make_jsonl_entry, make_tool_use_block
+    ):
+        """Streaming path (monitor, with carry): an unresolved tool_use is
+        emitted in-place once, and also kept in the returned pending_tools
+        dict so the next poll cycle can still pair it with a later
+        tool_result — it must not be flushed/emitted again here either."""
+        entries = [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t1", "Read", {"file_path": "a.py"})],
+            ),
+        ]
+        result, pending = TranscriptParser.parse_entries(entries, pending_tools={})
+        tool_entries = [e for e in result if e.tool_use_id == "t1"]
+        assert len(tool_entries) == 1
+        assert tool_entries[0].content_type == "tool_use"
+        assert "t1" in pending
 
     def test_system_tag_filtered(self, make_jsonl_entry, make_text_block):
         entries = [

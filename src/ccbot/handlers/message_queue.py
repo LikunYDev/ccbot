@@ -33,6 +33,8 @@ Queue semantics — deliver, or drop loudly:
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
   - get_or_create_queue: Get or create queue and worker for a user
+  - teardown_topic: Tear down a dead topic's queue/worker/lock/timers so
+    they don't leak once the topic can never be revisited
   - Message queue worker: Background task processing user's queue
   - Content task processing with tool_use/tool_result handling
   - Status message tracking and conversion (keyed by (user_id, thread_id))
@@ -153,6 +155,43 @@ def get_or_create_queue(
         # Start worker task for this topic
         _queue_workers[key] = asyncio.create_task(_message_queue_worker(bot, key))
     return _message_queues[key]
+
+
+async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
+    """Tear down all per-topic queue machinery when a topic dies.
+
+    Call this when a topic is closed or deleted — Telegram never reuses
+    thread_ids, so anything left behind under this key (queue, lock, worker
+    task, flood-control/typing-throttle timestamps) would otherwise leak
+    forever. This is a hard stop, not a drain: any tasks still sitting in
+    the queue are deliberately discarded along with the queue itself —
+    `drain_queues()` is the place to flush a live topic before shutdown;
+    this function is for a topic that no longer exists to flush *to*.
+
+    Pops (and cancels, for the worker) the (user_id, thread_id or 0) entry
+    from `_message_queues`, `_queue_locks`, `_flood_until`, `_last_typing`,
+    and `_queue_workers`. Deliberately does NOT touch `_group_process_locks`
+    — that lock is keyed by chat_id and shared across every topic's worker
+    in the same group chat.
+
+    Safe to call for a key that was never created (no-op), and safe to
+    call again afterward: `get_or_create_queue` only checks `key not in
+    _message_queues`, so a fresh queue + worker are created cleanly on the
+    next call for the same key.
+    """
+    key: _QueueKey = (user_id, thread_id or 0)
+    _message_queues.pop(key, None)
+    _queue_locks.pop(key, None)
+    _flood_until.pop(key, None)
+    _last_typing.pop(key, None)
+
+    worker = _queue_workers.pop(key, None)
+    if worker is not None:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
