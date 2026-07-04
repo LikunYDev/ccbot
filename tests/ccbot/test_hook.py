@@ -287,6 +287,58 @@ class TestHookMainCwdFallback:
         assert result == self.SESSION_MAP
 
 
+class TestHookSocketGate:
+    """session_map is ccbot's private state: panes on a foreign tmux server
+    (different socket basename in $TMUX) must not be written — their window
+    IDs can collide with ccbot's own."""
+
+    PAYLOAD = {
+        "session_id": "33333333-3333-3333-3333-333333333333",
+        "cwd": "/proj",
+        "hook_event_name": "SessionStart",
+    }
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        *,
+        tmux_env: str,
+    ) -> dict | None:
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="ccbot:@41:job\n", stderr=""
+            )
+
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr("ccbot.hook.subprocess.run", fake_run)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(self.PAYLOAD)))
+        monkeypatch.setenv("TMUX_PANE", "%9")
+        monkeypatch.setenv("TMUX", tmux_env)
+        monkeypatch.delenv("TMUX_SOCKET_NAME", raising=False)
+        hook_main()
+        map_file = tmp_path / "session_map.json"
+        return json.loads(map_file.read_text()) if map_file.exists() else None
+
+    def test_foreign_socket_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(
+            monkeypatch, tmp_path, tmux_env="/tmp/tmux-1002/default,999,0"
+        )
+        assert result is None
+
+    def test_ccbot_socket_is_written(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(monkeypatch, tmp_path, tmux_env="/tmp/tmux-1002/ccbot,999,0")
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+
 class TestHookMainWritePath:
     """Tests that exercise the session_map write path with tmux mocked.
 

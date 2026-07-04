@@ -127,6 +127,7 @@ from .handlers.message_sender import (
 )
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
+from .handlers.maintenance import maintenance_loop
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
@@ -167,6 +168,7 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+_maintenance_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -1946,9 +1948,14 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start local-state maintenance task (session_map hygiene)
+    global _maintenance_task
+    _maintenance_task = asyncio.create_task(maintenance_loop(application.bot))
+    logger.info("Maintenance task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _maintenance_task
 
     # Stop status polling
     if _status_poll_task:
@@ -1959,6 +1966,16 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+    # Stop maintenance
+    if _maintenance_task:
+        _maintenance_task.cancel()
+        try:
+            await _maintenance_task
+        except asyncio.CancelledError:
+            pass
+        _maintenance_task = None
+        logger.info("Maintenance stopped")
 
     # Order matters: stop producers, flush queues, THEN cancel workers.
     # 1. The session monitor enqueues already-read-but-unsent messages (offsets

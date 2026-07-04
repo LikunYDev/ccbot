@@ -363,6 +363,16 @@ def hook_main() -> None:
     pane_id = os.environ.get("TMUX_PANE", "")
     by_cwd_fallback = False
     if pane_id:
+        # session_map is ccbot's private state: only panes on ccbot's own
+        # tmux server belong in it. $TMUX is "<socket_path>,<pid>,<session>";
+        # a different socket basename means a foreign server — writing its
+        # windows would pollute the map with IDs that can collide with ours.
+        tmux_env = os.environ.get("TMUX", "")
+        if tmux_env:
+            socket_path = tmux_env.split(",", 1)[0]
+            if os.path.basename(socket_path) != _tmux_socket_name():
+                logger.debug("Pane is on foreign tmux socket %s, skipping", socket_path)
+                return
         resolved = _resolve_window_by_pane(pane_id)
     elif source and source != "startup":
         resolved = _resolve_window_by_cwd(cwd)

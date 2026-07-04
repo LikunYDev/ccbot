@@ -22,12 +22,13 @@ Key methods for thread binding access:
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import aiofiles
@@ -373,7 +374,7 @@ class SessionManager:
             logger.info("Startup re-resolution complete")
 
         # Clean up session_map.json: stale window IDs and old-format keys
-        await self._cleanup_stale_session_map_entries(live_ids)
+        await self.sweep_stale_session_map_entries()
         await self._cleanup_old_format_session_map_keys()
 
     async def _accepted_session_map_names(self) -> set[str]:
@@ -432,74 +433,89 @@ class SessionManager:
                 canonical[window_id] = (chosen, by_name[chosen])
         return canonical
 
+    @staticmethod
+    def _locked_session_map_update(
+        mutate: Callable[[dict[str, Any]], bool],
+    ) -> None:
+        """Read-modify-write session_map.json under the hook's file lock.
+
+        The SessionStart hook takes `session_map.lock` for its writes; bot-side
+        writers must take the same lock or a hook write landing mid-update gets
+        clobbered. Blocking I/O — call via asyncio.to_thread.
+        ``mutate`` edits the dict in place and returns True if it changed.
+        """
+        map_file = config.session_map_file
+        if not map_file.exists():
+            return
+        lock_path = map_file.with_suffix(".lock")
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                try:
+                    session_map = json.loads(map_file.read_text())
+                except (json.JSONDecodeError, OSError):
+                    return
+                if mutate(session_map):
+                    atomic_write_json(map_file, session_map)
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+
     async def _cleanup_old_format_session_map_keys(self) -> None:
         """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
-        if not config.session_map_file.exists():
-            return
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            return
-
         accepted_names = await self._accepted_session_map_names()
-        old_keys = [
-            key
-            for key in session_map
-            for parts in [self._split_session_map_key(key)]
-            if parts is not None
-            and parts[0] in accepted_names
-            and not self._is_window_id(parts[1])
-        ]
-        if not old_keys:
-            return
 
-        for key in old_keys:
-            del session_map[key]
-        atomic_write_json(config.session_map_file, session_map)
-        logger.info(
-            "Cleaned up %d old-format session_map keys: %s", len(old_keys), old_keys
-        )
+        def mutate(session_map: dict[str, Any]) -> bool:
+            old_keys = [
+                key
+                for key in session_map
+                for parts in [self._split_session_map_key(key)]
+                if parts is not None
+                and parts[0] in accepted_names
+                and not self._is_window_id(parts[1])
+            ]
+            for key in old_keys:
+                del session_map[key]
+            if old_keys:
+                logger.info(
+                    "Cleaned up %d old-format session_map keys: %s",
+                    len(old_keys),
+                    old_keys,
+                )
+            return bool(old_keys)
 
-    async def _cleanup_stale_session_map_entries(self, live_ids: set[str]) -> None:
-        """Remove entries for tmux windows that no longer exist.
+        await asyncio.to_thread(self._locked_session_map_update, mutate)
 
-        When windows are closed externally (outside ccbot), session_map.json
-        retains orphan references. This cleanup removes entries whose window_id
-        is not in the current set of live tmux windows.
+    async def sweep_stale_session_map_entries(self) -> None:
+        """Remove entries for tmux windows that no longer exist on the socket.
+
+        Window IDs are unique per tmux server and ccbot is session_map's only
+        consumer, so any window-id-keyed entry whose window is gone is garbage
+        regardless of its session-name prefix — including entries written by
+        grouped peers, other tmux sessions on the socket, or (historically)
+        other servers. Runs at startup and periodically from the maintenance
+        loop, so entries disappear shortly after their window dies instead of
+        accumulating until the next restart.
         """
-        if not config.session_map_file.exists():
-            return
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
+        live_ids = await tmux_manager.list_all_window_ids()
+        if live_ids is None:
+            # Server unreachable — "unknown", not "no windows". Never sweep.
             return
 
-        accepted_names = await self._accepted_session_map_names()
-        stale_keys = [
-            key
-            for key in session_map
-            for parts in [self._split_session_map_key(key)]
-            if parts is not None
-            and parts[0] in accepted_names
-            and self._is_window_id(parts[1])
-            and parts[1] not in live_ids
-        ]
-        if not stale_keys:
-            return
+        def mutate(session_map: dict[str, Any]) -> bool:
+            stale_keys = [
+                key
+                for key in session_map
+                for parts in [self._split_session_map_key(key)]
+                if parts is not None
+                and self._is_window_id(parts[1])
+                and parts[1] not in live_ids
+            ]
+            for key in stale_keys:
+                del session_map[key]
+                logger.info("Removed stale session_map entry: %s", key)
+            return bool(stale_keys)
 
-        for key in stale_keys:
-            del session_map[key]
-            logger.info("Removed stale session_map entry: %s", key)
-
-        atomic_write_json(config.session_map_file, session_map)
-        logger.info(
-            "Cleaned up %d stale session_map entries (windows no longer in tmux)",
-            len(stale_keys),
-        )
+        await asyncio.to_thread(self._locked_session_map_update, mutate)
 
     # --- Display name management ---
 
