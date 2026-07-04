@@ -7,6 +7,7 @@ Uses telegramify-markdown for MarkdownV2 formatting.
 
 Functions:
   - send_with_fallback: Send with formatting → plain text fallback
+  - edit_with_fallback: Edit with formatting → plain text fallback (bool result)
   - send_photo: Photo sending (single or media group)
   - safe_reply: Reply with formatting, fallback to plain text
   - safe_edit: Edit message with formatting, fallback to plain text
@@ -82,6 +83,49 @@ async def send_with_fallback(
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
             return None
+
+
+async def edit_with_fallback(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    **kwargs: Any,
+) -> bool:
+    """Edit message with MarkdownV2, falling back to plain text on failure.
+
+    Mirrors send_with_fallback: try MarkdownV2 first, and on a non-RetryAfter
+    failure retry once with sentinels stripped as plain text.
+
+    Returns True on success (either attempt), False on final failure.
+    RetryAfter is re-raised for caller handling (from either attempt).
+    """
+    kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=_ensure_formatted(text),
+            parse_mode=PARSE_MODE,
+            **kwargs,
+        )
+        return True
+    except RetryAfter:
+        raise
+    except Exception:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=strip_sentinels(text),
+                **kwargs,
+            )
+            return True
+        except RetryAfter:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to edit message {message_id} in {chat_id}: {e}")
+            return False
 
 
 async def send_photo(

@@ -107,6 +107,36 @@ class TestSplitMessage:
             fence_count = chunk.count("```")
             assert fence_count % 2 == 0, f"Unbalanced fences in: {chunk!r}"
 
+    def test_forced_split_inside_code_block_preserves_fences(self):
+        """A single line inside a fenced code block that itself exceeds
+        max_length must have each forced piece wrapped in its own fence
+        open/close — not emitted bare, which would break the code block
+        for every chunk downstream of it."""
+        huge_line = "z" * 10000
+        text = f"```python\n{huge_line}\n```"
+        max_length = 300
+        chunks = split_message(text, max_length=max_length)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert len(chunk) <= max_length
+            fence_count = chunk.count("```")
+            assert fence_count % 2 == 0, f"Unbalanced fences in: {chunk!r}"
+        # No content lost across the forced pieces
+        total_z = sum(chunk.count("z") for chunk in chunks)
+        assert total_z == len(huge_line)
+
+    def test_forced_split_inside_code_block_near_telegram_limit(self):
+        """Same as above at the real default budget (4096), to cover the
+        realistic case rather than only a small custom max_length."""
+        huge_line = "w" * 10000
+        text = f"```python\n{huge_line}\n```"
+        chunks = split_message(text)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert len(chunk) <= 4096
+            assert chunk.count("```") % 2 == 0
+        assert sum(chunk.count("w") for chunk in chunks) == len(huge_line)
+
     def test_multiple_code_blocks(self):
         """Multiple code blocks should each be handled independently."""
         text = "text\n```py\na=1\n```\nmid\n```sh\nls\n```\nend"

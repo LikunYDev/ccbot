@@ -29,13 +29,14 @@ Per-user message queues + worker pattern for all send tasks:
 - On 429, AIORateLimiter pauses all concurrent requests (`_retry_after_event`) and retries after the ban
 - On restart, the global bucket is pre-filled (`_level=max_rate`) to avoid burst against Telegram's persisted server-side counter
 - Status polling interval: 1 second (skips enqueue when queue is non-empty)
+- Per-queue `RetryAfter` handling: a `content`/`interactive_ui` task hitting `RetryAfter` is retried **in place** (same queued item) up to `MAX_CONTENT_RETRY_ATTEMPTS` (5) times, sleeping the required seconds between attempts — nothing else runs on that topic's queue meanwhile, so FIFO order holds. A long ban (`retry_after > FLOOD_CONTROL_MAX_WAIT`) also records `_flood_until` so producers skip enqueuing fresh status updates while banned. `status_update`/`status_clear` tasks are ephemeral and are dropped (after waiting out a short ban) instead of retried. A `content` task dropped after exhausting retries (or on any non-`RetryAfter` exception) gets a best-effort plain-text failure notice sent to the topic, so silence never means "delivered".
 
 ## Performance Optimizations
 
 **mtime cache**: The monitoring loop maintains an in-memory file mtime cache, skipping reads for unchanged files.
 
-**Byte offset incremental reads**: Each tracked session records `last_byte_offset`, reading only new content. File truncation (offset > file_size) is detected and offset is auto-reset.
+**Byte offset incremental reads**: Each tracked session records `last_byte_offset`, reading only new content. File truncation (offset > file_size) is detected and offset is auto-reset. Delivery contract: **read → dispatch → observe success → commit**. A batch's offset is only persisted once every message in it has been handed to the message callback without raising; while a batch awaits that outcome the session is held in-flight, which also backpressures further reads for it (no session ever has two dispatch batches racing each other). A callback failure re-reads and re-dispatches the same batch next poll cycle instead of losing it — this is an at-least-once contract (duplicates are possible on a mid-batch failure, preferred over silent loss). A poison batch is bounded to 3 consecutive delivery attempts, after which the offset is committed anyway and the drop is logged.
 
 ## No Message Truncation
 
-Historical messages (tool_use summaries, tool_result text, user/assistant messages) are always kept in full — no character-level truncation at the parsing layer. Long text is handled exclusively at the send layer: `split_message` splits by Telegram's 4096-character limit; real-time messages get `[1/N]` text suffixes, history pages get inline keyboard navigation.
+Historical messages (tool_use summaries, tool_result text, user/assistant messages, thinking) are always kept in full — no character-level truncation at the parsing or formatting layer. Long text is handled exclusively at the send layer: tool summaries/errors carry their full content via an expandable blockquote (budget-limited only at the MarkdownV2 render step, not dropped); user and assistant text — including thinking — paginate through the same `split_message` path instead of being cut off at a fixed character count. Real-time messages get `[1/N]` text suffixes, history pages get inline keyboard navigation.

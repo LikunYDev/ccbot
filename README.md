@@ -98,16 +98,17 @@ ALLOWED_USERS=your_telegram_user_id
 | ----------------------- | ---------- | ------------------------------------------------ |
 | `CCBOT_DIR`             | `~/.ccbot` | Config/state directory (`.env` loaded from here) |
 | `TMUX_SESSION_NAME`     | `ccbot`    | Tmux session name                                |
+| `TMUX_SOCKET_NAME`      | `ccbot`    | Dedicated tmux socket (`tmux -L <name>`), isolating ccbot's server from the user's interactive tmux |
 | `CLAUDE_COMMAND`        | `claude`   | Command to run in new windows                    |
 | `CLAUDE_PERMISSION_MODE` | _(unset)_ | `default` / `acceptEdits` / `plan` / `auto` / `bypassPermissions`. Appended as `--permission-mode <mode>` when set. |
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
 | `CCBOT_DEFAULT_DIR`      | _(unset)_ | Pinned starting directory for the new-session directory browser. Empty / unset / nonexistent path falls back to `cwd` (with a warning if set but invalid). |
+| `CCBOT_AUTO_RESTART`     | `true`    | Notify (never auto-restart) a topic when `claude --version` changes or a session looks stuck on a fatal error; the user runs `/restart` to pick it up. Set to `false` to disable both notices. |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs) |
 
-Message formatting is always HTML via `chatgpt-md-converter` (`chatgpt_md_converter` package).
-There is no runtime formatter switch to MarkdownV2.
+Message formatting is MarkdownV2 (`src/ccbot/markdown_v2.py`, built on `telegramify-markdown`), sent with `parse_mode=MarkdownV2` via the `safe_reply`/`safe_edit`/`safe_send` helpers. If MarkdownV2 parsing fails, those helpers automatically retry as plain text, so a formatting error never blocks delivery.
 
 > If running on a VPS where there's no interactive terminal to approve permissions, consider using **auto mode** — Claude Code runs actions automatically but a background classifier blocks risky ones (exfiltration, force-pushes to main, arbitrary downloads, etc.):
 >
@@ -186,6 +187,10 @@ uv run python -m pytest
 | `/history`    | Message history for this topic  |
 | `/screenshot` | Capture terminal screenshot     |
 | `/esc`        | Send Escape to interrupt Claude |
+| `/restart`    | Restart this topic's session in place (respawn-pane + `--resume`), clearing a stale model pin |
+| `/kill`       | Kill session and delete topic |
+| `/unbind`     | Detach this topic from its session without killing the tmux window |
+| `/usage`      | Show Claude Code usage/cost stats from the TUI |
 
 **Claude Code commands (forwarded via tmux):**
 
@@ -249,8 +254,9 @@ The monitor polls session JSONL files every 2 seconds and sends notifications fo
 Notifications are delivered to the topic bound to the session's window.
 
 Formatting note:
-- Telegram messages are rendered with parse mode `HTML` using `chatgpt-md-converter`
-- Long messages are split with HTML tag awareness to preserve code blocks and formatting
+- Telegram messages are rendered with parse mode `MarkdownV2` via `telegramify-markdown` (`src/ccbot/markdown_v2.py`), including expandable blockquotes for thinking/tool output
+- On a MarkdownV2 parse failure, the send layer automatically retries as plain text — formatting never blocks delivery
+- Long messages are split by `split_message` (`telegram_sender.py`) at Telegram's 4096-character limit
 
 ## Running Claude Code in tmux
 
@@ -294,7 +300,7 @@ src/ccbot/
 ├── monitor_state.py       # Monitor state persistence (byte offsets)
 ├── transcript_parser.py   # Claude Code JSONL transcript parsing
 ├── terminal_parser.py     # Terminal pane parsing (interactive UI + status line)
-├── html_converter.py      # Markdown → Telegram HTML conversion + HTML-aware splitting
+├── markdown_v2.py         # Markdown → Telegram MarkdownV2 conversion + expandable quotes
 ├── screenshot.py          # Terminal text → PNG image with ANSI color support
 ├── transcribe.py          # Voice-to-text transcription via OpenAI API
 ├── utils.py               # Shared utilities (atomic JSON writes, JSONL helpers)

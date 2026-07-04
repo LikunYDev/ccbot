@@ -232,7 +232,13 @@ class TranscriptParser:
 
         if summary:
             if len(summary) > cls._MAX_SUMMARY_LENGTH:
-                summary = summary[: cls._MAX_SUMMARY_LENGTH] + "…"
+                # The summary line is a compact rendering, not the data —
+                # keep it short, but never drop the full text: it follows
+                # immediately as an expandable quote.
+                shortened = summary[: cls._MAX_SUMMARY_LENGTH] + "…"
+                return f"**{name}**({shortened})\n" + cls._format_expandable_quote(
+                    summary
+                )
             return f"**{name}**({summary})"
         return f"**{name}**"
 
@@ -358,8 +364,14 @@ class TranscriptParser:
 
         Shows relevant statistics for each tool type, with expandable quote for full content.
 
-        No truncation here — per project principles, truncation is handled
-        only at the send layer (split_message / _render_expandable_quote).
+        No content is dropped here: any compact preview line built in this
+        class (this method's stats line, the 200-char tool_use summary, the
+        100-char error preview) is a *rendering*, never the only copy of the
+        data — whenever the full text is longer than that rendering, the
+        full text is appended right after as an expandable quote
+        (_format_expandable_quote), so nothing is permanently lost. Length
+        limits are enforced only at the send layer (split_message /
+        _render_expandable_quote).
         """
         if not text:
             return ""
@@ -651,12 +663,17 @@ class TranscriptParser:
                             # Add error message in stats format
                             if result_text:
                                 # Take first line of error as summary
-                                error_summary = result_text.split("\n")[0]
+                                first_line = result_text.split("\n")[0]
+                                error_summary = first_line
                                 if len(error_summary) > 100:
                                     error_summary = error_summary[:100] + "…"
                                 entry_text += f"\n  ⎿  Error: {error_summary}"
-                                # If multi-line error, add expandable quote
-                                if "\n" in result_text:
+                                # Whenever the summary line above dropped
+                                # something (multi-line error, or a single
+                                # line longer than the 100-char preview),
+                                # append the full error as an expandable
+                                # quote so nothing is lost.
+                                if "\n" in result_text or len(first_line) > 100:
                                     entry_text += "\n" + cls._format_expandable_quote(
                                         result_text
                                     )

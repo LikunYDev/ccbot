@@ -35,6 +35,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import RetryAfter
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -124,13 +126,12 @@ from .handlers.message_queue import (
     shutdown_workers,
 )
 from .handlers.message_sender import (
-    NO_LINK_PREVIEW,
+    edit_with_fallback,
     safe_edit,
     safe_reply,
     safe_send,
     send_with_fallback,
 )
-from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.maintenance import maintenance_loop
 from .handlers.status_polling import status_poll_loop
@@ -307,6 +308,71 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "The Claude session is still running in tmux.\n"
         "Send a message to bind to a new session.",
     )
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kill this topic's Claude session and delete the Telegram topic.
+
+    Unlike /unbind (which detaches the topic but leaves tmux running),
+    this actually kills the tmux window, then deletes the forum topic
+    itself. Mirrors the teardown sequence in topic_closed_handler, plus
+    the topic deletion that a native Telegram "close+delete" would do.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    display = session_manager.get_display_name(wid)
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if w:
+        await tmux_manager.kill_window(w.window_id)
+        logger.info(
+            "Killed window %s via /kill (user=%d, thread=%d)",
+            display,
+            user.id,
+            thread_id,
+        )
+    else:
+        logger.info(
+            "/kill: window %s already gone (user=%d, thread=%d)",
+            display,
+            user.id,
+            thread_id,
+        )
+
+    session_manager.unbind_thread(user.id, thread_id)
+    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+
+    resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
+    try:
+        await context.bot.delete_forum_topic(
+            chat_id=resolved_chat, message_thread_id=thread_id
+        )
+    except Exception as e:
+        # Bots need "Manage Topics" rights to delete a forum topic; without
+        # them the teardown above already happened, so just tell the user
+        # to finish the job manually instead of leaving them guessing.
+        logger.warning("Failed to delete forum topic (thread=%d): %s", thread_id, e)
+        await safe_reply(
+            update.message,
+            f"✅ Killed session '{display}'.\n"
+            "⚠️ Could not delete this topic automatically "
+            "(bot may lack the 'Manage Topics' right) — "
+            "please delete it manually.",
+        )
 
 
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -586,6 +652,25 @@ async def topic_edited_handler(
     )
 
 
+def _strip_bot_mention(cmd_text: str) -> str:
+    """Strip a trailing "@botname" mention from the command token only.
+
+    Telegram appends "@botname" to the command TOKEN itself in group chats
+    (e.g. "/clear@my_bot"), never to its arguments. Splitting the whole
+    string on "@" would also truncate arguments that legitimately contain
+    "@" (emails, "@decorators", etc.), so only the first whitespace-
+    delimited token is desentineled and the remainder is passed through
+    untouched.
+    """
+    parts = cmd_text.split(maxsplit=1)
+    if not parts:
+        return cmd_text
+    token = re.sub(r"@\w+$", "", parts[0])
+    if len(parts) == 1:
+        return token
+    return f"{token} {parts[1]}"
+
+
 async def forward_command_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -606,8 +691,8 @@ async def forward_command_handler(
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     cmd_text = update.message.text or ""
-    # The full text is already a slash command like "/clear" or "/compact foo"
-    cc_slash = cmd_text.split("@")[0]  # strip bot mention
+    # The full text is already a slash command like "/clear" or "/compact foo".
+    cc_slash = _strip_bot_mention(cmd_text)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
@@ -893,7 +978,9 @@ async def _capture_bash_output(
 
             last_output = output
 
-            # Truncate to fit Telegram's 4096-char limit
+            # Truncate to fit Telegram's 4096-char limit. This is a live
+            # terminal window (only the tail is ever meaningful while the
+            # command keeps running), not stored-content truncation.
             if len(output) > 3800:
                 output = "… " + output[-3800:]
 
@@ -908,25 +995,32 @@ async def _capture_bash_output(
                 if sent:
                     msg_id = sent.message_id
             else:
-                # Subsequent captures — edit in place
+                # Subsequent captures — edit in place, MarkdownV2 falling
+                # back to plain text.
                 try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=convert_markdown(output),
-                        parse_mode="MarkdownV2",
-                        link_preview_options=NO_LINK_PREVIEW,
+                    await edit_with_fallback(bot, chat_id, msg_id, output)
+                except RetryAfter as e:
+                    retry_secs = (
+                        e.retry_after
+                        if isinstance(e.retry_after, (int, float))
+                        else e.retry_after.total_seconds()
                     )
-                except Exception:
+                    await asyncio.sleep(retry_secs)
                     try:
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            text=output,
-                            link_preview_options=NO_LINK_PREVIEW,
+                        await edit_with_fallback(bot, chat_id, msg_id, output)
+                    except RetryAfter as e2:
+                        logger.warning(
+                            "Bash-output edit rate-limited twice for chat "
+                            "%s; skipping this tick: %s",
+                            chat_id,
+                            e2,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        logger.warning(
+                            "Bash-output edit failed after retry for chat %s: %s",
+                            chat_id,
+                            e2,
+                        )
 
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
@@ -2029,6 +2123,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

@@ -97,8 +97,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `OPENAI_API_KEY` | _(нет)_ | API-ключ OpenAI для транскрипции голосовых сообщений |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Базовый URL OpenAI API (для прокси или совместимых API) |
 
-Форматирование сообщений всегда HTML через `chatgpt-md-converter` (`chatgpt_md_converter`).
-Переключателя формата на MarkdownV2 во время выполнения нет.
+Форматирование сообщений — MarkdownV2 (`src/ccbot/markdown_v2.py`, на основе `telegramify-markdown`), отправляется с `parse_mode=MarkdownV2` через хелперы `safe_reply`/`safe_edit`/`safe_send`. Если разбор MarkdownV2 не удаётся, эти хелперы автоматически переключаются на обычный текст — ошибка форматирования никогда не блокирует доставку.
 
 > Если бот запущен на VPS без интерактивного терминала для подтверждений, используйте **auto-режим** — Claude Code выполняет действия автоматически, а фоновый классификатор блокирует опасные (утечки, force-push в main, произвольные загрузки и т. п.):
 >
@@ -215,8 +214,9 @@ I'll look into the login bug...
 Уведомления отправляются в topic, привязанный к окну сессии.
 
 Примечание по форматированию:
-- Telegram-сообщения рендерятся с parse mode `HTML` через `chatgpt-md-converter`
-- Длинные сообщения делятся с учётом HTML-тегов, чтобы сохранять код-блоки и форматирование
+- Telegram-сообщения рендерятся с parse mode `MarkdownV2` через `telegramify-markdown` (`src/ccbot/markdown_v2.py`), включая раскрываемые цитаты для thinking/tool-вывода
+- При ошибке разбора MarkdownV2 слой отправки автоматически повторяет попытку как обычный текст
+- Длинные сообщения делятся `split_message` (`telegram_sender.py`) по лимиту Telegram в 4096 символов
 
 ## Запуск Claude Code в tmux
 
@@ -271,7 +271,7 @@ src/ccbot/
 ├── monitor_state.py       # Persist состояния монитора (byte-offset)
 ├── transcript_parser.py   # Парсинг JSONL-транскриптов Claude Code
 ├── terminal_parser.py     # Парсинг terminal pane (interactive UI + status line)
-├── html_converter.py      # Markdown -> Telegram HTML + HTML-aware splitting
+├── markdown_v2.py         # Markdown -> Telegram MarkdownV2 + раскрываемые цитаты
 ├── screenshot.py          # Terminal text -> PNG с поддержкой ANSI-цветов
 ├── transcribe.py          # Транскрипция голоса в текст через OpenAI API
 ├── utils.py               # Общие утилиты (atomic JSON writes, JSONL helpers)

@@ -27,11 +27,13 @@ from pathlib import Path
 from typing import Any
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter
 
 from ..config import config
 from ..monitor_state import MonitorState
 from ..session import session_manager
 from .callback_data import CB_REPOINT
+from .message_sender import safe_send
 
 logger = logging.getLogger(__name__)
 
@@ -122,15 +124,20 @@ async def _check_hook_failures(bot: Bot) -> None:
 
 
 async def _notify_topics_for_cwd(bot: Bot, cwd: str, text: str) -> None:
-    """Send a plain-text notice to every topic bound to a window in cwd."""
+    """Send a notice (MarkdownV2, falling back to plain text) to every topic
+    bound to a window in cwd."""
     for user_id, thread_id, window_id in list(session_manager.iter_thread_bindings()):
         ws = session_manager.window_states.get(window_id)
         if ws is None or ws.cwd != cwd:
             continue
         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
         try:
-            await bot.send_message(
-                chat_id=chat_id, text=text, message_thread_id=thread_id
+            await safe_send(bot, chat_id, text, message_thread_id=thread_id)
+        except RetryAfter as e:
+            logger.warning(
+                "Hook-failure notice rate-limited for chat %s, skipping: %s",
+                chat_id,
+                e,
             )
         except Exception as e:
             logger.error("Failed to send hook-failure notice: %s", e)
@@ -283,17 +290,24 @@ async def _send_divergence_notice(
     )
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
+        await safe_send(
+            bot,
+            chat_id,
+            text,
             message_thread_id=thread_id,
+            reply_markup=keyboard,
         )
         logger.info(
             "Divergence notice sent: window=%s tracked=%s candidate=%s",
             window_id,
             tracked_sid,
             candidate_sid,
+        )
+    except RetryAfter as e:
+        logger.warning(
+            "Divergence notice rate-limited for chat %s, skipping: %s",
+            chat_id,
+            e,
         )
     except Exception as e:
         logger.error("Failed to send divergence notice: %s", e)

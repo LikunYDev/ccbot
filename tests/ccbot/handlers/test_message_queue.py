@@ -70,6 +70,16 @@ def _clear_queue_state():
 
 
 @pytest.fixture
+def _clear_status_msg_info():
+    """Reset _status_msg_info between tests so tracking doesn't leak."""
+    from ccbot.handlers import message_queue as mq
+
+    mq._status_msg_info.clear()
+    yield
+    mq._status_msg_info.clear()
+
+
+@pytest.fixture
 def _clear_enqueued_flag():
     """Reset _interactive_enqueued between tests."""
     from ccbot.handlers.interactive_ui import _interactive_enqueued
@@ -597,3 +607,100 @@ class TestContentRetryAndFailureNotice:
             text=DELIVERY_FAILURE_NOTICE,
             message_thread_id=42,
         )
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info")
+class TestConvertStatusToContentRace:
+    """f53: `_convert_status_to_content` must not pop `_status_msg_info`
+    until the outstanding edit has actually resolved. Popping it up front
+    (before awaiting the edit) lets a concurrent `enqueue_status_update`
+    dedup read see nothing mid-flight, skip the dedup, and resurrect a
+    duplicate status message that never gets cleared."""
+
+    @pytest.mark.asyncio
+    async def test_entry_stays_visible_until_edit_resolves(self):
+        """Simulate a slow in-flight edit with an asyncio.Event and assert
+        the tracking entry is still readable by a concurrent caller while
+        the edit is outstanding, then confirmed popped once it succeeds."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_edit(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return True
+
+        skey = (7, 42)
+        mq._status_msg_info[skey] = (11, "@5", "Thinking…")
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.edit_with_fallback", new=slow_edit),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            task = asyncio.create_task(
+                mq._convert_status_to_content(bot, 7, 42, "@5", "new content")
+            )
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+            # Mid-flight: a concurrent enqueue_status_update dedup read must
+            # still see the entry (this IS that read, since it uses .get()).
+            assert mq._status_msg_info.get(skey) == (11, "@5", "Thinking…")
+
+            release.set()
+            result = await asyncio.wait_for(task, timeout=5.0)
+
+        assert result == 11
+        # Consumed: popped only after the edit actually resolved.
+        assert skey not in mq._status_msg_info
+
+    @pytest.mark.asyncio
+    async def test_pops_entry_on_total_edit_failure(self):
+        """When both edit attempts fail (edit_with_fallback returns False),
+        the tracked message is dead either way, so the entry must still be
+        popped — the caller sends a fresh message."""
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        skey = (7, 42)
+        mq._status_msg_info[skey] = (11, "@5", "Thinking…")
+
+        async def failing_edit(*args, **kwargs):
+            return False
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch("ccbot.handlers.message_queue.edit_with_fallback", new=failing_edit),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            result = await mq._convert_status_to_content(
+                bot, 7, 42, "@5", "new content"
+            )
+
+        assert result is None
+        assert skey not in mq._status_msg_info
+
+    @pytest.mark.asyncio
+    async def test_pops_entry_on_different_window_delete(self):
+        """Stored status belongs to a different window: the old status is
+        deleted (not converted) and the entry must still be popped."""
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        skey = (7, 42)
+        mq._status_msg_info[skey] = (11, "@5", "Thinking…")
+
+        with patch("ccbot.handlers.message_queue.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id.return_value = 100
+            result = await mq._convert_status_to_content(
+                bot, 7, 42, "@6", "new content"
+            )
+
+        assert result is None
+        assert skey not in mq._status_msg_info
+        bot.delete_message.assert_awaited_once_with(chat_id=100, message_id=11)
