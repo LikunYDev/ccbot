@@ -4,8 +4,15 @@ Provides:
   - ccbot_dir(): resolve config directory from CCBOT_DIR env var.
   - atomic_write_json(): crash-safe JSON file writes via temp+rename.
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
+  - parse_group_session_names(): tmux session names sharing a configured
+    session's group, used to accept/reject grouped-peer and foreign tmux
+    sessions on ccbot's shared socket.
   - supervise_loop(): restart a background loop coroutine if it crashes or
     exits unexpectedly, instead of silently killing monitoring forever.
+
+This module is config-free (no import of config.py or any module that
+imports it), so both tmux_manager.py and hook.py — which must not import
+each other's config-dependent code — can share it.
 """
 
 import asyncio
@@ -76,6 +83,46 @@ def read_cwd_from_jsonl(file_path: str | Path) -> str:
     except OSError:
         pass
     return ""
+
+
+def parse_group_session_names(
+    list_sessions_output: str, configured_session_name: str
+) -> set[str]:
+    """Return tmux session names sharing the configured session's group.
+
+    tmux reports an empty `session_group` for ordinary ungrouped sessions.
+    In that case, matching on the group would incorrectly include every other
+    ungrouped session on the server, so we fall back to the configured name.
+
+    Shared by tmux_manager.py (grouped-peer session_map reads) and hook.py
+    (accepting/rejecting a pane's session before writing session_map).
+    """
+
+    sessions: list[tuple[str, str]] = []
+    target_group = ""
+
+    for raw_line in list_sessions_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        session_name, sep, session_group = line.partition("|")
+        if not sep or not session_name:
+            return {configured_session_name}
+        sessions.append((session_name, session_group))
+        if session_name == configured_session_name:
+            if not session_group:
+                return {configured_session_name}
+            target_group = session_group
+
+    if not target_group:
+        return {configured_session_name}
+
+    grouped_names = {
+        session_name
+        for session_name, session_group in sessions
+        if session_group == target_group
+    }
+    return grouped_names or {configured_session_name}
 
 
 async def supervise_loop(

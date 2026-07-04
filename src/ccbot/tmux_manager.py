@@ -37,6 +37,7 @@ from typing import TypeVar
 import libtmux
 
 from .config import SENSITIVE_ENV_VARS, config
+from .utils import parse_group_session_names
 
 logger = logging.getLogger(__name__)
 
@@ -103,43 +104,6 @@ def build_window_shell_cmd(claude_cmd: str, user_shell: str) -> str:
     shell in the pane after claude exits, instead of the window closing.
     """
     return f'PATH="{_FALLBACK_PATH}:$PATH" {claude_cmd}; exec {user_shell}'
-
-
-def _parse_group_session_names(
-    list_sessions_output: str, configured_session_name: str
-) -> set[str]:
-    """Return tmux session names sharing the configured session's group.
-
-    tmux reports an empty `session_group` for ordinary ungrouped sessions.
-    In that case, matching on the group would incorrectly include every other
-    ungrouped session on the server, so we fall back to the configured name.
-    """
-
-    sessions: list[tuple[str, str]] = []
-    target_group = ""
-
-    for raw_line in list_sessions_output.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        session_name, sep, session_group = line.partition("|")
-        if not sep or not session_name:
-            return {configured_session_name}
-        sessions.append((session_name, session_group))
-        if session_name == configured_session_name:
-            if not session_group:
-                return {configured_session_name}
-            target_group = session_group
-
-    if not target_group:
-        return {configured_session_name}
-
-    grouped_names = {
-        session_name
-        for session_name, session_group in sessions
-        if session_group == target_group
-    }
-    return grouped_names or {configured_session_name}
 
 
 def _text_visible_in_pane(pane_text: str, sent_text: str) -> bool:
@@ -483,7 +447,7 @@ class TmuxManager:
                 )
                 return {self.session_name}
 
-            return _parse_group_session_names(result.stdout, self.session_name)
+            return parse_group_session_names(result.stdout, self.session_name)
 
         return await self._bounded(
             "list_group_session_names", _sync_list, {self.session_name}

@@ -10,7 +10,6 @@ from ccbot import tmux_manager as tm
 from ccbot.config import config
 from ccbot.tmux_manager import (
     TmuxManager,
-    _parse_group_session_names,
     _text_visible_in_pane,
     build_claude_command,
     build_window_shell_cmd,
@@ -204,20 +203,6 @@ class TestListWindowsTimeout:
         result = await mgr.list_windows()
 
         assert result == []
-
-
-class TestParseGroupSessionNames:
-    def test_grouped_session_returns_all_peers(self):
-        output = "ccbot|ccbot\nccbot-2|ccbot\nother|\n"
-        assert _parse_group_session_names(output, "ccbot") == {"ccbot", "ccbot-2"}
-
-    def test_ungrouped_session_does_not_match_other_ungrouped_sessions(self):
-        output = "ccbot|\nother|\n"
-        assert _parse_group_session_names(output, "ccbot") == {"ccbot"}
-
-    def test_missing_configured_session_falls_back_to_literal_name(self):
-        output = "other|other\nother-2|other\n"
-        assert _parse_group_session_names(output, "ccbot") == {"ccbot"}
 
 
 class TestTextVisibleInPane:

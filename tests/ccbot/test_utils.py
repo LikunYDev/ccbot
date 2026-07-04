@@ -11,6 +11,7 @@ import pytest
 from ccbot.utils import (
     atomic_write_json,
     ccbot_dir,
+    parse_group_session_names,
     read_cwd_from_jsonl,
     supervise_loop,
 )
@@ -78,6 +79,23 @@ class TestReadCwdFromJsonl:
 
     def test_missing_file_returns_empty(self, tmp_path: Path):
         assert read_cwd_from_jsonl(tmp_path / "nonexistent.jsonl") == ""
+
+
+class TestParseGroupSessionNames:
+    """Moved from test_tmux_command.py alongside the function's move to
+    utils.py (shared by tmux_manager.py and hook.py)."""
+
+    def test_grouped_session_returns_all_peers(self):
+        output = "ccbot|ccbot\nccbot-2|ccbot\nother|\n"
+        assert parse_group_session_names(output, "ccbot") == {"ccbot", "ccbot-2"}
+
+    def test_ungrouped_session_does_not_match_other_ungrouped_sessions(self):
+        output = "ccbot|\nother|\n"
+        assert parse_group_session_names(output, "ccbot") == {"ccbot"}
+
+    def test_missing_configured_session_falls_back_to_literal_name(self):
+        output = "other|other\nother-2|other\n"
+        assert parse_group_session_names(output, "ccbot") == {"ccbot"}
 
 
 class TestSuperviseLoop:

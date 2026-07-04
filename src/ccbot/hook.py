@@ -1,8 +1,10 @@
 """Hook subcommand for Claude Code session tracking.
 
 Called by Claude Code's SessionStart hook to maintain a window↔session
-mapping in <CCBOT_DIR>/session_map.json. Also provides `--install` to
-auto-configure the hook in ~/.claude/settings.json.
+mapping in <CCBOT_DIR>/session_map.json. Skips panes belonging to a foreign
+tmux session sharing ccbot's dedicated socket (e.g. the user's own
+interactive tmux sessions), so their entries never pollute the map. Also
+provides `--install` to auto-configure the hook in ~/.claude/settings.json.
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
 since hooks run inside tmux panes where bot env vars are not set.
@@ -133,29 +135,80 @@ def _install_hook() -> int:
     return 0
 
 
-def _tmux_socket_name() -> str:
-    """Resolve ccbot's dedicated tmux socket name (mirrors config.tmux_socket_name).
+def _env_or_dotenv(key: str, default: str) -> str:
+    """Resolve a config value the way this module must: env var, then the
+    config dir's .env, then a default.
 
     config.py can't be imported here (it requires TELEGRAM_BOT_TOKEN), so
-    check $TMUX_SOCKET_NAME, then the config dir's .env, then the default.
+    this hand-rolls the same env/.env precedence for the couple of
+    tmux-identifying vars the hook needs directly (socket name, session
+    name).
     """
-    name = os.environ.get("TMUX_SOCKET_NAME", "")
-    if name:
-        return name
+    value = os.environ.get(key, "")
+    if value:
+        return value
 
     from .utils import ccbot_dir
 
     env_file = ccbot_dir() / ".env"
     try:
         for line in env_file.read_text().splitlines():
-            key, sep, value = line.strip().partition("=")
-            if sep and key == "TMUX_SOCKET_NAME":
-                value = value.strip().strip("'\"")
-                if value:
-                    return value
+            file_key, sep, file_value = line.strip().partition("=")
+            if sep and file_key == key:
+                file_value = file_value.strip().strip("'\"")
+                if file_value:
+                    return file_value
     except OSError:
         pass
-    return "ccbot"
+    return default
+
+
+def _tmux_socket_name() -> str:
+    """Resolve ccbot's dedicated tmux socket name (mirrors config.tmux_socket_name)."""
+    return _env_or_dotenv("TMUX_SOCKET_NAME", "ccbot")
+
+
+def _tmux_session_name() -> str:
+    """Resolve ccbot's configured tmux session name (mirrors config.tmux_session_name)."""
+    return _env_or_dotenv("TMUX_SESSION_NAME", "ccbot")
+
+
+def _accepted_session_names() -> set[str] | None:
+    """Tmux session names ccbot's session_map accepts: the configured
+    session plus any grouped peers.
+
+    Returns None if the tmux query itself failed (transient hiccup, socket
+    not up yet, etc.) — callers must treat that as "unknown, accept
+    anything" rather than silently dropping a legitimate registration.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "-L",
+                _tmux_socket_name(),
+                "list-sessions",
+                "-F",
+                "#{session_name}|#{session_group}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("_accepted_session_names: tmux query failed: %s", e)
+        return None
+    if result.returncode != 0:
+        logger.debug(
+            "_accepted_session_names: list-sessions failed (rc=%s): %s",
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return None
+
+    from .utils import parse_group_session_names
+
+    return parse_group_session_names(result.stdout, _tmux_session_name())
 
 
 def _record_hook_failure(cwd: str, session_id: str, reason: str) -> None:
@@ -412,6 +465,25 @@ def hook_main() -> None:
             )
         return
     tmux_session_name, window_id, window_name = resolved
+
+    # A pane can resolve to a tmux session that isn't ccbot's own — e.g. the
+    # user's personal interactive tmux sessions sharing this dedicated
+    # socket. session_map is ccbot's private state; readers only ever look
+    # at the configured session (plus grouped peers), so an entry from any
+    # other session is inert pollution. Skip it here instead of writing it
+    # and relying on readers to ignore it.
+    accepted_session_names = _accepted_session_names()
+    if (
+        accepted_session_names is not None
+        and tmux_session_name not in accepted_session_names
+    ):
+        logger.info(
+            "Pane belongs to foreign tmux session %r on ccbot's socket; "
+            "not registering",
+            tmux_session_name,
+        )
+        return
+
     # Key uses window_id for uniqueness
     session_window_key = f"{tmux_session_name}:{window_id}"
 

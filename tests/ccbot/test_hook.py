@@ -186,6 +186,13 @@ class TestHookMainCwdFallback:
                     args=cmd, returncode=0, stdout=ps_output, stderr=""
                 )
             assert cmd[:2] == ["tmux", "-L"], cmd
+            if "list-sessions" in cmd:
+                # Every resolved window in this test class reports back the
+                # configured session name ("ccbot"), so a trivial ungrouped
+                # entry is enough to have it accepted.
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="ccbot|\n", stderr=""
+                )
             assert "list-panes" in cmd
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=panes, stderr=""
@@ -312,6 +319,10 @@ class TestHookSocketGate:
         tmux_env: str,
     ) -> dict | None:
         def fake_run(cmd, *args, **kwargs):
+            if "list-sessions" in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="ccbot|\n", stderr=""
+                )
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="ccbot:@41:job\n", stderr=""
             )
@@ -323,6 +334,7 @@ class TestHookSocketGate:
         monkeypatch.setenv("TMUX_PANE", "%9")
         monkeypatch.setenv("TMUX", tmux_env)
         monkeypatch.delenv("TMUX_SOCKET_NAME", raising=False)
+        monkeypatch.delenv("TMUX_SESSION_NAME", raising=False)
         hook_main()
         map_file = tmp_path / "session_map.json"
         return json.loads(map_file.read_text()) if map_file.exists() else None
@@ -345,6 +357,112 @@ class TestHookSocketGate:
         )
 
 
+class TestHookForeignSessionGate:
+    """The socket gate (TestHookSocketGate) only catches a foreign tmux
+    *server*. A user's personal interactive tmux session (e.g. a
+    default-named session "7") can perfectly well live on ccbot's own
+    dedicated socket alongside ccbot's session — same $TMUX socket basename,
+    different #{session_name}. Claude Code started in one of those panes
+    must not get a session_map entry: readers only ever look at the
+    configured session (plus grouped peers), so anything else is inert
+    pollution the hook should just not write."""
+
+    PAYLOAD = {
+        "session_id": "33333333-3333-3333-3333-333333333333",
+        "cwd": "/proj",
+        "hook_event_name": "SessionStart",
+    }
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        *,
+        pane_output: str,
+        list_sessions_output: str,
+        list_sessions_rc: int = 0,
+    ) -> dict | None:
+        def fake_run(cmd, *args, **kwargs):
+            if "list-sessions" in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=list_sessions_rc,
+                    stdout=list_sessions_output,
+                    stderr="" if list_sessions_rc == 0 else "tmux exploded",
+                )
+            assert "display-message" in cmd, cmd
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=pane_output, stderr=""
+            )
+
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr("ccbot.hook.subprocess.run", fake_run)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(self.PAYLOAD)))
+        monkeypatch.setenv("TMUX_PANE", "%9")
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.delenv("TMUX_SOCKET_NAME", raising=False)
+        monkeypatch.delenv("TMUX_SESSION_NAME", raising=False)
+        hook_main()
+        map_file = tmp_path / "session_map.json"
+        return json.loads(map_file.read_text()) if map_file.exists() else None
+
+    def test_foreign_ungrouped_session_is_skipped(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level("INFO", logger="ccbot.hook"):
+            result = self._run(
+                monkeypatch,
+                tmp_path,
+                pane_output="7:@29:zsh\n",
+                list_sessions_output="ccbot|\n7|\n",
+            )
+        assert result is None
+        assert any(
+            "foreign tmux session" in record.getMessage()
+            and "'7'" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_grouped_peer_session_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A session sharing the configured session's group (e.g. reattached
+        via `tmux new-session -t ccbot`) is accepted even though its name
+        differs from TMUX_SESSION_NAME — it's the same logical ccbot session,
+        not a foreign one."""
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            pane_output="ccbot-2:@7:job\n",
+            list_sessions_output="ccbot|grp1\nccbot-2|grp1\n",
+        )
+        assert result is not None
+        assert result["ccbot-2:@7"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+    def test_list_sessions_failure_fails_open(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A transient tmux hiccup querying list-sessions must not block a
+        legitimate registration — unknown is treated as accept-anything."""
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            pane_output="ccbot:@41:job\n",
+            list_sessions_output="",
+            list_sessions_rc=1,
+        )
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+
 class TestHookMainWritePath:
     """Tests that exercise the session_map write path with tmux mocked.
 
@@ -359,14 +477,22 @@ class TestHookMainWritePath:
         *,
         tmux_pane: str,
         tmux_output: str,
+        list_sessions_output: str = "ccbot|grp1\nccbot-2|grp1\n",
     ) -> None:
-        """Run hook_main with `subprocess.run` mocked to return `tmux_output`."""
+        """Run hook_main with `subprocess.run` mocked to return `tmux_output`
+        for the pane resolution call, and `list_sessions_output` for the
+        session-acceptance query. The default groups "ccbot" and "ccbot-2"
+        together so tests resolving to either name are accepted.
+        """
 
         def fake_run(cmd, *args, **kwargs):
-            result = subprocess.CompletedProcess(
+            if "list-sessions" in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=list_sessions_output, stderr=""
+                )
+            return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=tmux_output, stderr=""
             )
-            return result
 
         monkeypatch.setattr("ccbot.hook.subprocess.run", fake_run)
         monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
@@ -497,6 +623,10 @@ class TestHookMainTranscriptSizeAtStart:
         transcript_path: str,
     ) -> dict:
         def fake_run(cmd, *args, **kwargs):
+            if "list-sessions" in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="ccbot|\n", stderr=""
+                )
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="ccbot:@41:job\n", stderr=""
             )
