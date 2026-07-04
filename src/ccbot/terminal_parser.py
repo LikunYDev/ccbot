@@ -362,11 +362,34 @@ def build_degraded_prompt(pane_text: str) -> InteractiveUIContent | None:
 
     Returns the visible UI region (chrome stripped) plus a note, named
     ``"UnknownPrompt"``. Returns None when no interactive footer is present.
+
+    The region is trimmed to everything below the last chrome separator
+    (the boundary rule the bottom-anchored extractor uses), so the message
+    shows the dialog itself instead of burying it under whatever scrollback
+    happened to precede it. Panes without a separator above the dialog keep
+    the previous last-N-lines behavior.
     """
     if not has_interactive_footer(pane_text):
         return None
     lines = strip_pane_chrome(pane_text.strip().split("\n"))
-    block = [ln for ln in lines if ln.strip()][-_DEGRADED_MAX_LINES:]
+
+    sep_idx: int | None = None
+    for i, ln in enumerate(lines):
+        if _RE_SEPARATOR.match(ln.strip()):
+            sep_idx = i
+    below_sep = (
+        [ln for ln in lines[sep_idx + 1 :] if ln.strip()] if sep_idx is not None else []
+    )
+    # Only trust the trimmed region when it still holds the actual prompt
+    # (its footer); otherwise the separator was below the dialog and the
+    # untrimmed tail is the safe choice.
+    if len(below_sep) >= 2 and any(
+        p.search(ln) for ln in below_sep for p in _FOOTER_MARKERS
+    ):
+        block = below_sep[-_DEGRADED_MAX_LINES:]
+    else:
+        block = [ln for ln in lines if ln.strip()][-_DEGRADED_MAX_LINES:]
+
     body = _shorten_separators("\n".join(block)).rstrip()
     return InteractiveUIContent(
         content=f"{_DEGRADED_NOTE}\n\n{body}", name="UnknownPrompt"
