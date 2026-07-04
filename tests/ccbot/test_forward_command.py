@@ -14,7 +14,6 @@ def _make_update(text: str, user_id: int = 1, thread_id: int = 42) -> MagicMock:
     update.message.text = text
     update.message.message_thread_id = thread_id
     update.message.chat = MagicMock()
-    update.message.chat.send_action = AsyncMock()
     update.effective_chat = MagicMock()
     update.effective_chat.type = "supergroup"
     update.effective_chat.id = 100

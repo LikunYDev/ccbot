@@ -92,7 +92,6 @@ def _make_update_with_photo(user_id: int = 1, thread_id: int = 42) -> MagicMock:
     update.message.chat = MagicMock()
     update.message.chat.type = "supergroup"
     update.message.chat.id = 100
-    update.message.chat.send_action = AsyncMock()
     return update
 
 
@@ -105,7 +104,6 @@ def _make_update_with_voice(user_id: int = 1, thread_id: int = 42) -> MagicMock:
     update.message.chat = MagicMock()
     update.message.chat.type = "supergroup"
     update.message.chat.id = 100
-    update.message.chat.send_action = AsyncMock()
     return update
 
 

@@ -632,10 +632,9 @@ class TestTeardownTopic:
             assert key in mq._queue_workers
             worker = mq._queue_workers[key]
 
-            # Populate the flood-control / typing-throttle entries too, so
-            # teardown's cleanup of them is actually exercised.
+            # Populate the flood-control entry too, so teardown's cleanup
+            # of it is actually exercised.
             mq._flood_until[key] = 123.0
-            mq._last_typing[key] = 456.0
 
             await teardown_topic(7, 42)
 
@@ -644,7 +643,6 @@ class TestTeardownTopic:
         assert key not in mq._queue_locks
         assert key not in mq._queue_workers
         assert key not in mq._flood_until
-        assert key not in mq._last_typing
 
     @pytest.mark.asyncio
     async def test_teardown_does_not_touch_group_process_locks(self):

@@ -49,7 +49,6 @@ from telegram import (
     Message,
     Update,
 )
-from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 from telegram.ext import (
     AIORateLimiter,
@@ -709,7 +708,6 @@ async def forward_command_handler(
     logger.info(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
     )
-    await update.message.chat.send_action(ChatAction.TYPING)
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
@@ -838,7 +836,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         text_to_send = f"(image attached: {file_path})"
 
-    await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
     success, message = await session_manager.send_to_window(wid, text_to_send)
@@ -918,7 +915,6 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"⚠ Transcription failed: {e}")
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
     success, message = await session_manager.send_to_window(wid, text)
@@ -1166,7 +1162,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
     await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
 
     # Cancel any running bash capture — new message pushes pane content down
@@ -2144,6 +2139,30 @@ async def post_shutdown(application: Application) -> None:
     await close_transcribe_client()
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch exceptions escaping any handler: log them and notify the user.
+
+    PTB advances the getUpdates offset before dispatching, so an update whose
+    handler dies is never redelivered — without this, the message is dropped
+    with no trace ("silence never means delivered"). The notice is plain text
+    sent directly (no MarkdownV2 conversion) and best-effort: if Telegram is
+    unreachable the loud log is the fallback.
+    """
+    logger.error(
+        "Handler exception while processing update %s", update, exc_info=context.error
+    )
+    message = update.effective_message if isinstance(update, Update) else None
+    if message is None:
+        return
+    try:
+        await message.reply_text(
+            "⚠️ Error while handling this message — it may not have reached "
+            "Claude. If no response follows, please resend it."
+        )
+    except Exception:
+        logger.exception("Failed to send error notice to user")
+
+
 def create_bot() -> Application:
     application = (
         Application.builder()
@@ -2153,6 +2172,8 @@ def create_bot() -> Application:
         .post_shutdown(post_shutdown)
         .build()
     )
+
+    application.add_error_handler(error_handler)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))

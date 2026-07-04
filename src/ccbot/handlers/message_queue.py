@@ -48,7 +48,6 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from telegram import Bot
-from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
 from ..session import session_manager
@@ -110,12 +109,6 @@ DELIVERY_FAILURE_NOTICE = (
 # sending to the same Telegram group to prevent rate limit bursts
 _group_process_locks: dict[int, asyncio.Lock] = {}
 
-# Typing indicator throttle: (user_id, thread_id_or_0) -> monotonic time of last send
-_last_typing: dict[tuple[int, int], float] = {}
-
-# Minimum interval between typing indicators to same topic (seconds)
-TYPING_MIN_INTERVAL = 4.0
-
 
 # Regex to strip the stats parenthetical (and any trailing text) from status lines, e.g.:
 # "Unravelling… (45s · ↓ 2.5k tokens · thought for 25s)" → "Unravelling…"
@@ -162,14 +155,14 @@ async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
 
     Call this when a topic is closed or deleted — Telegram never reuses
     thread_ids, so anything left behind under this key (queue, lock, worker
-    task, flood-control/typing-throttle timestamps) would otherwise leak
+    task, flood-control timestamps) would otherwise leak
     forever. This is a hard stop, not a drain: any tasks still sitting in
     the queue are deliberately discarded along with the queue itself —
     `drain_queues()` is the place to flush a live topic before shutdown;
     this function is for a topic that no longer exists to flush *to*.
 
     Pops (and cancels, for the worker) the (user_id, thread_id or 0) entry
-    from `_message_queues`, `_queue_locks`, `_flood_until`, `_last_typing`,
+    from `_message_queues`, `_queue_locks`, `_flood_until`,
     and `_queue_workers`. Deliberately does NOT touch `_group_process_locks`
     — that lock is keyed by chat_id and shared across every topic's worker
     in the same group chat.
@@ -183,7 +176,6 @@ async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
     _message_queues.pop(key, None)
     _queue_locks.pop(key, None)
     _flood_until.pop(key, None)
-    _last_typing.pop(key, None)
 
     worker = _queue_workers.pop(key, None)
     if worker is not None:
@@ -618,19 +610,6 @@ async def _process_status_update_task(
             return
         else:
             # Same window, text changed - edit in place
-            # Send typing indicator when Claude is working (throttled)
-            if "esc to interrupt" in status_text.lower():
-                now = time.monotonic()
-                if now - _last_typing.get(skey, 0) >= TYPING_MIN_INTERVAL:
-                    try:
-                        await bot.send_chat_action(
-                            chat_id=chat_id, action=ChatAction.TYPING
-                        )
-                        _last_typing[skey] = now
-                    except RetryAfter:
-                        raise
-                    except Exception:
-                        pass
             if await edit_with_fallback(bot, chat_id, msg_id, status_text):
                 _status_msg_info[skey] = (msg_id, wid, status_text)
             else:
@@ -660,17 +639,6 @@ async def _do_send_status_message(
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
         except Exception:
             pass
-    # Send typing indicator when Claude is working (throttled)
-    if "esc to interrupt" in text.lower():
-        now = time.monotonic()
-        if now - _last_typing.get(skey, 0) >= TYPING_MIN_INTERVAL:
-            try:
-                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                _last_typing[skey] = now
-            except RetryAfter:
-                raise
-            except Exception:
-                pass
     sent = await send_with_fallback(
         bot,
         chat_id,
@@ -872,5 +840,4 @@ async def shutdown_workers() -> None:
     _message_queues.clear()
     _queue_locks.clear()
     _group_process_locks.clear()
-    _last_typing.clear()
     logger.info("Message queue workers stopped")
