@@ -268,15 +268,21 @@ class TestGroupedSessionMapHandling:
         load_session_map.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_cleanup_stale_session_map_entries_removes_grouped_prefix(
+    async def test_sweep_removes_dead_windows_regardless_of_prefix(
         self, mgr: SessionManager, tmp_path, monkeypatch
     ) -> None:
+        """Window IDs are unique per tmux server and ccbot is the map's only
+        consumer, so a dead window's entry is garbage no matter which
+        session-name prefix wrote it (grouped peer, foreign tmux session).
+        Live windows survive even under foreign prefixes."""
         session_map_file = tmp_path / "session_map.json"
         session_map_file.write_text(
             json.dumps(
                 {
+                    "ccbot:@5": {"session_id": "sid-5"},
                     "ccbot-2:@7": {"session_id": "sid-7"},
                     "other:@9": {"session_id": "sid-9"},
+                    "other:@11": {"session_id": "sid-11"},
                 }
             ),
             encoding="utf-8",
@@ -284,14 +290,75 @@ class TestGroupedSessionMapHandling:
         monkeypatch.setattr(config, "session_map_file", session_map_file)
         monkeypatch.setattr(config, "tmux_session_name", "ccbot")
         monkeypatch.setattr(
-            "ccbot.session.tmux_manager.list_group_session_names",
-            AsyncMock(return_value={"ccbot", "ccbot-2"}),
+            "ccbot.session.tmux_manager.list_all_window_ids",
+            AsyncMock(return_value={"@5", "@11"}),
         )
 
-        await mgr._cleanup_stale_session_map_entries({"@5"})
+        await mgr.sweep_stale_session_map_entries()
 
         remaining = json.loads(session_map_file.read_text(encoding="utf-8"))
-        assert remaining == {"other:@9": {"session_id": "sid-9"}}
+        assert remaining == {
+            "ccbot:@5": {"session_id": "sid-5"},
+            "other:@11": {"session_id": "sid-11"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_repoint_updates_every_prefix_for_the_window(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccbot:@41": {"session_id": "sid-old", "cwd": "/proj"},
+                    "ccbot-2:@41": {"session_id": "sid-old", "cwd": "/proj"},
+                    "ccbot:@49": {"session_id": "sid-49", "cwd": "/other"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+
+        ok = await mgr.repoint_window_session("@41", "sid-new")
+
+        assert ok is True
+        result = json.loads(session_map_file.read_text(encoding="utf-8"))
+        assert result["ccbot:@41"]["session_id"] == "sid-new"
+        assert result["ccbot-2:@41"]["session_id"] == "sid-new"
+        assert result["ccbot:@49"]["session_id"] == "sid-49"
+
+    @pytest.mark.asyncio
+    async def test_repoint_returns_false_when_window_absent(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        original = {"ccbot:@49": {"session_id": "sid-49"}}
+        session_map_file.write_text(json.dumps(original), encoding="utf-8")
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+
+        ok = await mgr.repoint_window_session("@77", "sid-new")
+
+        assert ok is False
+        assert json.loads(session_map_file.read_text(encoding="utf-8")) == original
+
+    @pytest.mark.asyncio
+    async def test_sweep_is_a_noop_when_tmux_unreachable(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """An unreachable tmux server means "unknown", not "no windows" —
+        sweeping on it would delete every entry."""
+        session_map_file = tmp_path / "session_map.json"
+        original = {"ccbot:@5": {"session_id": "sid-5"}}
+        session_map_file.write_text(json.dumps(original), encoding="utf-8")
+        monkeypatch.setattr(config, "session_map_file", session_map_file)
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_all_window_ids",
+            AsyncMock(return_value=None),
+        )
+
+        await mgr.sweep_stale_session_map_entries()
+
+        assert json.loads(session_map_file.read_text(encoding="utf-8")) == original
 
     @pytest.mark.asyncio
     async def test_load_session_map_dedups_same_window_id_across_grouped_peers(

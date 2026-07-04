@@ -317,6 +317,71 @@ class TestInteractiveEnqueuedFlag:
         assert is_interactive_enqueued(7, 42) is False
 
 
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestEditNotModified:
+    """Editing the existing interactive message with identical content (🔄 tap,
+    arrow press at a list boundary) makes Telegram raise BadRequest 'Message is
+    not modified'. That is a no-op success — treating it as a dead message sent
+    a duplicate prompt and orphaned the old one."""
+
+    def _patches(self):
+        mock_window = MagicMock()
+        mock_window.window_id = "@5"
+        p_tmux = patch("ccbot.handlers.interactive_ui.tmux_manager")
+        p_sm = patch("ccbot.handlers.interactive_ui.session_manager")
+        return mock_window, p_tmux, p_sm
+
+    @pytest.mark.asyncio
+    async def test_not_modified_edit_is_success_not_duplicate(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        from telegram.error import BadRequest
+
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        mock_window, p_tmux, p_sm = self._patches()
+        _interactive_msgs[(1, 42)] = 555  # UI already delivered
+        mock_bot.edit_message_text.side_effect = BadRequest("Message is not modified")
+
+        with p_tmux as mock_tmux, p_sm as mock_sm:
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id="@5", thread_id=42
+            )
+
+        assert result is True
+        mock_bot.send_message.assert_not_called()
+        assert _interactive_msgs[(1, 42)] == 555
+
+    @pytest.mark.asyncio
+    async def test_other_edit_failure_still_sends_new(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        from telegram.error import BadRequest
+
+        from ccbot.handlers.interactive_ui import _interactive_msgs
+
+        mock_window, p_tmux, p_sm = self._patches()
+        _interactive_msgs[(1, 42)] = 555
+        mock_bot.edit_message_text.side_effect = BadRequest("Message to edit not found")
+
+        with p_tmux as mock_tmux, p_sm as mock_sm:
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_sm.resolve_chat_id.return_value = 100
+
+            result = await handle_interactive_ui(
+                mock_bot, user_id=1, window_id="@5", thread_id=42
+            )
+
+        assert result is True
+        mock_bot.send_message.assert_called_once()
+        assert _interactive_msgs[(1, 42)] == 999  # replaced by the new message
+
+
 class TestKeyboardLayoutForSettings:
     def test_settings_keyboard_includes_all_nav_keys(self):
         """Settings keyboard includes Tab, arrows (not vertical_only), Space, Esc, Enter."""

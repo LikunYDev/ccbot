@@ -75,6 +75,7 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_REPOINT,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -127,6 +128,7 @@ from .handlers.message_sender import (
 )
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
+from .handlers.maintenance import maintenance_loop
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
@@ -167,6 +169,7 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+_maintenance_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -1735,6 +1738,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
 
+    # Divergence notice: re-point a window's session_map entry (human-approved)
+    elif data.startswith(CB_REPOINT):
+        rest = data[len(CB_REPOINT) :]
+        window_id, _, new_sid = rest.partition(":")
+        if not window_id or not new_sid:
+            await query.answer("Invalid data")
+            return
+        ok = await session_manager.repoint_window_session(window_id, new_sid)
+        if ok:
+            await query.answer("Re-pointed")
+            try:
+                await query.edit_message_text(
+                    f"✅ This window now tracks session {new_sid[:8]}… — "
+                    "new messages will flow again shortly."
+                )
+            except Exception:
+                pass  # Original notice may be old or already edited
+        else:
+            await query.answer("No session_map entry for this window", show_alert=True)
+
     # Screenshot quick keys: send key to tmux window
     elif data.startswith(CB_KEYS_PREFIX):
         rest = data[len(CB_KEYS_PREFIX) :]
@@ -1946,9 +1969,14 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start local-state maintenance task (session_map hygiene)
+    global _maintenance_task
+    _maintenance_task = asyncio.create_task(maintenance_loop(application.bot))
+    logger.info("Maintenance task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _maintenance_task
 
     # Stop status polling
     if _status_poll_task:
@@ -1959,6 +1987,16 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+    # Stop maintenance
+    if _maintenance_task:
+        _maintenance_task.cancel()
+        try:
+            await _maintenance_task
+        except asyncio.CancelledError:
+            pass
+        _maintenance_task = None
+        logger.info("Maintenance stopped")
 
     # Order matters: stop producers, flush queues, THEN cancel workers.
     # 1. The session monitor enqueues already-read-but-unsent messages (offsets

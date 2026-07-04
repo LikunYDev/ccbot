@@ -147,6 +147,204 @@ class TestHookMainValidation:
         assert not (tmp_path / "session_map.json").exists()
 
 
+class TestHookMainCwdFallback:
+    """SessionStart under a daemon-hosted claude (--bg-pty-host) runs with
+    TMUX/TMUX_PANE stripped. The hook falls back to matching the session cwd
+    against live panes on ccbot's socket, and only re-points a window entry
+    that a prior in-pane fire already created — never creates or re-purposes
+    one from a cwd guess."""
+
+    SESSION_MAP = {
+        "ccbot:@41": {
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "cwd": "/proj",
+            "window_name": "job",
+        },
+        "ccbot:@49": {
+            "session_id": "22222222-2222-2222-2222-222222222222",
+            "cwd": "/other",
+            "window_name": "other",
+        },
+    }
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        *,
+        panes: str,
+        source: str = "clear",
+        seed_map: dict | None = None,
+        ps_output: str = "",
+    ) -> dict | None:
+        """Run hook_main without TMUX_PANE; tmux list-panes returns `panes`,
+        ps (used to filter idle shells on ambiguity) returns `ps_output`."""
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=ps_output, stderr=""
+                )
+            assert cmd[:2] == ["tmux", "-L"], cmd
+            assert "list-panes" in cmd
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=panes, stderr=""
+            )
+
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        if seed_map is not None:
+            (tmp_path / "session_map.json").write_text(json.dumps(seed_map))
+        monkeypatch.setattr("ccbot.hook.subprocess.run", fake_run)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        payload = {
+            "session_id": "33333333-3333-3333-3333-333333333333",
+            "cwd": "/proj",
+            "hook_event_name": "SessionStart",
+            "source": source,
+        }
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        monkeypatch.delenv("TMUX_PANE", raising=False)
+        monkeypatch.delenv("TMUX", raising=False)
+        hook_main()
+        map_file = tmp_path / "session_map.json"
+        return json.loads(map_file.read_text()) if map_file.exists() else None
+
+    def test_unique_cwd_match_repoints_existing_entry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            panes=("ccbot\t@41\tjob\t/proj\t100\nccbot\t@49\tother\t/other\t200\n"),
+            seed_map=self.SESSION_MAP,
+        )
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+        # Unrelated entry untouched
+        assert result["ccbot:@49"] == self.SESSION_MAP["ccbot:@49"]
+
+    def test_no_prior_entry_refuses_to_bind(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """An outside-tmux claude in a directory matching some live pane must
+        not create a mapping for that window."""
+        seed = {"ccbot:@49": self.SESSION_MAP["ccbot:@49"]}
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            panes="ccbot\t@41\tjob\t/proj\t100\n",
+            seed_map=seed,
+        )
+        assert result == seed
+
+    def test_idle_shell_in_same_dir_filtered_out(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A bare shell parked in the project directory (no claude below it)
+        must not block resolution — only the window running a claude client
+        counts."""
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            panes=("7\t@29\tzsh\t/proj\t100\nccbot\t@41\tjob\t/proj\t200\n"),
+            # pane 100 is an idle zsh; pane 200 has a claude child (201)
+            ps_output=("100 1 zsh\n200 1 zsh\n201 200 claude\n"),
+            seed_map=self.SESSION_MAP,
+        )
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+    def test_ambiguous_claude_windows_refuse(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """Two live windows on the same directory, both running claude — the
+        window cannot be named, so the map must stay untouched."""
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            panes=("ccbot\t@41\tjob\t/proj\t100\nccbot\t@42\tjob-2\t/proj\t200\n"),
+            ps_output=("100 1 zsh\n101 100 claude\n200 1 zsh\n201 200 claude\n"),
+            seed_map=self.SESSION_MAP,
+        )
+        assert result == self.SESSION_MAP
+        # The refusal is recorded for the maintenance loop to surface.
+        failures = (tmp_path / "hook_failures.jsonl").read_text().splitlines()
+        assert len(failures) == 1
+        failure = json.loads(failures[0])
+        assert failure["cwd"] == "/proj"
+        assert failure["session_id"] == "33333333-3333-3333-3333-333333333333"
+
+    def test_startup_source_never_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A fresh `claude` launched outside tmux fires source=startup; the
+        fallback is reserved for continuations (clear/compact/resume)."""
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            panes="ccbot\t@41\tjob\t/proj\t100\n",
+            source="startup",
+            seed_map=self.SESSION_MAP,
+        )
+        assert result == self.SESSION_MAP
+
+
+class TestHookSocketGate:
+    """session_map is ccbot's private state: panes on a foreign tmux server
+    (different socket basename in $TMUX) must not be written — their window
+    IDs can collide with ccbot's own."""
+
+    PAYLOAD = {
+        "session_id": "33333333-3333-3333-3333-333333333333",
+        "cwd": "/proj",
+        "hook_event_name": "SessionStart",
+    }
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        *,
+        tmux_env: str,
+    ) -> dict | None:
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="ccbot:@41:job\n", stderr=""
+            )
+
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr("ccbot.hook.subprocess.run", fake_run)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(self.PAYLOAD)))
+        monkeypatch.setenv("TMUX_PANE", "%9")
+        monkeypatch.setenv("TMUX", tmux_env)
+        monkeypatch.delenv("TMUX_SOCKET_NAME", raising=False)
+        hook_main()
+        map_file = tmp_path / "session_map.json"
+        return json.loads(map_file.read_text()) if map_file.exists() else None
+
+    def test_foreign_socket_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(
+            monkeypatch, tmp_path, tmux_env="/tmp/tmux-1002/default,999,0"
+        )
+        assert result is None
+
+    def test_ccbot_socket_is_written(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(monkeypatch, tmp_path, tmux_env="/tmp/tmux-1002/ccbot,999,0")
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+
 class TestHookMainWritePath:
     """Tests that exercise the session_map write path with tmux mocked.
 

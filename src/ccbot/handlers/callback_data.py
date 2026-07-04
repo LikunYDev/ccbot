@@ -49,3 +49,6 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Stale-tracking divergence notice: re-point a window's session_map entry
+CB_REPOINT = "rp:"  # rp:<window>:<session_id>

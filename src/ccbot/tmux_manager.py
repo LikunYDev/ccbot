@@ -252,6 +252,36 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_list_windows)
 
+    async def list_all_window_ids(self) -> set[str] | None:
+        """Window IDs of every window on ccbot's tmux server, across all
+        tmux sessions on the socket (not just the configured one).
+
+        Used by the session_map sweep: window IDs are unique per server, so
+        any map entry whose ID is absent here belongs to a dead window.
+        Returns None when the server can't be queried — callers must treat
+        that as "unknown", never as "no windows".
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._tmux_argv("list-windows", "-a", "-F", "#{window_id}"),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_TMUX_SUBPROCESS_TIMEOUT
+            )
+        except Exception as e:
+            logger.debug("list_all_window_ids failed: %s", e)
+            return None
+        if proc.returncode != 0:
+            logger.debug(
+                "list_all_window_ids failed (rc=%s): %s",
+                proc.returncode,
+                stderr.decode("utf-8", "replace").strip(),
+            )
+            return None
+        return {ln.strip() for ln in stdout.decode("utf-8").splitlines() if ln.strip()}
+
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.
 

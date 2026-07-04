@@ -17,6 +17,7 @@ State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 import logging
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import (
@@ -131,10 +132,10 @@ def _build_interactive_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
-    ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
-    since only vertical selection is needed.
+    ``ui_name`` controls the layout: vertical-list UIs (``RestoreCheckpoint``,
+    ``ResumeSession``) omit ←/→ keys since only vertical selection is needed.
     """
-    vertical_only = ui_name == "RestoreCheckpoint"
+    vertical_only = ui_name in ("RestoreCheckpoint", "ResumeSession")
 
     rows: list[list[InlineKeyboardButton]] = []
     # Row 1: directional keys
@@ -256,6 +257,20 @@ async def handle_interactive_ui(
             _interactive_mode[ikey] = window_id
             _interactive_last_name[ikey] = content.name
             return True
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                # Pane content is identical (e.g. 🔄 tap, or an arrow press at
+                # a list boundary). The existing message is already current —
+                # falling through would send a duplicate and orphan it.
+                _interactive_mode[ikey] = window_id
+                _interactive_last_name[ikey] = content.name
+                return True
+            # Edit failed (message deleted, etc.) - clear stale msg_id and send new
+            logger.debug(
+                "Edit failed for interactive msg %s, sending new", existing_msg_id
+            )
+            _interactive_msgs.pop(ikey, None)
+            # Fall through to send new message
         except Exception:
             # Edit failed (message deleted, etc.) - clear stale msg_id and send new
             logger.debug(
