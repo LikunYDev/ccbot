@@ -1,5 +1,6 @@
 """Tests for message_queue — status stats stripping for dedup."""
 
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -809,3 +810,475 @@ class TestConvertStatusToContentRace:
         assert result is None
         assert skey not in mq._status_msg_info
         bot.delete_message.assert_awaited_once_with(chat_id=100, message_id=11)
+
+
+@pytest.fixture
+def _clear_last_content_msg():
+    """Reset footer tracking between tests so state doesn't leak."""
+    from ccbot.handlers import message_queue as mq
+
+    mq._last_content_msg.clear()
+    mq._footer_applied.clear()
+    yield
+    mq._last_content_msg.clear()
+    mq._footer_applied.clear()
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info", "_clear_last_content_msg")
+class TestTurnEndFooterTask:
+    """turn_end_footer task: sends the terminal statusline (verbatim, as
+    code) as its own message once the turn's final text is delivered."""
+
+    @pytest.mark.asyncio
+    async def test_sends_footer_as_new_message(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        key = (7, 42)
+        mq._last_content_msg[key] = (200, "final answer text")
+        sent = MagicMock()
+        sent.message_id = 400
+        task = mq.MessageTask(
+            task_type="turn_end_footer",
+            text="~/proj (main) | Fable 5 | ctx: 11% | cost: $4.88",
+            window_id="@5",
+            thread_id=42,
+        )
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=sent,
+            ) as mock_send,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, 7, task)
+
+        mock_send.assert_awaited_once_with(
+            bot,
+            100,
+            "`~/proj (main) | Fable 5 | ctx: 11% | cost: $4.88`",
+            message_thread_id=42,
+        )
+        # Target consumed; sent footer tracked for a potential move.
+        assert key not in mq._last_content_msg
+        assert mq._footer_applied[key] == 400
+
+    @pytest.mark.asyncio
+    async def test_multiline_footer_rendered_as_code_block(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        key = (7, 42)
+        mq._last_content_msg[key] = (200, "final")
+        sent = MagicMock()
+        sent.message_id = 400
+        task = mq.MessageTask(
+            task_type="turn_end_footer",
+            text="line one\nline two",
+            window_id="@5",
+            thread_id=42,
+        )
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=sent,
+            ) as mock_send,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, 7, task)
+
+        mock_send.assert_awaited_once_with(
+            bot,
+            100,
+            "```\nline one\nline two\n```",
+            message_thread_id=42,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_target_message_is_a_noop(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        task = mq.MessageTask(
+            task_type="turn_end_footer",
+            text="footer",
+            window_id="@5",
+            thread_id=42,
+        )
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+            ) as mock_send,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, 7, task)
+
+        mock_send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clears_leftover_status_message(self):
+        """A stale spinner status message is deleted when the turn ends."""
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        skey = (7, 42)
+        mq._status_msg_info[skey] = (11, "@5", "Puttering…")
+        task = mq.MessageTask(
+            task_type="turn_end_footer",
+            text="footer",
+            window_id="@5",
+            thread_id=42,
+        )
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, 7, task)
+
+        assert skey not in mq._status_msg_info
+        bot.delete_message.assert_awaited_once_with(chat_id=100, message_id=11)
+
+    @pytest.mark.asyncio
+    async def test_send_failure_drops_footer_silently(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        key = (7, 42)
+        mq._last_content_msg[key] = (200, "final")
+        task = mq.MessageTask(
+            task_type="turn_end_footer",
+            text="footer",
+            window_id="@5",
+            thread_id=42,
+        )
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            # Must not raise; target still consumed, nothing tracked.
+            await mq._process_turn_end_footer_task(bot, 7, task)
+
+        assert key not in mq._last_content_msg
+        assert key not in mq._footer_applied
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info", "_clear_last_content_msg")
+class TestFooterTargetTracking:
+    """Only Claude's own text/thinking may become the footer target — a
+    user-message echo or bot notice delivered near turn end must not
+    (regression: footer appended right after the user's message)."""
+
+    async def _run_content_task(self, role: str, content_type: str = "text"):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        sent = MagicMock()
+        sent.message_id = 300
+        task = mq.MessageTask(
+            task_type="content",
+            window_id="@5",
+            parts=["some text"],
+            content_type=content_type,
+            thread_id=42,
+            role=role,
+        )
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=sent,
+            ),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_content_task(bot, 7, task)
+        return mq
+
+    @pytest.mark.asyncio
+    async def test_assistant_text_is_tracked(self):
+        mq = await self._run_content_task(role="assistant")
+        assert mq._last_content_msg[(7, 42)] == (300, "some text")
+
+    @pytest.mark.asyncio
+    async def test_assistant_thinking_is_tracked(self):
+        mq = await self._run_content_task(role="assistant", content_type="thinking")
+        assert mq._last_content_msg[(7, 42)] == (300, "some text")
+
+    @pytest.mark.asyncio
+    async def test_user_echo_not_tracked(self):
+        mq = await self._run_content_task(role="user")
+        assert (7, 42) not in mq._last_content_msg
+
+    @pytest.mark.asyncio
+    async def test_system_notice_not_tracked(self):
+        mq = await self._run_content_task(role="system")
+        assert (7, 42) not in mq._last_content_msg
+
+    @pytest.mark.asyncio
+    async def test_tool_use_not_tracked(self):
+        mq = await self._run_content_task(role="assistant", content_type="tool_use")
+        assert (7, 42) not in mq._last_content_msg
+
+    @pytest.mark.asyncio
+    async def test_user_echo_does_not_replace_existing_target(self):
+        """The previous turn's final text stays the target when a user echo
+        arrives before the footer fires."""
+        from ccbot.handlers import message_queue as mq
+
+        mq._last_content_msg[(7, 42)] = (200, "claude final text")
+        await self._run_content_task(role="user")
+        assert mq._last_content_msg[(7, 42)] == (200, "claude final text")
+
+
+@pytest.fixture
+def _clear_status_last_edit():
+    from ccbot.handlers import message_queue as mq
+
+    mq._status_last_edit.clear()
+    yield
+    mq._status_last_edit.clear()
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info", "_clear_status_last_edit")
+class TestStatusTimerTick:
+    """Stats-only status changes are skipped while the last edit is fresh but
+    tick through once STATUS_TICK_INTERVAL has passed — the elapsed-time
+    display advances without per-second API calls."""
+
+    USER = 7
+    TID = 42
+    SKEY = (7, 42)
+
+    def _task(self, text: str):
+        from ccbot.handlers.message_queue import MessageTask
+
+        return MessageTask(
+            task_type="status_update",
+            text=text,
+            window_id="@5",
+            thread_id=self.TID,
+        )
+
+    async def _process(self, text: str, edit_ok: bool = True):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.edit_with_fallback",
+                new_callable=AsyncMock,
+                return_value=edit_ok,
+            ) as mock_edit,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_status_update_task(bot, self.USER, self._task(text))
+        return mock_edit
+
+    @pytest.mark.asyncio
+    async def test_stats_only_change_skipped_when_fresh(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic()  # just edited
+
+        mock_edit = await self._process("Envisioning… (45s · thinking)")
+        mock_edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stats_only_change_ticks_after_interval(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic() - mq.STATUS_TICK_INTERVAL - 1
+
+        mock_edit = await self._process("Envisioning… (45s · thinking)")
+        mock_edit.assert_awaited_once()
+        # last_text and tick timestamp updated
+        assert mq._status_msg_info[self.SKEY][2] == "Envisioning… (45s · thinking)"
+        assert time.monotonic() - mq._status_last_edit[self.SKEY] < 5
+
+    @pytest.mark.asyncio
+    async def test_identical_text_never_edits_even_when_tick_due(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic() - mq.STATUS_TICK_INTERVAL - 1
+
+        mock_edit = await self._process("Envisioning… (32s · thinking)")
+        mock_edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_action_change_edits_regardless_of_tick(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic()
+
+        mock_edit = await self._process("Reading file src/main.py")
+        mock_edit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_producer_dedup_respects_tick(self):
+        """enqueue_status_update skips a fresh stats-only change but enqueues
+        once the tick is due."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        key = self.SKEY
+        # Pre-populate queue machinery so no real worker is spawned.
+        mq._message_queues[key] = asyncio.Queue()
+        mq._queue_locks[key] = asyncio.Lock()
+        mq._queue_workers[key] = MagicMock()
+        try:
+            mq._status_msg_info[key] = (11, "@5", "Envisioning… (32s · thinking)")
+
+            mq._status_last_edit[key] = time.monotonic()
+            await mq.enqueue_status_update(
+                bot,
+                self.USER,
+                "@5",
+                "Envisioning… (45s · thinking)",
+                thread_id=self.TID,
+            )
+            assert mq._message_queues[key].empty()
+
+            mq._status_last_edit[key] = time.monotonic() - mq.STATUS_TICK_INTERVAL - 1
+            await mq.enqueue_status_update(
+                bot,
+                self.USER,
+                "@5",
+                "Envisioning… (45s · thinking)",
+                thread_id=self.TID,
+            )
+            task = mq._message_queues[key].get_nowait()
+            assert task.task_type == "status_update"
+            assert task.text == "Envisioning… (45s · thinking)"
+        finally:
+            mq._message_queues.pop(key, None)
+            mq._queue_locks.pop(key, None)
+            mq._queue_workers.pop(key, None)
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info", "_clear_last_content_msg")
+class TestFooterMove:
+    """A footer sent early (mid-turn pane lull) must MOVE to the end: the
+    earlier footer message is deleted when a new footer fires with no user
+    message in between; a user message makes it permanent."""
+
+    USER = 7
+    TID = 42
+    KEY = (7, 42)
+
+    def _footer_task(self, footer: str = "~/proj | Fable 5 | ctx: 9%"):
+        from ccbot.handlers.message_queue import MessageTask
+
+        return MessageTask(
+            task_type="turn_end_footer",
+            text=footer,
+            window_id="@5",
+            thread_id=self.TID,
+        )
+
+    async def _fire(self, bot, new_msg_id: int = 400):
+        from ccbot.handlers import message_queue as mq
+
+        sent = MagicMock()
+        sent.message_id = new_msg_id
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=sent,
+            ) as mock_send,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, self.USER, self._footer_task())
+        return mock_send
+
+    @pytest.mark.asyncio
+    async def test_refire_deletes_previous_footer_message(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        mq._footer_applied[self.KEY] = 350  # footer sent during a false lull
+        mq._last_content_msg[self.KEY] = (300, "true final text")
+
+        await self._fire(bot, new_msg_id=400)
+
+        bot.delete_message.assert_awaited_once_with(chat_id=100, message_id=350)
+        assert mq._footer_applied[self.KEY] == 400
+
+    @pytest.mark.asyncio
+    async def test_first_fire_no_delete(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        mq._last_content_msg[self.KEY] = (300, "final text")
+
+        await self._fire(bot, new_msg_id=400)
+
+        bot.delete_message.assert_not_awaited()
+        assert mq._footer_applied[self.KEY] == 400
+
+    @pytest.mark.asyncio
+    async def test_user_message_makes_footer_permanent(self):
+        """A user-role content task pops _footer_applied: the next turn's
+        footer fire must not delete the previous turn's footer message."""
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        mq._footer_applied[self.KEY] = 350  # previous turn's footer
+        sent = MagicMock()
+        sent.message_id = 250
+        user_task = mq.MessageTask(
+            task_type="content",
+            window_id="@5",
+            parts=["user says hi"],
+            content_type="text",
+            thread_id=self.TID,
+            role="user",
+        )
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=sent,
+            ),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_content_task(bot, self.USER, user_task)
+
+        assert self.KEY not in mq._footer_applied
+
+        # New turn's footer fires on a new target: no delete of msg 350.
+        mq._last_content_msg[self.KEY] = (300, "new turn final")
+        await self._fire(bot, new_msg_id=500)
+        bot.delete_message.assert_not_awaited()
+        assert mq._footer_applied[self.KEY] == 500

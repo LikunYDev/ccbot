@@ -10,7 +10,8 @@ All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
-parse_status_line(), strip_pane_chrome(), extract_bash_output().
+parse_status_line(), is_turn_end_status(), parse_chrome_footer(),
+strip_pane_chrome(), extract_bash_output().
 """
 
 import re
@@ -447,19 +448,43 @@ def is_interactive_ui(pane_text: str) -> bool:
 
 # ── Status line parsing ─────────────────────────────────────────────────
 
-# Spinner characters Claude Code uses in its status line
-STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
+# Spinner characters Claude Code uses in its status line. The animation
+# cycles through several glyphs, including a plain ASCII ``*`` in current
+# versions — a missing glyph here makes detection silently intermittent.
+STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢", "*"])
+
+# Hint/chrome lines that may sit between the spinner line and the chrome
+# separator (e.g. "  ⎿  Tip: Use /btw …" or "⏵⏵ auto mode on"). These are
+# skipped when scanning upward for the spinner; any other content line
+# stops the scan so ·/* bullets in Claude's output can't be misread as a
+# status line.
+_RE_STATUS_SKIPPABLE = re.compile(r"^\s*[⎿⏵]")
+
+# How many lines above the separator to scan for the spinner (blanks and
+# skippable hint lines included).
+_STATUS_SCAN_HEIGHT = 6
+
+# Turn-end summary line Claude Code prints when a turn completes, e.g.
+# "Cogitated for 1m 12s" / "Churned for 9m 58s" (after the spinner glyph
+# is stripped). It sits above the separator like a live status but is
+# static — it marks the turn as finished, not in progress.
+_RE_TURN_END_STATUS = re.compile(r"\S+ for (?:\d+[hms]\s*)+$")
 
 
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
-    The status line (spinner + working text) appears immediately above
-    the chrome separator (a full line of ``─`` characters).  We locate
-    the separator first, then check the line just above it — this avoids
-    false positives from ``·`` bullets in Claude's regular output.
+    The status line (spinner + working text) appears above the chrome
+    separator (a full line of ``─`` characters), possibly with hint lines
+    (tips, mode indicators) in between.  We locate the separator first,
+    then scan upward — skipping blanks and known hint lines — for a line
+    starting with a spinner glyph.  Any other content line stops the scan,
+    which avoids false positives from ``·``/``*`` bullets in Claude's
+    regular output.
 
     Returns the text after the spinner, or None if no status line found.
+    Note: the turn-end summary line ("Cogitated for 1m 12s") also parses —
+    use ``is_turn_end_status`` to distinguish it from a live working state.
     """
     if not pane_text:
         return None
@@ -478,16 +503,86 @@ def parse_status_line(pane_text: str) -> str | None:
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
 
-    # Check lines just above the separator (skip blanks, up to 4 lines)
-    for i in range(chrome_idx - 1, max(chrome_idx - 5, -1), -1):
+    # Scan upward from the separator (skip blanks and hint lines)
+    for i in range(chrome_idx - 1, max(chrome_idx - _STATUS_SCAN_HEIGHT - 1, -1), -1):
         line = lines[i].strip()
         if not line:
             continue
         if line[0] in STATUS_SPINNERS:
             return line[1:].strip()
-        # First non-empty line above separator isn't a spinner → no status
+        if _RE_STATUS_SKIPPABLE.match(lines[i]):
+            continue
+        # Content line that is neither spinner nor hint → no status
         return None
     return None
+
+
+def is_turn_end_status(status_text: str) -> bool:
+    """True if a parsed status line is the turn-end summary, not live work.
+
+    Matches "Cogitated for 1m 12s" / "Churned for 9m 58s" (single word +
+    duration). Live states never match: working lines carry a stats
+    parenthetical ("Puttering… (22s · ↓ 270 tokens)") and waiting lines
+    have prose after "for" ("Waiting for 1 background agent to finish").
+    """
+    return _RE_TURN_END_STATUS.fullmatch(status_text.strip()) is not None
+
+
+# Chrome lines below the statusline that are not part of it: the permission
+# mode indicator ("⏵⏵ auto mode on …") and the background-task HUD
+# ("● main" / "◯ general-purpose  …").
+_RE_FOOTER_STOP = re.compile(r"^\s*[⏵●◯]")
+
+
+def parse_chrome_footer(pane_text: str) -> str | None:
+    """Extract the statusline footer from the bottom chrome, verbatim.
+
+    The bottom chrome looks like::
+
+        ────────────────────────  (separator)
+        ❯                        (prompt)
+        ────────────────────────  (separator)
+          ~/ccbot (main) | Fable 5 | ctx: 11% | cost: $4.88
+          ⏵⏵ auto mode on (shift+tab to cycle)
+
+    The statusline is whatever the user's statusLine command rendered — no
+    shape is assumed, and multi-line statuslines are preserved. Collection
+    starts below the second separator and stops at the mode indicator, the
+    background-task HUD, or the first blank line after content began.
+    Returns None when nothing is rendered there or the chrome isn't visible.
+    """
+    if not pane_text:
+        return None
+
+    lines = pane_text.split("\n")
+
+    # Topmost chrome separator in the last 10 lines, then the next one below
+    separators: list[int] = []
+    search_start = max(0, len(lines) - 10)
+    for i in range(search_start, len(lines)):
+        stripped = lines[i].strip()
+        if len(stripped) >= 20 and all(c == "─" for c in stripped):
+            separators.append(i)
+            if len(separators) == 2:
+                break
+
+    if len(separators) < 2:
+        return None
+
+    collected: list[str] = []
+    for i in range(separators[1] + 1, len(lines)):
+        line = lines[i].strip()
+        if not line:
+            if collected:
+                break
+            continue
+        if _RE_FOOTER_STOP.match(line):
+            break
+        collected.append(line)
+
+    if not collected:
+        return None
+    return "\n".join(collected)
 
 
 # ── Pane chrome stripping & bash output extraction ─────────────────────

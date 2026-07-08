@@ -22,6 +22,18 @@ def mock_bot():
 
 
 @pytest.fixture
+def _clear_turn_end_state():
+    """Ensure turn-end footer state is clean before and after each test."""
+    from ccbot.handlers.status_polling import _idle_poll_counts, _working_seen
+
+    _working_seen.clear()
+    _idle_poll_counts.clear()
+    yield
+    _working_seen.clear()
+    _idle_poll_counts.clear()
+
+
+@pytest.fixture
 def _clear_interactive_state():
     """Ensure interactive state is clean before and after each test."""
     from ccbot.handlers.interactive_ui import (
@@ -541,3 +553,229 @@ class TestPaneAsSourceInteractiveUI:
             mock_enqueue.assert_called_once_with(
                 mock_bot, self.USER, self.WIN, thread_id=self.THREAD
             )
+
+
+@pytest.mark.usefixtures("_clear_interactive_state", "_clear_turn_end_state")
+class TestTurnEndFooter:
+    """Turn-end detection: a live working status arms the footer; once the
+    pane goes idle (spinner gone or static turn-end summary) for
+    _TURN_END_IDLE_POLLS consecutive polls, the statusline footer is enqueued
+    exactly once."""
+
+    WIN = "@5"
+    USER = 1
+    THREAD = 42
+
+    @pytest.fixture
+    def mock_window(self):
+        w = MagicMock()
+        w.window_id = self.WIN
+        return w
+
+    async def _poll(
+        self, mock_bot, pane_text, mock_window, skip_status=False, has_target=True
+    ):
+        """Drive one poll cycle; return (status_mock, footer_mock)."""
+        with (
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.has_footer_target",
+                return_value=has_target,
+            ),
+            patch(
+                "ccbot.handlers.status_polling.enqueue_status_update",
+                new_callable=AsyncMock,
+            ) as mock_status,
+            patch(
+                "ccbot.handlers.status_polling.enqueue_turn_end_footer",
+                new_callable=AsyncMock,
+            ) as mock_footer,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+
+            await update_status_message(
+                mock_bot,
+                user_id=self.USER,
+                window_id=self.WIN,
+                thread_id=self.THREAD,
+                skip_status=skip_status,
+            )
+            return mock_status, mock_footer
+
+    @pytest.mark.asyncio
+    async def test_working_then_idle_fires_footer(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_working_asterisk: str,
+        sample_pane_turn_end: str,
+    ):
+        """The full happy path: working status enqueued, then after the
+        debounce the footer is enqueued; once the target is consumed
+        (has_target False), further idle polls do not re-fire."""
+        status, footer = await self._poll(
+            mock_bot, sample_pane_working_asterisk, mock_window
+        )
+        status.assert_called_once_with(
+            mock_bot,
+            self.USER,
+            self.WIN,
+            "Puttering… (22s · ↓ 270 tokens)",
+            thread_id=self.THREAD,
+        )
+        footer.assert_not_called()
+
+        # Idle polls 1 and 2: debouncing, no footer yet
+        for _ in range(2):
+            status, footer = await self._poll(
+                mock_bot, sample_pane_turn_end, mock_window
+            )
+            status.assert_not_called()
+            footer.assert_not_called()
+
+        # Idle poll 3: footer fires with the verbatim statusline
+        status, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        footer.assert_called_once_with(
+            mock_bot,
+            self.USER,
+            self.WIN,
+            "~/ccbot (main) | Fable 5 | ctx: 11% | cost: $4.88",
+            thread_id=self.THREAD,
+        )
+
+        # Target consumed by the fire → further idle polls hold.
+        for _ in range(4):
+            status, footer = await self._poll(
+                mock_bot, sample_pane_turn_end, mock_window, has_target=False
+            )
+            footer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_false_lull_refires_when_new_text_lands(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_working_asterisk: str,
+        sample_pane_turn_end: str,
+    ):
+        """A mid-turn lull fires the footer early; when the turn's real
+        final text is delivered (a fresh target appears), the idle edge must
+        re-fire so the worker can move the footer onto it."""
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+
+        # Lull: debounce passes, footer fires (early, as it turns out).
+        for _ in range(2):
+            await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        footer.assert_called_once()
+
+        # Turn actually continues: work resumes, then new text + idle again.
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+        for _ in range(2):
+            _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+            footer.assert_not_called()
+        _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        footer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_idle_without_prior_working_no_footer(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_turn_end: str,
+    ):
+        """Bot restarted over an idle session → no footer on old messages."""
+        for _ in range(5):
+            _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+            footer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_turn_end_summary_not_shown_as_status(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_turn_end: str,
+    ):
+        """The static 'Cogitated for 1m 12s' line must not be enqueued as a
+        working status."""
+        status, _ = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_working_resumed_resets_idle_streak(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_working_asterisk: str,
+        sample_pane_turn_end: str,
+    ):
+        """Idle polls interleaved with renewed work never reach the
+        threshold."""
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+        for _ in range(2):
+            await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        # Work resumes → streak resets
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+        for _ in range(2):
+            _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+            footer.assert_not_called()
+        # Third consecutive idle poll now fires
+        _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        footer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_holds_fire_until_target_exists(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_working_asterisk: str,
+        sample_pane_turn_end: str,
+    ):
+        """Regression: the pane goes idle before the turn's final text is
+        delivered (JSONL → 2s monitor poll trails the 1s pane poll). The
+        idle edge must hold fire — staying armed — until a footer target
+        exists, not consume the arm on an empty target."""
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+
+        # Idle polls with NO delivered target: debounce passes but the
+        # footer must not fire, and the arm must survive.
+        for _ in range(6):
+            _, footer = await self._poll(
+                mock_bot, sample_pane_turn_end, mock_window, has_target=False
+            )
+            footer.assert_not_called()
+
+        # Final text lands → very next poll fires the footer.
+        _, footer = await self._poll(
+            mock_bot, sample_pane_turn_end, mock_window, has_target=True
+        )
+        footer.assert_called_once_with(
+            mock_bot,
+            self.USER,
+            self.WIN,
+            "~/ccbot (main) | Fable 5 | ctx: 11% | cost: $4.88",
+            thread_id=self.THREAD,
+        )
+
+    @pytest.mark.asyncio
+    async def test_skip_status_pauses_idle_streak(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_working_asterisk: str,
+        sample_pane_turn_end: str,
+    ):
+        """Polls with a non-empty queue (skip_status=True) must not advance
+        the idle streak — the footer waits for content to drain."""
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+        for _ in range(5):
+            _, footer = await self._poll(
+                mock_bot, sample_pane_turn_end, mock_window, skip_status=True
+            )
+            footer.assert_not_called()
+        for _ in range(2):
+            _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+            footer.assert_not_called()
+        _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        footer.assert_called_once()

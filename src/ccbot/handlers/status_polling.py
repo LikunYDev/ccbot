@@ -4,6 +4,8 @@ Provides background polling of terminal status lines for all active users:
   - Detects Claude Code status (working, waiting, etc.)
   - Detects interactive UIs (permission prompts) not triggered via JSONL
   - Updates status messages in Telegram
+  - Detects turn end (working status gone, debounced) and appends the
+    terminal statusline footer to the turn's final message
   - Polls thread_bindings (each topic = one window)
   - Periodically probes topic existence via unpin_all_forum_topic_messages
     (silent no-op when no pins); cleans up deleted topics (kills tmux window
@@ -13,7 +15,7 @@ Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
   - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
   - status_poll_loop: Background polling task
-  - update_status_message: Poll and enqueue status updates
+  - update_status_message: Poll and enqueue status/footer updates
 """
 
 import asyncio
@@ -28,6 +30,8 @@ from ..terminal_parser import (
     build_degraded_prompt,
     extract_interactive_content,
     has_interactive_footer,
+    is_turn_end_status,
+    parse_chrome_footer,
     parse_status_line,
 )
 from ..tmux_manager import tmux_manager
@@ -44,7 +48,9 @@ from .cleanup import clear_topic_state
 from .message_queue import (
     enqueue_interactive_ui,
     enqueue_status_update,
+    enqueue_turn_end_footer,
     get_message_queue,
+    has_footer_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +68,21 @@ _PROMPT_MISS_THRESHOLD = 3
 
 # (user_id, thread_id_or_0) -> consecutive unparsed-but-footer-present polls.
 _prompt_miss_counts: dict[tuple[int, int], int] = {}
+
+# Turn-end footer: consecutive idle polls (queue empty, no live working
+# status) required before appending the statusline footer to the turn's
+# final message. Debounces the race between the pane going idle (1s poll)
+# and the final JSONL text being dispatched (2s monitor poll).
+_TURN_END_IDLE_POLLS = 3
+
+# Topics armed for turn-end footers: armed by the first live working status
+# seen after startup and kept armed for the topic's lifetime. Its only job
+# is making sure a bot restart over idle sessions doesn't stamp footers onto
+# old messages; per-fire dedup lives in the footer target (consumed on fire).
+_working_seen: set[tuple[int, int]] = set()
+
+# (user_id, thread_id_or_0) -> consecutive idle polls while working_seen.
+_idle_poll_counts: dict[tuple[int, int], int] = {}
 
 
 async def update_status_message(
@@ -155,7 +176,10 @@ async def update_status_message(
 
     status_line = parse_status_line(pane_text)
 
-    if status_line:
+    if status_line and not is_turn_end_status(status_line):
+        # Live working status → show it, and arm the turn-end footer.
+        _working_seen.add(ikey)
+        _idle_poll_counts.pop(ikey, None)
         await enqueue_status_update(
             bot,
             user_id,
@@ -163,7 +187,41 @@ async def update_status_message(
             status_line,
             thread_id=thread_id,
         )
-    # If no status line, keep existing status message (don't clear on transient state)
+        return
+
+    # Pane is idle (no spinner, or the static turn-end summary). If a turn
+    # was in progress, debounce a few polls — the final JSONL text may still
+    # be in flight on the 2s monitor poll — then append the statusline
+    # footer to the turn's final message. Skipped polls (non-empty queue)
+    # return above, so the streak only advances while the queue is drained.
+    if ikey not in _working_seen:
+        return
+    streak = min(_idle_poll_counts.get(ikey, 0) + 1, _TURN_END_IDLE_POLLS)
+    _idle_poll_counts[ikey] = streak
+    if streak < _TURN_END_IDLE_POLLS:
+        return
+    if not has_footer_target(user_id, thread_id):
+        # No undelivered-footer target: either the turn's final text is
+        # still in flight (JSONL write → 2s monitor poll → queue → send
+        # trails the pane going idle) or this turn's footer already fired
+        # and consumed it. Hold — stay armed and re-check next poll. A
+        # pane lull mid-turn can fire the footer early; when the turn's
+        # real final text lands, this re-fires and the worker MOVES the
+        # footer onto it (reverting the earlier edit), so the footer
+        # always ends up on the last message.
+        return
+    _idle_poll_counts.pop(ikey, None)
+    footer = parse_chrome_footer(pane_text)
+    if footer:
+        logger.info(
+            "Turn end detected for user=%d thread=%s window=%s — footer enqueued",
+            user_id,
+            thread_id,
+            window_id,
+        )
+        await enqueue_turn_end_footer(
+            bot, user_id, window_id, footer, thread_id=thread_id
+        )
 
 
 async def status_poll_loop(bot: Bot) -> None:

@@ -8,6 +8,8 @@ from ccbot.terminal_parser import (
     extract_interactive_content,
     has_interactive_footer,
     is_interactive_ui,
+    is_turn_end_status,
+    parse_chrome_footer,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -25,6 +27,7 @@ class TestParseStatusLine:
             ("✶", "Analyzing code", "Analyzing code"),
             ("✳", "Processing input", "Processing input"),
             ("✢", "Building project", "Building project"),
+            ("*", "Puttering… (22s · ↓ 270 tokens)", "Puttering… (22s · ↓ 270 tokens)"),
         ],
     )
     def test_spinner_chars(self, spinner: str, rest: str, expected: str, chrome: str):
@@ -63,6 +66,123 @@ class TestParseStatusLine:
 
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
+
+    def test_tip_line_between_spinner_and_chrome(
+        self, sample_pane_working_asterisk: str
+    ):
+        """Regression: a `⎿ Tip: …` hint line between the spinner and the
+        separator must be skipped, not treated as 'no status'."""
+        assert (
+            parse_status_line(sample_pane_working_asterisk)
+            == "Puttering… (22s · ↓ 270 tokens)"
+        )
+
+    def test_mode_hint_line_skipped(self, chrome: str):
+        """A ⏵⏵ hint line above the separator is skipped too."""
+        pane = f"output\n✻ Doing work\n⏵⏵ accept edits on\n{chrome}"
+        assert parse_status_line(pane) == "Doing work"
+
+    def test_content_line_between_spinner_and_chrome_blocks(self, chrome: str):
+        """A regular content line above the separator still means no status —
+        the ·-bullet false-positive fix must survive the hint-skipping."""
+        pane = f"✻ Doing work\nsome regular output\n{chrome}"
+        assert parse_status_line(pane) is None
+
+    def test_turn_end_summary_parses(self, sample_pane_turn_end: str):
+        """The static turn-end line parses as a status (classification is
+        is_turn_end_status's job, not the parser's)."""
+        assert parse_status_line(sample_pane_turn_end) == "Cogitated for 1m 12s"
+
+
+# ── is_turn_end_status ───────────────────────────────────────────────────
+
+
+class TestIsTurnEndStatus:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            pytest.param("Cogitated for 1m 12s", True, id="minutes_seconds"),
+            pytest.param("Churned for 9m 58s", True, id="churned"),
+            pytest.param("Worked for 45s", True, id="seconds_only"),
+            pytest.param("Baked for 1h 2m 3s", True, id="hours"),
+            pytest.param(
+                "Puttering… (22s · ↓ 270 tokens)", False, id="live_with_stats"
+            ),
+            pytest.param(
+                "Waiting for 1 background agent to finish", False, id="waiting_prose"
+            ),
+            pytest.param("Reading file src/main.py", False, id="tool_status"),
+            pytest.param("", False, id="empty"),
+        ],
+    )
+    def test_classification(self, text: str, expected: bool):
+        assert is_turn_end_status(text) is expected
+
+
+# ── parse_chrome_footer ──────────────────────────────────────────────────
+
+
+class TestParseChromeFooter:
+    def test_custom_statusline(self, sample_pane_turn_end: str):
+        assert (
+            parse_chrome_footer(sample_pane_turn_end)
+            == "~/ccbot (main) | Fable 5 | ctx: 11% | cost: $4.88"
+        )
+
+    def test_statusline_while_working(self, sample_pane_working_asterisk: str):
+        """Footer is present mid-turn too — extraction is layout-based."""
+        assert (
+            parse_chrome_footer(sample_pane_working_asterisk)
+            == "~/ccbot (main) | Fable 5 | ctx: 11% | cost: $4.88"
+        )
+
+    def test_task_hud_below_statusline_excluded(
+        self, sample_pane_footer_with_task_hud: str
+    ):
+        """● / ◯ background-task HUD lines below the statusline are not part
+        of the footer."""
+        assert (
+            parse_chrome_footer(sample_pane_footer_with_task_hud)
+            == "~/huobi | Opus 4.8 | ctx: 28% | cost: $27.43"
+        )
+
+    def test_default_chrome_line(self, chrome: str):
+        """Without a custom statusLine the default model/context line is the
+        footer — whatever is rendered there is returned verbatim."""
+        pane = f"some output\n{chrome}"
+        assert parse_chrome_footer(pane) == "[Opus 4.6] Context: 50%"
+
+    def test_mode_indicator_only_returns_none(self):
+        pane = (
+            "output\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        )
+        assert parse_chrome_footer(pane) is None
+
+    def test_multiline_statusline_preserved(self):
+        pane = (
+            "output\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  line one of statusline\n"
+            "  line two of statusline\n"
+            "  ⏵⏵ auto mode on\n"
+        )
+        assert (
+            parse_chrome_footer(pane)
+            == "line one of statusline\nline two of statusline"
+        )
+
+    def test_no_second_separator_returns_none(self):
+        pane = "output\n──────────────────────────────────────\n❯ \n"
+        assert parse_chrome_footer(pane) is None
+
+    def test_empty_pane_returns_none(self):
+        assert parse_chrome_footer("") is None
 
 
 # ── extract_interactive_content ──────────────────────────────────────────
