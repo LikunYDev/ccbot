@@ -305,6 +305,7 @@ async def restart_topic_in_place(
             content_type="text",
             text=text,
             thread_id=thread_id,
+            role="system",
         )
 
     state = session_manager.get_window_state(window_id)
@@ -487,6 +488,7 @@ async def maybe_notify_update_or_failure(
                 content_type="text",
                 text=notice,
                 thread_id=thread_id,
+                role="system",
             )
             state.update_notified_version = current
             session_manager._save_state()
@@ -523,6 +525,7 @@ async def maybe_notify_update_or_failure(
                 content_type="text",
                 text=notice,
                 thread_id=thread_id,
+                role="system",
             )
             state.failure_notified = True
             session_manager._save_state()

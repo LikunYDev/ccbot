@@ -969,3 +969,71 @@ class TestTurnEndFooterTask:
             await mq._process_turn_end_footer_task(bot, 7, task)
 
         assert key not in mq._last_content_msg
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info", "_clear_last_content_msg")
+class TestFooterTargetTracking:
+    """Only Claude's own text/thinking may become the footer target — a
+    user-message echo or bot notice delivered near turn end must not
+    (regression: footer appended right after the user's message)."""
+
+    async def _run_content_task(self, role: str, content_type: str = "text"):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        sent = MagicMock()
+        sent.message_id = 300
+        task = mq.MessageTask(
+            task_type="content",
+            window_id="@5",
+            parts=["some text"],
+            content_type=content_type,
+            thread_id=42,
+            role=role,
+        )
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=sent,
+            ),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_content_task(bot, 7, task)
+        return mq
+
+    @pytest.mark.asyncio
+    async def test_assistant_text_is_tracked(self):
+        mq = await self._run_content_task(role="assistant")
+        assert mq._last_content_msg[(7, 42)] == (300, "some text")
+
+    @pytest.mark.asyncio
+    async def test_assistant_thinking_is_tracked(self):
+        mq = await self._run_content_task(role="assistant", content_type="thinking")
+        assert mq._last_content_msg[(7, 42)] == (300, "some text")
+
+    @pytest.mark.asyncio
+    async def test_user_echo_not_tracked(self):
+        mq = await self._run_content_task(role="user")
+        assert (7, 42) not in mq._last_content_msg
+
+    @pytest.mark.asyncio
+    async def test_system_notice_not_tracked(self):
+        mq = await self._run_content_task(role="system")
+        assert (7, 42) not in mq._last_content_msg
+
+    @pytest.mark.asyncio
+    async def test_tool_use_not_tracked(self):
+        mq = await self._run_content_task(role="assistant", content_type="tool_use")
+        assert (7, 42) not in mq._last_content_msg
+
+    @pytest.mark.asyncio
+    async def test_user_echo_does_not_replace_existing_target(self):
+        """The previous turn's final text stays the target when a user echo
+        arrives before the footer fires."""
+        from ccbot.handlers import message_queue as mq
+
+        mq._last_content_msg[(7, 42)] = (200, "claude final text")
+        await self._run_content_task(role="user")
+        assert mq._last_content_msg[(7, 42)] == (200, "claude final text")

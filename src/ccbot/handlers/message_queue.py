@@ -81,6 +81,10 @@ class MessageTask:
     content_type: str = "text"
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    # Author of the content: "assistant" (Claude), "user" (echoed user
+    # message), or "system" (bot notices). Only assistant text/thinking may
+    # become a turn_end_footer target.
+    role: str = "assistant"
 
 
 # Per-topic message queues and worker tasks — keyed by (user_id, thread_id_or_0)
@@ -290,6 +294,7 @@ async def _merge_content_tasks(
             tool_use_id=first.tool_use_id,
             content_type=first.content_type,
             thread_id=first.thread_id,
+            role=first.role,
         ),
         merge_count,
     )
@@ -504,7 +509,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
             if await edit_with_fallback(bot, chat_id, edit_msg_id, full_text):
-                _last_content_msg[(user_id, tid)] = (edit_msg_id, full_text)
                 await _send_task_images(bot, chat_id, task)
                 return
             logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
@@ -548,8 +552,15 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
 
     # Track the last delivered message so a turn_end_footer task can append
-    # the terminal statusline to it when the turn completes.
-    if last_msg_id is not None and last_part_text is not None:
+    # the terminal statusline to it when the turn completes. Only Claude's
+    # own text/thinking qualifies — a user-message echo or a bot notice
+    # delivered near turn end must not become the footer's target.
+    if (
+        last_msg_id is not None
+        and last_part_text is not None
+        and task.role == "assistant"
+        and task.content_type in ("text", "thinking")
+    ):
         _last_content_msg[(user_id, tid)] = (last_msg_id, last_part_text)
 
     # 4. Send images if present (from tool_result with base64 image blocks)
@@ -703,6 +714,7 @@ async def enqueue_content_message(
     text: str | None = None,
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
+    role: str = "assistant",
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -722,6 +734,7 @@ async def enqueue_content_message(
         content_type=content_type,
         thread_id=thread_id,
         image_data=image_data,
+        role=role,
     )
     queue.put_nowait(task)
 
