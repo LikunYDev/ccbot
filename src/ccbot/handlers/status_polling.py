@@ -50,6 +50,7 @@ from .message_queue import (
     enqueue_status_update,
     enqueue_turn_end_footer,
     get_message_queue,
+    has_footer_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -198,10 +199,23 @@ async def update_status_message(
     _idle_poll_counts[ikey] = streak
     if streak < _TURN_END_IDLE_POLLS:
         return
+    if not has_footer_target(user_id, thread_id):
+        # The turn's final text hasn't been delivered yet (JSONL write →
+        # 2s monitor poll → queue → send can trail the pane going idle).
+        # Hold fire and stay armed — re-check on the next poll. If the turn
+        # truly produced no Claude text, this simply never fires; the next
+        # turn's live status resets the streak.
+        return
     _working_seen.discard(ikey)
     _idle_poll_counts.pop(ikey, None)
     footer = parse_chrome_footer(pane_text)
     if footer:
+        logger.info(
+            "Turn end detected for user=%d thread=%s window=%s — footer enqueued",
+            user_id,
+            thread_id,
+            window_id,
+        )
         await enqueue_turn_end_footer(
             bot, user_id, window_id, footer, thread_id=thread_id
         )

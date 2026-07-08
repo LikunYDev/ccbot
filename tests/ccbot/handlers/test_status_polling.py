@@ -572,10 +572,16 @@ class TestTurnEndFooter:
         w.window_id = self.WIN
         return w
 
-    async def _poll(self, mock_bot, pane_text, mock_window, skip_status=False):
+    async def _poll(
+        self, mock_bot, pane_text, mock_window, skip_status=False, has_target=True
+    ):
         """Drive one poll cycle; return (status_mock, footer_mock)."""
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "ccbot.handlers.status_polling.has_footer_target",
+                return_value=has_target,
+            ),
             patch(
                 "ccbot.handlers.status_polling.enqueue_status_update",
                 new_callable=AsyncMock,
@@ -687,6 +693,40 @@ class TestTurnEndFooter:
         # Third consecutive idle poll now fires
         _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
         footer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_holds_fire_until_target_exists(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_working_asterisk: str,
+        sample_pane_turn_end: str,
+    ):
+        """Regression: the pane goes idle before the turn's final text is
+        delivered (JSONL → 2s monitor poll trails the 1s pane poll). The
+        idle edge must hold fire — staying armed — until a footer target
+        exists, not consume the arm on an empty target."""
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+
+        # Idle polls with NO delivered target: debounce passes but the
+        # footer must not fire, and the arm must survive.
+        for _ in range(6):
+            _, footer = await self._poll(
+                mock_bot, sample_pane_turn_end, mock_window, has_target=False
+            )
+            footer.assert_not_called()
+
+        # Final text lands → very next poll fires the footer.
+        _, footer = await self._poll(
+            mock_bot, sample_pane_turn_end, mock_window, has_target=True
+        )
+        footer.assert_called_once_with(
+            mock_bot,
+            self.USER,
+            self.WIN,
+            "~/ccbot (main) | Fable 5 | ctx: 11% | cost: $4.88",
+            thread_id=self.THREAD,
+        )
 
     @pytest.mark.asyncio
     async def test_skip_status_pauses_idle_streak(

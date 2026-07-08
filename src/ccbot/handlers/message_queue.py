@@ -801,6 +801,17 @@ async def enqueue_interactive_ui(
     queue.put_nowait(task)
 
 
+def has_footer_target(user_id: int, thread_id: int | None = None) -> bool:
+    """True if a turn-end footer has a message to append to.
+
+    The idle-edge detector in status_polling holds its fire until this is
+    true: the turn's final text can land seconds after the pane goes idle
+    (JSONL write → 2s monitor poll → queue), and firing on an empty target
+    would consume the one footer this turn gets.
+    """
+    return (user_id, thread_id or 0) in _last_content_msg
+
+
 async def _process_turn_end_footer_task(
     bot: Bot, user_id: int, task: MessageTask
 ) -> None:
@@ -823,13 +834,16 @@ async def _process_turn_end_footer_task(
 
     info = _last_content_msg.pop(key, None)
     if info is None or not task.text:
+        logger.info("Turn-end footer for %s: no target message — dropped", key)
         return
 
     msg_id, text = info
     footer = f"```\n{task.text}\n```" if "\n" in task.text else f"`{task.text}`"
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
-    if not await edit_with_fallback(bot, chat_id, msg_id, f"{text}\n\n{footer}"):
-        logger.debug(
+    if await edit_with_fallback(bot, chat_id, msg_id, f"{text}\n\n{footer}"):
+        logger.info("Turn-end footer appended for %s (msg %d)", key, msg_id)
+    else:
+        logger.warning(
             "Turn-end footer edit failed for %s (msg %d) — footer dropped",
             key,
             msg_id,
