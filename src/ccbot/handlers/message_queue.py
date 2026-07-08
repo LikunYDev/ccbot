@@ -100,18 +100,19 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
-# Last delivered content message per topic: (user_id, thread_id_or_0) ->
-# (message_id, sent_markdown_text). A turn_end_footer task edits this message
-# to append the terminal statusline; the raw text is kept because MarkdownV2
-# edits re-render the whole message.
+# Turn-end footer target: (user_id, thread_id_or_0) ->
+# (message_id, sent_markdown_text) of the last delivered assistant
+# text/thinking message. Consumed by turn_end_footer as its gate + per-fire
+# dedup — the footer (sent as its own message) only fires once the turn's
+# final text is actually delivered, so it always lands after it.
 _last_content_msg: dict[tuple[int, int], tuple[int, str]] = {}
 
-# Footer already applied this turn: (user_id, thread_id_or_0) ->
-# (message_id, original_text_without_footer). Lets a re-fired footer (a pane
-# lull mid-turn looks like a turn end) MOVE to the true final message by
-# reverting the earlier edit. A user-role content message marks a turn
-# boundary and pops the entry, making the previous turn's footer permanent.
-_footer_applied: dict[tuple[int, int], tuple[int, str]] = {}
+# Footer message already sent this turn: (user_id, thread_id_or_0) ->
+# footer message_id. Lets a re-fired footer (a pane lull mid-turn looks like
+# a turn end) MOVE to the end by deleting the earlier footer message before
+# sending the new one. A user-role content message marks a turn boundary and
+# pops the entry, making the previous turn's footer permanent.
+_footer_applied: dict[tuple[int, int], int] = {}
 
 # Status timer tick: a status whose action word is unchanged (only the
 # timer/stats parenthetical moved, e.g. "(32s · …)" → "(45s · …)") is still
@@ -828,22 +829,26 @@ def has_footer_target(user_id: int, thread_id: int | None = None) -> bool:
 async def _process_turn_end_footer_task(
     bot: Bot, user_id: int, task: MessageTask
 ) -> None:
-    """Append the terminal statusline to the turn's final content message.
+    """Send the terminal statusline as its own message at the turn's end.
 
-    Edits the last delivered content message, appending the footer verbatim
-    as code (inline for one line, fenced for multi-line) so arbitrary
-    statusLine content renders as-is instead of as Markdown. Also clears any
-    leftover status message — the turn is over, so a stale spinner message
-    would otherwise linger until the next turn.
+    The footer is sent verbatim as code (inline for one line, fenced for
+    multi-line) so arbitrary statusLine content renders as-is instead of as
+    Markdown. Also clears any leftover status message — the turn is over,
+    so a stale spinner message would otherwise linger until the next turn.
+
+    The footer target (`_last_content_msg`) is consumed as the gate/dedup:
+    it guarantees the turn's final text was already delivered, so the
+    footer message lands after it.
 
     A pane lull mid-turn (Claude Code's static "✻ Cogitated for 1m 12s"
     segment summary with no live spinner) is indistinguishable from a real
-    turn end, so a footer can fire early. Self-correction: the applied
-    footer is remembered in `_footer_applied`, and when another footer fires
-    with no user message in between (same turn — `_process_content_task`
-    pops the entry on user-role content), the earlier footer is reverted
-    first. The footer therefore always ends up on the turn's true final
-    message, and exactly one footer per turn survives.
+    turn end, so a footer can fire early. Self-correction: the sent footer
+    message is remembered in `_footer_applied`, and when another footer
+    fires with no user message in between (same turn —
+    `_process_content_task` pops the entry on user-role content), the
+    earlier footer message is deleted first. The footer therefore always
+    ends up after the turn's true final message, and exactly one footer
+    per turn survives.
     """
     tid = task.thread_id or 0
     key = (user_id, tid)
@@ -857,29 +862,33 @@ async def _process_turn_end_footer_task(
 
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
 
-    # Same-turn re-fire (false lull earlier): move the footer — revert the
-    # previously footered message back to its original text, best-effort.
-    prev = _footer_applied.pop(key, None)
-    if prev is not None:
-        prev_msg_id, prev_text = prev
-        if not await edit_with_fallback(bot, chat_id, prev_msg_id, prev_text):
+    # Same-turn re-fire (false lull earlier): move the footer — delete the
+    # previously sent footer message, best-effort.
+    prev_msg_id = _footer_applied.pop(key, None)
+    if prev_msg_id is not None:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=prev_msg_id)
+        except Exception as e:
             logger.warning(
-                "Turn-end footer revert failed for %s (msg %d) — stale footer stays",
+                "Turn-end footer delete failed for %s (msg %d): %s — "
+                "stale footer stays",
                 key,
                 prev_msg_id,
+                e,
             )
 
-    msg_id, text = info
     footer = f"```\n{task.text}\n```" if "\n" in task.text else f"`{task.text}`"
-    if await edit_with_fallback(bot, chat_id, msg_id, f"{text}\n\n{footer}"):
-        _footer_applied[key] = (msg_id, text)
-        logger.info("Turn-end footer appended for %s (msg %d)", key, msg_id)
+    sent = await send_with_fallback(
+        bot,
+        chat_id,
+        footer,
+        **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+    )
+    if sent:
+        _footer_applied[key] = sent.message_id
+        logger.info("Turn-end footer sent for %s (msg %d)", key, sent.message_id)
     else:
-        logger.warning(
-            "Turn-end footer edit failed for %s (msg %d) — footer dropped",
-            key,
-            msg_id,
-        )
+        logger.warning("Turn-end footer send failed for %s — footer dropped", key)
 
 
 async def enqueue_turn_end_footer(
