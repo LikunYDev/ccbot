@@ -23,6 +23,8 @@ Per-user message queues + worker pattern for all send tasks:
 
 **Deduplication**: The worker compares `last_text` when processing status updates; identical content skips the edit, reducing API calls.
 
+**Turn-end statusline footer**: The poller distinguishes a live working status from Claude Code's static turn-end summary line ("Cogitated for 1m 12s", `is_turn_end_status`). When a working status has been seen and the pane then stays idle for 3 consecutive polls with an empty queue (debouncing the 1s pane poll vs 2s JSONL monitor race), the terminal's statusline (the line(s) below the input box, `parse_chrome_footer`, captured verbatim — no shape assumed) is appended as code to the turn's final content message via a `turn_end_footer` task, and any leftover spinner status message is deleted. The footer task is ephemeral like status tasks: dropped under flood control, never retried, at most one append per turn.
+
 ## Rate Limiting
 
 - `AIORateLimiter(max_retries=5)` on the Application (30/s global)

@@ -190,3 +190,68 @@ def sample_pane_exit_plan_numbered():
 @pytest.fixture
 def sample_pane_no_ui():
     return "$ echo hello\nhello\n$\n"
+
+
+# Bottom chrome with a custom statusLine configured, as captured live
+# (2026-07, Claude Code 2.x). The statusline sits below the second separator,
+# above the mode indicator.
+_CHROME_WITH_STATUSLINE = (
+    "──────────────────────────────────────\n"
+    "❯ \n"
+    "──────────────────────────────────────\n"
+    "  ~/ccbot (main) | Fable 5 | ctx: 11% | cost: $4.88\n"
+    "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+)
+
+
+@pytest.fixture
+def chrome_with_statusline():
+    return _CHROME_WITH_STATUSLINE
+
+
+@pytest.fixture
+def sample_pane_working_asterisk():
+    """Captured live: `*` spinner frame with a Tip hint line between the
+    spinner and the separator."""
+    return (
+        "● Capturing now while it's working:\n"
+        "\n"
+        "● Running 2 shell commands…\n"
+        "  ⎿  $ tmux -L ccbot capture-pane -p -t ccbot:@85 | tail -20\n"
+        "\n"
+        "* Puttering… (22s · ↓ 270 tokens)\n"
+        "  ⎿  Tip: Use /btw to ask a quick side question\n"
+        "\n" + _CHROME_WITH_STATUSLINE
+    )
+
+
+@pytest.fixture
+def sample_pane_turn_end():
+    """Idle pane right after a turn: static turn-end summary line above the
+    separator, statusline in the bottom chrome."""
+    return (
+        "● Done. The fix is in place and tests pass.\n"
+        "\n"
+        "✻ Cogitated for 1m 12s\n"
+        "\n" + _CHROME_WITH_STATUSLINE
+    )
+
+
+@pytest.fixture
+def sample_pane_footer_with_task_hud():
+    """Captured live: statusline followed by the background-task HUD."""
+    return (
+        "● Report text here.\n"
+        "\n"
+        "✻ Waiting for 1 background agent to finish\n"
+        "\n"
+        "──────────────────────────────────────\n"
+        "❯ wait for the render and publish it\n"
+        "──────────────────────────────────────\n"
+        "  ~/huobi | Opus 4.8 | ctx: 28% | cost: $27.43\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        "\n"
+        "  ● main\n"
+        "  ◯ general-purpose  Render interactive system map HTML"
+        "                       2m 20s · ↓ 52.4k tokens\n"
+    )

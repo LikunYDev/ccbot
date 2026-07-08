@@ -17,9 +17,10 @@ Queue semantics — deliver, or drop loudly:
     is preserved. A long ban (retry_after > FLOOD_CONTROL_MAX_WAIT) still
     records `_flood_until` so producers skip enqueuing new status updates
     while banned.
-  - `status_update`/`status_clear` tasks are ephemeral: on RetryAfter they
-    are dropped (after waiting out a short ban) rather than retried, since
-    a fresh status will be enqueued again shortly.
+  - `status_update`/`status_clear`/`turn_end_footer` tasks are ephemeral:
+    on RetryAfter they are dropped (after waiting out a short ban) rather
+    than retried — status is re-enqueued shortly, and the footer is
+    cosmetic.
   - A `content` task that is ultimately dropped — retry attempts exhausted,
     or a non-RetryAfter Exception — gets a best-effort plain-text failure
     notice sent to the topic, so silence never means "delivered". Status
@@ -65,7 +66,13 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear", "interactive_ui"]
+    task_type: Literal[
+        "content",
+        "status_update",
+        "status_clear",
+        "interactive_ui",
+        "turn_end_footer",
+    ]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -88,6 +95,12 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+
+# Last delivered content message per topic: (user_id, thread_id_or_0) ->
+# (message_id, sent_markdown_text). A turn_end_footer task edits this message
+# to append the terminal statusline; the raw text is kept because MarkdownV2
+# edits re-render the whole message.
+_last_content_msg: dict[tuple[int, int], tuple[int, str]] = {}
 
 # Flood control: (user_id, thread_id_or_0) -> monotonic time when ban expires
 _flood_until: dict[_QueueKey, float] = {}
@@ -163,7 +176,7 @@ async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
 
     Pops (and cancels, for the worker) the (user_id, thread_id or 0) entry
     from `_message_queues`, `_queue_locks`, `_flood_until`,
-    and `_queue_workers`. Deliberately does NOT touch `_group_process_locks`
+    `_last_content_msg`, and `_queue_workers`. Deliberately does NOT touch `_group_process_locks`
     — that lock is keyed by chat_id and shared across every topic's worker
     in the same group chat.
 
@@ -176,6 +189,7 @@ async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
     _message_queues.pop(key, None)
     _queue_locks.pop(key, None)
     _flood_until.pop(key, None)
+    _last_content_msg.pop(key, None)
 
     worker = _queue_workers.pop(key, None)
     if worker is not None:
@@ -374,6 +388,10 @@ async def _message_queue_worker(bot: Bot, key: _QueueKey) -> None:
                                 await _process_interactive_ui_task(
                                     bot, user_id, work_task
                                 )
+                            elif task.task_type == "turn_end_footer":
+                                await _process_turn_end_footer_task(
+                                    bot, user_id, work_task
+                                )
                         break  # sent successfully
                     except RetryAfter as e:
                         retry_secs = (
@@ -486,6 +504,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
             if await edit_with_fallback(bot, chat_id, edit_msg_id, full_text):
+                _last_content_msg[(user_id, tid)] = (edit_msg_id, full_text)
                 await _send_task_images(bot, chat_id, task)
                 return
             logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
@@ -494,6 +513,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 2. Send content messages, converting status message to first content part
     first_part = True
     last_msg_id: int | None = None
+    last_part_text: str | None = None
     for part in task.parts:
         sent = None
 
@@ -509,6 +529,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
+                last_part_text = part
                 continue
 
         sent = await send_with_fallback(
@@ -520,10 +541,16 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
         if sent:
             last_msg_id = sent.message_id
+            last_part_text = part
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
+
+    # Track the last delivered message so a turn_end_footer task can append
+    # the terminal statusline to it when the turn completes.
+    if last_msg_id is not None and last_part_text is not None:
+        _last_content_msg[(user_id, tid)] = (last_msg_id, last_part_text)
 
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
@@ -742,6 +769,64 @@ async def enqueue_interactive_ui(
         thread_id=thread_id,
     )
     queue.put_nowait(task)
+
+
+async def _process_turn_end_footer_task(
+    bot: Bot, user_id: int, task: MessageTask
+) -> None:
+    """Append the terminal statusline to the turn's final content message.
+
+    Edits the last delivered content message, appending the footer verbatim
+    as code (inline for one line, fenced for multi-line) so arbitrary
+    statusLine content renders as-is instead of as Markdown. Also clears any
+    leftover status message — the turn is over, so a stale spinner message
+    would otherwise linger until the next turn.
+
+    The tracked entry is popped up front so the footer is appended at most
+    once per turn; a failed edit (message deleted / too old) just drops the
+    footer — it is cosmetic, and the next turn re-tracks from scratch.
+    """
+    tid = task.thread_id or 0
+    key = (user_id, tid)
+
+    await _do_clear_status_message(bot, user_id, tid)
+
+    info = _last_content_msg.pop(key, None)
+    if info is None or not task.text:
+        return
+
+    msg_id, text = info
+    footer = f"```\n{task.text}\n```" if "\n" in task.text else f"`{task.text}`"
+    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    if not await edit_with_fallback(bot, chat_id, msg_id, f"{text}\n\n{footer}"):
+        logger.debug(
+            "Turn-end footer edit failed for %s (msg %d) — footer dropped",
+            key,
+            msg_id,
+        )
+
+
+async def enqueue_turn_end_footer(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    footer_text: str,
+    thread_id: int | None = None,
+) -> None:
+    """Enqueue a turn-end footer append for the last content message.
+
+    Ephemeral like status tasks: dropped during flood control rather than
+    retried — the footer is cosmetic and stale by the next turn anyway.
+    """
+    queue = get_or_create_queue(bot, user_id, thread_id)
+    queue.put_nowait(
+        MessageTask(
+            task_type="turn_end_footer",
+            text=footer_text,
+            window_id=window_id,
+            thread_id=thread_id,
+        )
+    )
 
 
 async def enqueue_status_update(

@@ -25,7 +25,8 @@
 ├──────────────────────┴──────────────────────────────────────────────┤
 │  terminal_parser.py                                                 │
 │  - Detect interactive UIs (AskUserQuestion, ExitPlanMode, etc.)    │
-│  - Parse status line (spinner + working text)                      │
+│  - Parse status line (spinner + working text) + turn-end summary   │
+│  - Parse statusline footer from bottom chrome (verbatim)           │
 └──────────┬──────────────────────────────────────────────────────────┘
            │                              │
            │ Notify (NewMessage callback) │ Send (tmux keys)
@@ -81,7 +82,8 @@ Additional modules:
 Handler modules (handlers/):
   message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send
   message_queue.py    ─ Per-user queue + worker (merge, status dedup)
-  status_polling.py   ─ Background status line polling (1s interval)
+  status_polling.py   ─ Background status line polling (1s interval); turn-end
+                        detection → statusline footer on the final message
   response_builder.py ─ Response pagination and formatting
   interactive_ui.py   ─ AskUserQuestion / ExitPlanMode / Permission UI
   directory_browser.py─ Directory selection + session picker UI for new topics
