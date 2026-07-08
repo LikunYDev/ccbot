@@ -75,9 +75,10 @@ _prompt_miss_counts: dict[tuple[int, int], int] = {}
 # and the final JSONL text being dispatched (2s monitor poll).
 _TURN_END_IDLE_POLLS = 3
 
-# Topics whose pane showed a live working status since the last footer —
-# only these get a footer when the pane goes idle, so a bot restart over
-# idle sessions doesn't append footers to old messages.
+# Topics armed for turn-end footers: armed by the first live working status
+# seen after startup and kept armed for the topic's lifetime. Its only job
+# is making sure a bot restart over idle sessions doesn't stamp footers onto
+# old messages; per-fire dedup lives in the footer target (consumed on fire).
 _working_seen: set[tuple[int, int]] = set()
 
 # (user_id, thread_id_or_0) -> consecutive idle polls while working_seen.
@@ -195,18 +196,20 @@ async def update_status_message(
     # return above, so the streak only advances while the queue is drained.
     if ikey not in _working_seen:
         return
-    streak = _idle_poll_counts.get(ikey, 0) + 1
+    streak = min(_idle_poll_counts.get(ikey, 0) + 1, _TURN_END_IDLE_POLLS)
     _idle_poll_counts[ikey] = streak
     if streak < _TURN_END_IDLE_POLLS:
         return
     if not has_footer_target(user_id, thread_id):
-        # The turn's final text hasn't been delivered yet (JSONL write →
-        # 2s monitor poll → queue → send can trail the pane going idle).
-        # Hold fire and stay armed — re-check on the next poll. If the turn
-        # truly produced no Claude text, this simply never fires; the next
-        # turn's live status resets the streak.
+        # No undelivered-footer target: either the turn's final text is
+        # still in flight (JSONL write → 2s monitor poll → queue → send
+        # trails the pane going idle) or this turn's footer already fired
+        # and consumed it. Hold — stay armed and re-check next poll. A
+        # pane lull mid-turn can fire the footer early; when the turn's
+        # real final text lands, this re-fires and the worker MOVES the
+        # footer onto it (reverting the earlier edit), so the footer
+        # always ends up on the last message.
         return
-    _working_seen.discard(ikey)
     _idle_poll_counts.pop(ikey, None)
     footer = parse_chrome_footer(pane_text)
     if footer:

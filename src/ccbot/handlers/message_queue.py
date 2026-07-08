@@ -106,6 +106,13 @@ _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 # edits re-render the whole message.
 _last_content_msg: dict[tuple[int, int], tuple[int, str]] = {}
 
+# Footer already applied this turn: (user_id, thread_id_or_0) ->
+# (message_id, original_text_without_footer). Lets a re-fired footer (a pane
+# lull mid-turn looks like a turn end) MOVE to the true final message by
+# reverting the earlier edit. A user-role content message marks a turn
+# boundary and pops the entry, making the previous turn's footer permanent.
+_footer_applied: dict[tuple[int, int], tuple[int, str]] = {}
+
 # Status timer tick: a status whose action word is unchanged (only the
 # timer/stats parenthetical moved, e.g. "(32s · …)" → "(45s · …)") is still
 # edited once this many seconds have passed since the last status send/edit,
@@ -203,6 +210,7 @@ async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
     _queue_locks.pop(key, None)
     _flood_until.pop(key, None)
     _last_content_msg.pop(key, None)
+    _footer_applied.pop(key, None)
     _status_last_edit.pop(key, None)
 
     worker = _queue_workers.pop(key, None)
@@ -508,6 +516,11 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     wid = task.window_id or ""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+
+    # A user message marks a turn boundary: the previous turn's footer (if
+    # any) becomes permanent — a later footer fire must not revert it.
+    if task.role == "user":
+        _footer_applied.pop((user_id, tid), None)
 
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
@@ -823,9 +836,14 @@ async def _process_turn_end_footer_task(
     leftover status message — the turn is over, so a stale spinner message
     would otherwise linger until the next turn.
 
-    The tracked entry is popped up front so the footer is appended at most
-    once per turn; a failed edit (message deleted / too old) just drops the
-    footer — it is cosmetic, and the next turn re-tracks from scratch.
+    A pane lull mid-turn (Claude Code's static "✻ Cogitated for 1m 12s"
+    segment summary with no live spinner) is indistinguishable from a real
+    turn end, so a footer can fire early. Self-correction: the applied
+    footer is remembered in `_footer_applied`, and when another footer fires
+    with no user message in between (same turn — `_process_content_task`
+    pops the entry on user-role content), the earlier footer is reverted
+    first. The footer therefore always ends up on the turn's true final
+    message, and exactly one footer per turn survives.
     """
     tid = task.thread_id or 0
     key = (user_id, tid)
@@ -837,10 +855,24 @@ async def _process_turn_end_footer_task(
         logger.info("Turn-end footer for %s: no target message — dropped", key)
         return
 
+    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+
+    # Same-turn re-fire (false lull earlier): move the footer — revert the
+    # previously footered message back to its original text, best-effort.
+    prev = _footer_applied.pop(key, None)
+    if prev is not None:
+        prev_msg_id, prev_text = prev
+        if not await edit_with_fallback(bot, chat_id, prev_msg_id, prev_text):
+            logger.warning(
+                "Turn-end footer revert failed for %s (msg %d) — stale footer stays",
+                key,
+                prev_msg_id,
+            )
+
     msg_id, text = info
     footer = f"```\n{task.text}\n```" if "\n" in task.text else f"`{task.text}`"
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
     if await edit_with_fallback(bot, chat_id, msg_id, f"{text}\n\n{footer}"):
+        _footer_applied[key] = (msg_id, text)
         logger.info("Turn-end footer appended for %s (msg %d)", key, msg_id)
     else:
         logger.warning(

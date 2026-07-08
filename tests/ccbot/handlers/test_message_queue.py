@@ -814,12 +814,14 @@ class TestConvertStatusToContentRace:
 
 @pytest.fixture
 def _clear_last_content_msg():
-    """Reset _last_content_msg between tests so tracking doesn't leak."""
+    """Reset footer tracking between tests so state doesn't leak."""
     from ccbot.handlers import message_queue as mq
 
     mq._last_content_msg.clear()
+    mq._footer_applied.clear()
     yield
     mq._last_content_msg.clear()
+    mq._footer_applied.clear()
 
 
 @pytest.mark.usefixtures("_clear_status_msg_info", "_clear_last_content_msg")
@@ -1170,3 +1172,126 @@ class TestStatusTimerTick:
             mq._message_queues.pop(key, None)
             mq._queue_locks.pop(key, None)
             mq._queue_workers.pop(key, None)
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info", "_clear_last_content_msg")
+class TestFooterMove:
+    """A footer fired early (mid-turn pane lull) must MOVE to the true final
+    message: the earlier edit is reverted when a new footer fires with no
+    user message in between; a user message makes it permanent."""
+
+    USER = 7
+    TID = 42
+    KEY = (7, 42)
+
+    def _footer_task(self, footer: str = "~/proj | Fable 5 | ctx: 9%"):
+        from ccbot.handlers.message_queue import MessageTask
+
+        return MessageTask(
+            task_type="turn_end_footer",
+            text=footer,
+            window_id="@5",
+            thread_id=self.TID,
+        )
+
+    @pytest.mark.asyncio
+    async def test_refire_reverts_previous_footer(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        mq._footer_applied[self.KEY] = (200, "intermediate text")
+        mq._last_content_msg[self.KEY] = (300, "true final text")
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.edit_with_fallback",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_edit,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, self.USER, self._footer_task())
+
+        assert mock_edit.await_args_list[0].args == (
+            bot,
+            100,
+            200,
+            "intermediate text",
+        )
+        assert mock_edit.await_args_list[1].args == (
+            bot,
+            100,
+            300,
+            "true final text\n\n`~/proj | Fable 5 | ctx: 9%`",
+        )
+        # The new footer is now the revertable one.
+        assert mq._footer_applied[self.KEY] == (300, "true final text")
+
+    @pytest.mark.asyncio
+    async def test_first_fire_no_revert(self):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        mq._last_content_msg[self.KEY] = (300, "final text")
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.edit_with_fallback",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_edit,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, self.USER, self._footer_task())
+
+        mock_edit.assert_awaited_once()
+        assert mq._footer_applied[self.KEY] == (300, "final text")
+
+    @pytest.mark.asyncio
+    async def test_user_message_makes_footer_permanent(self):
+        """A user-role content task pops _footer_applied: the next turn's
+        footer fire must not revert the previous turn's footer."""
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        mq._footer_applied[self.KEY] = (200, "previous turn final")
+        sent = MagicMock()
+        sent.message_id = 250
+        user_task = mq.MessageTask(
+            task_type="content",
+            window_id="@5",
+            parts=["user says hi"],
+            content_type="text",
+            thread_id=self.TID,
+            role="user",
+        )
+
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.send_with_fallback",
+                new_callable=AsyncMock,
+                return_value=sent,
+            ),
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_content_task(bot, self.USER, user_task)
+
+        assert self.KEY not in mq._footer_applied
+
+        # New turn's footer fires on new target: only ONE edit (no revert).
+        mq._last_content_msg[self.KEY] = (300, "new turn final")
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.edit_with_fallback",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_edit,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_turn_end_footer_task(bot, self.USER, self._footer_task())
+
+        mock_edit.assert_awaited_once()

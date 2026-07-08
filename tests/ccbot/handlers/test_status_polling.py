@@ -604,7 +604,7 @@ class TestTurnEndFooter:
             return mock_status, mock_footer
 
     @pytest.mark.asyncio
-    async def test_working_then_idle_appends_footer_once(
+    async def test_working_then_idle_fires_footer(
         self,
         mock_bot: AsyncMock,
         mock_window: MagicMock,
@@ -612,8 +612,8 @@ class TestTurnEndFooter:
         sample_pane_turn_end: str,
     ):
         """The full happy path: working status enqueued, then after the
-        debounce the footer is enqueued exactly once, and a further idle
-        poll does not re-fire."""
+        debounce the footer is enqueued; once the target is consumed
+        (has_target False), further idle polls do not re-fire."""
         status, footer = await self._poll(
             mock_bot, sample_pane_working_asterisk, mock_window
         )
@@ -644,9 +644,39 @@ class TestTurnEndFooter:
             thread_id=self.THREAD,
         )
 
-        # Idle poll 4: disarmed, no second footer
-        status, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
-        footer.assert_not_called()
+        # Target consumed by the fire → further idle polls hold.
+        for _ in range(4):
+            status, footer = await self._poll(
+                mock_bot, sample_pane_turn_end, mock_window, has_target=False
+            )
+            footer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_false_lull_refires_when_new_text_lands(
+        self,
+        mock_bot: AsyncMock,
+        mock_window: MagicMock,
+        sample_pane_working_asterisk: str,
+        sample_pane_turn_end: str,
+    ):
+        """A mid-turn lull fires the footer early; when the turn's real
+        final text is delivered (a fresh target appears), the idle edge must
+        re-fire so the worker can move the footer onto it."""
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+
+        # Lull: debounce passes, footer fires (early, as it turns out).
+        for _ in range(2):
+            await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        footer.assert_called_once()
+
+        # Turn actually continues: work resumes, then new text + idle again.
+        await self._poll(mock_bot, sample_pane_working_asterisk, mock_window)
+        for _ in range(2):
+            _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+            footer.assert_not_called()
+        _, footer = await self._poll(mock_bot, sample_pane_turn_end, mock_window)
+        footer.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_idle_without_prior_working_no_footer(
