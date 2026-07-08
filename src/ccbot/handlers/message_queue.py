@@ -106,6 +106,15 @@ _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 # edits re-render the whole message.
 _last_content_msg: dict[tuple[int, int], tuple[int, str]] = {}
 
+# Status timer tick: a status whose action word is unchanged (only the
+# timer/stats parenthetical moved, e.g. "(32s · …)" → "(45s · …)") is still
+# edited once this many seconds have passed since the last status send/edit,
+# so the elapsed-time display keeps ticking without per-second API calls.
+STATUS_TICK_INTERVAL = 10.0
+
+# (user_id, thread_id_or_0) -> monotonic time of the last status send/edit.
+_status_last_edit: dict[tuple[int, int], float] = {}
+
 # Flood control: (user_id, thread_id_or_0) -> monotonic time when ban expires
 _flood_until: dict[_QueueKey, float] = {}
 
@@ -194,6 +203,7 @@ async def teardown_topic(user_id: int, thread_id: int | None = None) -> None:
     _queue_locks.pop(key, None)
     _flood_until.pop(key, None)
     _last_content_msg.pop(key, None)
+    _status_last_edit.pop(key, None)
 
     worker = _queue_workers.pop(key, None)
     if worker is not None:
@@ -643,13 +653,19 @@ async def _process_status_update_task(
             # Window changed - delete old and send new
             await _do_clear_status_message(bot, user_id, tid)
             await _do_send_status_message(bot, user_id, tid, wid, status_text)
-        elif _strip_status_stats(status_text) == _strip_status_stats(last_text):
-            # Same action (ignoring timer changes), skip edit
+        elif status_text == last_text or (
+            _strip_status_stats(status_text) == _strip_status_stats(last_text)
+            and time.monotonic() - _status_last_edit.get(skey, 0) < STATUS_TICK_INTERVAL
+        ):
+            # Identical text, or same action with only the timer/stats moved
+            # and the last edit is recent — skip. The timer still ticks:
+            # once STATUS_TICK_INTERVAL has passed, the edit goes through.
             return
         else:
-            # Same window, text changed - edit in place
+            # Same window, text (or a due timer tick) changed - edit in place
             if await edit_with_fallback(bot, chat_id, msg_id, status_text):
                 _status_msg_info[skey] = (msg_id, wid, status_text)
+                _status_last_edit[skey] = time.monotonic()
             else:
                 _status_msg_info.pop(skey, None)
                 await _do_send_status_message(bot, user_id, tid, wid, status_text)
@@ -685,6 +701,7 @@ async def _do_send_status_message(
     )
     if sent:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
+        _status_last_edit[skey] = time.monotonic()
 
 
 async def _do_clear_status_message(
@@ -858,7 +875,9 @@ async def enqueue_status_update(
     if flood_end > time.monotonic():
         return
 
-    # Deduplicate: skip if action text matches (ignoring timer/stats changes)
+    # Deduplicate: skip if the action text matches (ignoring timer/stats
+    # changes) — unless the timer tick is due (STATUS_TICK_INTERVAL since the
+    # last status send/edit), so the elapsed-time display keeps advancing.
     if status_text:
         skey = (user_id, tid)
         info = _status_msg_info.get(skey)
@@ -866,6 +885,11 @@ async def enqueue_status_update(
             info
             and info[1] == window_id
             and _strip_status_stats(info[2]) == _strip_status_stats(status_text)
+            and (
+                status_text == info[2]
+                or time.monotonic() - _status_last_edit.get(skey, 0)
+                < STATUS_TICK_INTERVAL
+            )
         ):
             return
 

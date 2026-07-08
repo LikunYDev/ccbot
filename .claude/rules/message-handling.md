@@ -21,7 +21,7 @@ Per-user message queues + worker pattern for all send tasks:
 
 **Polling**: Background task polls terminal status for all active windows at 1-second intervals. Send-layer rate limiting ensures flood control is not triggered.
 
-**Deduplication**: The worker compares `last_text` when processing status updates; identical content skips the edit, reducing API calls.
+**Deduplication + timer tick**: Status updates whose action word is unchanged (only the timer/stats parenthetical moved) are normally skipped, reducing API calls. The elapsed-time display still ticks: once `STATUS_TICK_INTERVAL` (10s) has passed since the last status send/edit, a stats-only change is edited through anyway — at most one edit per topic per interval. Identical raw text always skips.
 
 **Turn-end statusline footer**: The poller distinguishes a live working status from Claude Code's static turn-end summary line ("Cogitated for 1m 12s", `is_turn_end_status`). When a working status has been seen and the pane then stays idle for 3 consecutive polls with an empty queue (debouncing the 1s pane poll vs 2s JSONL monitor race), the terminal's statusline (the line(s) below the input box, `parse_chrome_footer`, captured verbatim — no shape assumed) is appended as code to the turn's final content message via a `turn_end_footer` task, and any leftover spinner status message is deleted. The footer task is ephemeral like status tasks: dropped under flood control, never retried, at most one append per turn.
 

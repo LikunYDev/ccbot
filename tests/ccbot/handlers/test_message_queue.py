@@ -1,5 +1,6 @@
 """Tests for message_queue — status stats stripping for dedup."""
 
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1037,3 +1038,135 @@ class TestFooterTargetTracking:
         mq._last_content_msg[(7, 42)] = (200, "claude final text")
         await self._run_content_task(role="user")
         assert mq._last_content_msg[(7, 42)] == (200, "claude final text")
+
+
+@pytest.fixture
+def _clear_status_last_edit():
+    from ccbot.handlers import message_queue as mq
+
+    mq._status_last_edit.clear()
+    yield
+    mq._status_last_edit.clear()
+
+
+@pytest.mark.usefixtures("_clear_status_msg_info", "_clear_status_last_edit")
+class TestStatusTimerTick:
+    """Stats-only status changes are skipped while the last edit is fresh but
+    tick through once STATUS_TICK_INTERVAL has passed — the elapsed-time
+    display advances without per-second API calls."""
+
+    USER = 7
+    TID = 42
+    SKEY = (7, 42)
+
+    def _task(self, text: str):
+        from ccbot.handlers.message_queue import MessageTask
+
+        return MessageTask(
+            task_type="status_update",
+            text=text,
+            window_id="@5",
+            thread_id=self.TID,
+        )
+
+    async def _process(self, text: str, edit_ok: bool = True):
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        with (
+            patch("ccbot.handlers.message_queue.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.message_queue.edit_with_fallback",
+                new_callable=AsyncMock,
+                return_value=edit_ok,
+            ) as mock_edit,
+        ):
+            mock_sm.resolve_chat_id.return_value = 100
+            await mq._process_status_update_task(bot, self.USER, self._task(text))
+        return mock_edit
+
+    @pytest.mark.asyncio
+    async def test_stats_only_change_skipped_when_fresh(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic()  # just edited
+
+        mock_edit = await self._process("Envisioning… (45s · thinking)")
+        mock_edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stats_only_change_ticks_after_interval(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic() - mq.STATUS_TICK_INTERVAL - 1
+
+        mock_edit = await self._process("Envisioning… (45s · thinking)")
+        mock_edit.assert_awaited_once()
+        # last_text and tick timestamp updated
+        assert mq._status_msg_info[self.SKEY][2] == "Envisioning… (45s · thinking)"
+        assert time.monotonic() - mq._status_last_edit[self.SKEY] < 5
+
+    @pytest.mark.asyncio
+    async def test_identical_text_never_edits_even_when_tick_due(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic() - mq.STATUS_TICK_INTERVAL - 1
+
+        mock_edit = await self._process("Envisioning… (32s · thinking)")
+        mock_edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_action_change_edits_regardless_of_tick(self):
+        from ccbot.handlers import message_queue as mq
+
+        mq._status_msg_info[self.SKEY] = (11, "@5", "Envisioning… (32s · thinking)")
+        mq._status_last_edit[self.SKEY] = time.monotonic()
+
+        mock_edit = await self._process("Reading file src/main.py")
+        mock_edit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_producer_dedup_respects_tick(self):
+        """enqueue_status_update skips a fresh stats-only change but enqueues
+        once the tick is due."""
+        import asyncio
+
+        from ccbot.handlers import message_queue as mq
+
+        bot = AsyncMock()
+        key = self.SKEY
+        # Pre-populate queue machinery so no real worker is spawned.
+        mq._message_queues[key] = asyncio.Queue()
+        mq._queue_locks[key] = asyncio.Lock()
+        mq._queue_workers[key] = MagicMock()
+        try:
+            mq._status_msg_info[key] = (11, "@5", "Envisioning… (32s · thinking)")
+
+            mq._status_last_edit[key] = time.monotonic()
+            await mq.enqueue_status_update(
+                bot,
+                self.USER,
+                "@5",
+                "Envisioning… (45s · thinking)",
+                thread_id=self.TID,
+            )
+            assert mq._message_queues[key].empty()
+
+            mq._status_last_edit[key] = time.monotonic() - mq.STATUS_TICK_INTERVAL - 1
+            await mq.enqueue_status_update(
+                bot,
+                self.USER,
+                "@5",
+                "Envisioning… (45s · thinking)",
+                thread_id=self.TID,
+            )
+            task = mq._message_queues[key].get_nowait()
+            assert task.task_type == "status_update"
+            assert task.text == "Envisioning… (45s · thinking)"
+        finally:
+            mq._message_queues.pop(key, None)
+            mq._queue_locks.pop(key, None)
+            mq._queue_workers.pop(key, None)
