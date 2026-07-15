@@ -297,6 +297,47 @@ def _panes_running_claude(pane_pids: list[str]) -> set[str]:
     return matched
 
 
+def _count_claude_ancestors() -> int | None:
+    """Count ``claude`` processes among this hook process's ancestors.
+
+    The pane's own session runs its hooks under exactly one claude — the
+    one hosting the pane. A child session (e.g. a tool inside the pane
+    shelling out to ``claude -p``) runs them under two or more, because the
+    child inherits the pane's environment and fires the same hook. The
+    count is the discriminator; callers skip registration at >= 2.
+
+    Returns None when the process table can't be read — unknown must fail
+    open (register as before) rather than silently drop a legitimate
+    registration, mirroring _accepted_session_names.
+    """
+    result = subprocess.run(
+        ["ps", "-A", "-o", "pid=,ppid=,comm="],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    parent: dict[str, str] = {}
+    comm: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        parent[parts[0]] = parts[1]
+        # basename: Linux comm is the bare name, macOS comm is the full path
+        comm[parts[0]] = os.path.basename(parts[2].strip())
+
+    count = 0
+    seen: set[str] = set()
+    p = str(os.getpid())
+    while p in parent and p not in seen:
+        seen.add(p)
+        if comm.get(p) == "claude":
+            count += 1
+        p = parent[p]
+    return count
+
+
 def _resolve_window_by_cwd(cwd: str) -> tuple[str, str, str] | None:
     """Resolve (session_name, window_id, window_name) by matching the cwd.
 
@@ -439,6 +480,21 @@ def hook_main() -> None:
     pane_id = os.environ.get("TMUX_PANE", "")
     by_cwd_fallback = False
     if pane_id:
+        # A child claude spawned from inside the pane (a tool shelling out
+        # to `claude -p`) inherits TMUX_PANE and reaches this path looking
+        # exactly like the pane's own session — its SessionStart would
+        # steal the window's mapping and the topic would go silent until
+        # the divergence notice. The pane's own session runs this hook
+        # under exactly one claude ancestor; a child session under two or
+        # more. Skip those; unknown (None) fails open.
+        claude_ancestors = _count_claude_ancestors()
+        if claude_ancestors is not None and claude_ancestors >= 2:
+            logger.info(
+                "Hook fired by a claude nested inside another claude "
+                "(%d claude ancestors); not registering",
+                claude_ancestors,
+            )
+            return
         # session_map is ccbot's private state: only panes on ccbot's own
         # tmux server belong in it. $TMUX is "<socket_path>,<pid>,<session>";
         # a different socket basename means a foreign server — writing its

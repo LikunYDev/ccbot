@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import subprocess
 import sys
 
@@ -319,6 +320,10 @@ class TestHookSocketGate:
         tmux_env: str,
     ) -> dict | None:
         def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
             if "list-sessions" in cmd:
                 return subprocess.CompletedProcess(
                     args=cmd, returncode=0, stdout="ccbot|\n", stderr=""
@@ -383,6 +388,10 @@ class TestHookForeignSessionGate:
         list_sessions_rc: int = 0,
     ) -> dict | None:
         def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
             if "list-sessions" in cmd:
                 return subprocess.CompletedProcess(
                     args=cmd,
@@ -463,6 +472,117 @@ class TestHookForeignSessionGate:
         )
 
 
+class TestHookNestedClaudeGate:
+    """A child claude spawned from inside a pane (a tool shelling out to
+    ``claude -p``) inherits TMUX_PANE, so its SessionStart hook reaches the
+    pane path looking exactly like the pane's own session — and would steal
+    the window's mapping (the 2026-07-15 lateen incident: every Game Master
+    turn re-pointed the window at a throwaway session, silencing the topic).
+    The pane's own session runs the hook under exactly one claude ancestor;
+    a child session under two or more. A failed ps read must fail open."""
+
+    PAYLOAD = {
+        "session_id": "33333333-3333-3333-3333-333333333333",
+        "cwd": "/proj",
+        "hook_event_name": "SessionStart",
+    }
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        *,
+        ps_output: str,
+        ps_rc: int = 0,
+    ) -> dict | None:
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=ps_rc,
+                    stdout=ps_output,
+                    stderr="" if ps_rc == 0 else "ps exploded",
+                )
+            if "list-sessions" in cmd:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="ccbot|\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="ccbot:@41:job\n", stderr=""
+            )
+
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr("ccbot.hook.subprocess.run", fake_run)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(self.PAYLOAD)))
+        monkeypatch.setenv("TMUX_PANE", "%9")
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.delenv("TMUX_SOCKET_NAME", raising=False)
+        monkeypatch.delenv("TMUX_SESSION_NAME", raising=False)
+        hook_main()
+        map_file = tmp_path / "session_map.json"
+        return json.loads(map_file.read_text()) if map_file.exists() else None
+
+    def _ps_table(self, *, nested: bool) -> str:
+        """A process table rooting this test process in a pane's claude —
+        with or without a second claude between them (the child-session
+        case: hook <- sh <- claude -p <- python tool <- claude <- pane)."""
+        me = str(os.getpid())
+        lines = [
+            f"{me} 77770 /opt/homebrew/bin/python3",
+            "77770 77771 sh",
+            "77771 77772 claude",
+        ]
+        if nested:
+            lines += [
+                "77772 77773 python3",
+                "77773 77774 claude",
+                "77774 77775 -zsh",
+            ]
+        else:
+            lines += ["77772 77775 -zsh"]
+        lines += ["77775 1 tmux", "1 0 /sbin/launchd"]
+        return "\n".join(lines) + "\n"
+
+    def test_nested_claude_is_skipped(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level("INFO", logger="ccbot.hook"):
+            result = self._run(
+                monkeypatch, tmp_path, ps_output=self._ps_table(nested=True)
+            )
+        assert result is None
+        assert any(
+            "nested inside another claude" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_single_claude_ancestor_registers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        result = self._run(
+            monkeypatch, tmp_path, ps_output=self._ps_table(nested=False)
+        )
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+    def test_ps_failure_fails_open(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A transient ps failure must not block a legitimate registration —
+        unknown ancestry is treated as not nested."""
+        result = self._run(monkeypatch, tmp_path, ps_output="", ps_rc=1)
+        assert result is not None
+        assert result["ccbot:@41"]["session_id"] == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+
 class TestHookMainWritePath:
     """Tests that exercise the session_map write path with tmux mocked.
 
@@ -486,6 +606,10 @@ class TestHookMainWritePath:
         """
 
         def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
             if "list-sessions" in cmd:
                 return subprocess.CompletedProcess(
                     args=cmd, returncode=0, stdout=list_sessions_output, stderr=""
@@ -623,6 +747,10 @@ class TestHookMainTranscriptSizeAtStart:
         transcript_path: str,
     ) -> dict:
         def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
             if "list-sessions" in cmd:
                 return subprocess.CompletedProcess(
                     args=cmd, returncode=0, stdout="ccbot|\n", stderr=""
