@@ -53,9 +53,13 @@ _TMUX_SUBPROCESS_TIMEOUT = 10.0
 # Verify-before-Enter: number of capture-pane polls used to confirm literal
 # text actually landed in the pane before submitting Enter, and the spacing
 # between them. A wedged/slow-redrawing TUI would otherwise turn a
-# fixed-delay Enter into a stray newline inside the input box.
-_SEND_VERIFY_ATTEMPTS = 3
-_SEND_VERIFY_POLL_INTERVAL = 0.3
+# fixed-delay Enter into a stray newline inside the input box. The ~4s
+# total window absorbs a TUI that is slow to echo a multi-KB burst (a
+# 1.2k-char send was observed to miss the previous ~0.6s window); on
+# success the loop exits at first sight of the text, so the widening
+# costs nothing on the happy path.
+_SEND_VERIFY_ATTEMPTS = 8
+_SEND_VERIFY_POLL_INTERVAL = 0.5
 
 _T = TypeVar("_T")
 
