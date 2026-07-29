@@ -93,6 +93,46 @@ class TestParseStatusLine:
         is_turn_end_status's job, not the parser's)."""
         assert parse_status_line(sample_pane_turn_end) == "Cogitated for 1m 12s"
 
+    def test_todo_hud_between_spinner_and_chrome(self, chrome: str):
+        """Regression: the todo-list HUD under the spinner (first line
+        `⎿`-prefixed, continuations indented with ◼/◻/… glyphs) must be
+        skipped, and the scan must reach over its full height."""
+        pane = (
+            "· Wave 3: building the identity foundation… (39m 42s · ↓ 90.9k tokens)\n"
+            "  ⎿  ◼ Wave 3: identity — lineage spawn guard (#85)\n"
+            "     ◻ Wave 4: surface unparseable [repeat::] in sync status (#82)\n"
+            "     ◻ Wave 5: migration safety (#81)\n"
+            "     ◻ Wave 6: GM window aligned (#84) and decluttered (#83)\n"
+            "     ◻ Final: full suite, integration review, push branch\n"
+            "      … +3 completed\n"
+            "\n" + chrome
+        )
+        assert parse_status_line(pane) == (
+            "Wave 3: building the identity foundation… (39m 42s · ↓ 90.9k tokens)"
+        )
+
+    def test_queued_message_echo_skipped(self, chrome: str):
+        """Regression: a queued user message echoed above the separator
+        (`  ❯ Where are we`) must not hide the spinner."""
+        pane = (
+            "✻ Wave 2: fixing the sync engine… (32m 12s · ↓ 71.9k tokens)\n"
+            "  ⎿  ◼ Wave 2: sync engine — adopt (#79), re-date wedge (#80)\n"
+            "     ◻ Wave 3: identity — lineage spawn guard (#85)\n"
+            "      … +1 pending, 2 completed\n"
+            "\n"
+            "  ❯ Where are we\n"
+            "\n" + chrome
+        )
+        assert parse_status_line(pane) == (
+            "Wave 2: fixing the sync engine… (32m 12s · ↓ 71.9k tokens)"
+        )
+
+    def test_content_line_below_hud_still_blocks(self, chrome: str):
+        """A regular content line between the HUD and the separator still
+        stops the scan — skippable lines widen the reach, not the guard."""
+        pane = f"✻ Doing work\n  ⎿  ◼ some task\nsome regular output\n{chrome}"
+        assert parse_status_line(pane) is None
+
 
 # ── is_turn_end_status ───────────────────────────────────────────────────
 

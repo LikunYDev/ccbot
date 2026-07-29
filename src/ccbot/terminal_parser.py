@@ -454,15 +454,19 @@ def is_interactive_ui(pane_text: str) -> bool:
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢", "*"])
 
 # Hint/chrome lines that may sit between the spinner line and the chrome
-# separator (e.g. "  ⎿  Tip: Use /btw …" or "⏵⏵ auto mode on"). These are
-# skipped when scanning upward for the spinner; any other content line
-# stops the scan so ·/* bullets in Claude's output can't be misread as a
-# status line.
-_RE_STATUS_SKIPPABLE = re.compile(r"^\s*[⎿⏵]")
+# separator: `⎿`-prefixed hints ("  ⎿  Tip: Use /btw …"), mode indicators
+# ("⏵⏵ auto mode on"), the queued-message echo ("  ❯ Where are we"), and
+# the todo-list HUD's continuation lines ("     ◻ Wave 4: …",
+# "      … +3 completed") — indented ≥3 columns, deeper than any output
+# bullet. These are skipped when scanning upward for the spinner; any other
+# content line stops the scan so ·/* bullets in Claude's output can't be
+# misread as a status line.
+_RE_STATUS_SKIPPABLE = re.compile(r"^\s*[⎿⏵❯]|^\s{3,}[◼◻✔✓…]")
 
 # How many lines above the separator to scan for the spinner (blanks and
-# skippable hint lines included).
-_STATUS_SCAN_HEIGHT = 6
+# skippable hint lines included). Must clear the todo-list HUD (up to ~8
+# lines: 6-7 items plus the "… +N" summary) and a queued-message echo.
+_STATUS_SCAN_HEIGHT = 16
 
 # Turn-end summary line Claude Code prints when a turn completes, e.g.
 # "Cogitated for 1m 12s" / "Churned for 9m 58s" (after the spinner glyph
@@ -476,11 +480,11 @@ def parse_status_line(pane_text: str) -> str | None:
 
     The status line (spinner + working text) appears above the chrome
     separator (a full line of ``─`` characters), possibly with hint lines
-    (tips, mode indicators) in between.  We locate the separator first,
-    then scan upward — skipping blanks and known hint lines — for a line
-    starting with a spinner glyph.  Any other content line stops the scan,
-    which avoids false positives from ``·``/``*`` bullets in Claude's
-    regular output.
+    (tips, mode indicators), the todo-list HUD, or a queued-message echo
+    in between.  We locate the separator first, then scan upward — skipping
+    blanks and known hint lines — for a line starting with a spinner glyph.
+    Any other content line stops the scan, which avoids false positives
+    from ``·``/``*`` bullets in Claude's regular output.
 
     Returns the text after the spinner, or None if no status line found.
     Note: the turn-end summary line ("Cogitated for 1m 12s") also parses —
