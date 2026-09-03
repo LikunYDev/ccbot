@@ -133,6 +133,37 @@ class TestParseStatusLine:
         pane = f"✻ Doing work\n  ⎿  ◼ some task\nsome regular output\n{chrome}"
         assert parse_status_line(pane) is None
 
+    def test_wrapped_tip_continuation_skipped(self, chrome: str):
+        """Regression: at 80 columns the Tip hint wraps, and its continuation
+        line (indented under the hint text, no glyph) must not stop the
+        scan. Captured live from an 80x24 pane."""
+        pane = (
+            "· Actioning… (6m 43s · ↓ 27.7k tokens)\n"
+            "  ⎿  Tip: Use /btw to ask a quick side question without "
+            "interrupting Claude's\n"
+            "     current work\n"
+            "\n" + chrome
+        )
+        assert parse_status_line(pane) == "Actioning… (6m 43s · ↓ 27.7k tokens)"
+
+    def test_labeled_separator_recognized(self):
+        """Regression: with ultracode on, the separator carries a
+        right-aligned label ("──── ultracode ─") and is still the chrome
+        separator."""
+        pane = (
+            "✻ Cogitated for 1m 12s\n"
+            "\n" + "─" * 68 + " ultracode ─\n"
+            "❯ \n" + "─" * 80 + "\n"
+            "  ~/ccbot (main) | Fable 5.1 | ctx: 7% | cost: $1.50\n"
+        )
+        assert parse_status_line(pane) == "Cogitated for 1m 12s"
+
+    def test_rule_followed_by_text_is_not_a_separator(self):
+        """The label sits inside the rule (dashes on both sides); a rule
+        followed by trailing text is output, not chrome."""
+        pane = "· Working… (3s)\n" + "─" * 30 + " not chrome\n"
+        assert parse_status_line(pane) is None
+
 
 # ── is_turn_end_status ───────────────────────────────────────────────────
 
@@ -223,6 +254,20 @@ class TestParseChromeFooter:
 
     def test_empty_pane_returns_none(self):
         assert parse_chrome_footer("") is None
+
+    def test_labeled_separator_recognized(self):
+        """Regression: the ultracode label on the first separator must not
+        hide the statusline below the second."""
+        pane = (
+            "output\n" + "─" * 68 + " ultracode ─\n"
+            "❯ \n" + "─" * 80 + "\n"
+            "  ~/ccbot (main) | Fable 5.1 | ctx: 7% | cost: $1.50\n"
+            "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        )
+        assert (
+            parse_chrome_footer(pane)
+            == "~/ccbot (main) | Fable 5.1 | ctx: 7% | cost: $1.50"
+        )
 
 
 # ── extract_interactive_content ──────────────────────────────────────────
@@ -643,6 +688,16 @@ class TestStripPaneChrome:
         # Separator at line 0 with 15 lines total — outside the last-10 window
         lines = ["─" * 30] + [f"line {i}" for i in range(14)]
         assert strip_pane_chrome(lines) == lines
+
+    def test_labeled_separator_strips(self):
+        lines = [
+            "some output",
+            "─" * 68 + " ultracode ─",
+            "❯",
+            "─" * 80,
+            "  statusline",
+        ]
+        assert strip_pane_chrome(lines) == ["some output"]
 
 
 # ── extract_bash_output ─────────────────────────────────────────────────

@@ -456,12 +456,15 @@ STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢", "*"])
 # Hint/chrome lines that may sit between the spinner line and the chrome
 # separator: `⎿`-prefixed hints ("  ⎿  Tip: Use /btw …"), mode indicators
 # ("⏵⏵ auto mode on"), the queued-message echo ("  ❯ Where are we"), and
-# the todo-list HUD's continuation lines ("     ◻ Wave 4: …",
-# "      … +3 completed") — indented ≥3 columns, deeper than any output
-# bullet. These are skipped when scanning upward for the spinner; any other
-# content line stops the scan so ·/* bullets in Claude's output can't be
-# misread as a status line.
-_RE_STATUS_SKIPPABLE = re.compile(r"^\s*[⎿⏵❯]|^\s{3,}[◼◻✔✓…]")
+# any line indented ≥3 columns — the todo-list HUD's continuations
+# ("     ◻ Wave 4: …", "      … +3 completed") and a hint's own wrapped
+# continuation ("  ⎿  Tip: Use /btw … without interrupting Claude's" /
+# "     current work" at 80 columns). Claude's own output is rendered at
+# 2 columns, so anything deeper below the spinner is chrome. These are
+# skipped when scanning upward for the spinner; any other content line
+# stops the scan so ·/* bullets in Claude's output can't be misread as a
+# status line.
+_RE_STATUS_SKIPPABLE = re.compile(r"^\s*[⎿⏵❯]|^\s{3,}\S")
 
 # How many lines above the separator to scan for the spinner (blanks and
 # skippable hint lines included). Must clear the todo-list HUD (up to ~8
@@ -474,12 +477,23 @@ _STATUS_SCAN_HEIGHT = 16
 # static — it marks the turn as finished, not in progress.
 _RE_TURN_END_STATUS = re.compile(r"\S+ for (?:\d+[hms]\s*)+$")
 
+# The bottom-chrome separator: a full-width rule of ─ that may carry a short
+# right-aligned mode label ("──────── ultracode ─"). At least 20 columns, so
+# a short ───── rule in Claude's output never passes as chrome.
+_RE_CHROME_SEPARATOR = re.compile(r"^(?=.{20})─+(?: [^─]{1,40} ─+)?$")
+
+
+def _is_chrome_separator(line: str) -> bool:
+    """True if ``line`` (whitespace-stripped) is a bottom-chrome separator."""
+    return _RE_CHROME_SEPARATOR.match(line) is not None
+
 
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
     The status line (spinner + working text) appears above the chrome
-    separator (a full line of ``─`` characters), possibly with hint lines
+    separator (a full-width line of ``─`` characters, optionally carrying a
+    mode label such as ``ultracode``), possibly with hint lines
     (tips, mode indicators), the todo-list HUD, or a queued-message echo
     in between.  We locate the separator first, then scan upward — skipping
     blanks and known hint lines — for a line starting with a spinner glyph.
@@ -500,7 +514,7 @@ def parse_status_line(pane_text: str) -> str | None:
     search_start = max(0, len(lines) - 10)
     for i in range(search_start, len(lines)):
         stripped = lines[i].strip()
-        if len(stripped) >= 20 and all(c == "─" for c in stripped):
+        if _is_chrome_separator(stripped):
             chrome_idx = i
             break
 
@@ -565,7 +579,7 @@ def parse_chrome_footer(pane_text: str) -> str | None:
     search_start = max(0, len(lines) - 10)
     for i in range(search_start, len(lines)):
         stripped = lines[i].strip()
-        if len(stripped) >= 20 and all(c == "─" for c in stripped):
+        if _is_chrome_separator(stripped):
             separators.append(i)
             if len(separators) == 2:
                 break
@@ -609,7 +623,7 @@ def strip_pane_chrome(lines: list[str]) -> list[str]:
     search_start = max(0, len(lines) - 10)
     for i in range(search_start, len(lines)):
         stripped = lines[i].strip()
-        if len(stripped) >= 20 and all(c == "─" for c in stripped):
+        if _is_chrome_separator(stripped):
             return lines[:i]
     return lines
 
